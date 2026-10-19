@@ -1,111 +1,67 @@
 # sfn-wiki-mirror
 
-A local copy of English Wikipedia, searchable and readable by AI agents through an **MCP server**, with a plain
-HTTP API for everything else. It is refreshed monthly from Wikimedia Enterprise's snapshots and runs on your own
-hardware.
+**Hybrid keyword and semantic search over your own copy of English Wikipedia, served to AI agents through MCP.**
 
-## Why
+sfn-wiki-mirror turns Wikimedia's snapshots of English Wikipedia into a search service on your own network. Each
+month it downloads the latest snapshot, reduces every article to clean text, cuts the text into passages and
+generates the search indexes automatically: a keyword index and a semantic (embedding) index, fused into one
+ranking. Any MCP-capable agent can then search and read all of Wikipedia locally, as often as it likes, and cite
+the exact revision it read.
 
-AI agents that use Wikipedia live run into its API rate limits, its policies for robots, and network latency, and
-an agent that fetches pages in a loop hammers a volunteer-run service. This server holds the whole of English
-Wikipedia locally. Any MCP-capable agent (Claude Code, Claude Desktop, other MCP clients) can search and read
-articles as often and as fast as it likes, with no throttling by Wikipedia, and any other program can do the same
-over HTTP. Wikipedia itself is contacted once a month, for one bulk download.
+> **Status, October 2026.** Keyword search is live over 41.6 million passages from 7.2 million articles. The semantic
+> index and hybrid ranking are designed, measured on samples, and next on the [roadmap](docs/ROADMAP.md) (phase W2).
 
-Every search and article reply carries the snapshot date, the revision id and a permalink to the exact revision it
-read (`https://en.wikipedia.org/wiki/<Title>?oldid=<revision>`), so an answer can be cited precisely. An article
-reply also carries the licence (CC BY-SA 4.0); search replies do not, but the same licence covers them.
+## What sets it apart
 
-### Self-hosted, or an MCP server in front of Wikipedia's API?
+- **Search built for agents.** Articles are cut into passages of about 720 characters. A query returns the best
+  passage from each matching article, with its title, section and snippet: what a model needs to decide what to
+  read, rather than a list of page titles.
+- **Hybrid retrieval.** Keyword search (BM25-style sparse vectors) finds exact names, numbers and rare terms.
+  Semantic search (bge-m3 embeddings) finds passages that answer a question in other words. Both indexes live in
+  Qdrant and are fused with reciprocal rank fusion. *Keyword is live; semantic arrives with W2.*
+- **A fully automated pipeline.** One monthly job downloads the snapshot, parses it, builds the article store and
+  generates the keyword vectors; from W2 it also generates embeddings on an Ollama-compatible server you point it at.
+  The new index is built beside the live one, so search keeps serving throughout.
+- **An MCP layer, and plain HTTP.** Two read-only tools, `wiki_search` and `wiki_read`, over Streamable HTTP, and the
+  same data through a REST API. Each client gets its own revocable key.
+- **Exact citations.** Every reply carries the snapshot date, the revision id and an `?oldid=` permalink to the
+  revision that was read.
+- **Local and fast.** About 27 ms per search and 1-2 ms per article read on the local network, with no rate limit.
+  Wikipedia is contacted once a month, for one bulk download, and queries never leave your network.
+- **Secure by default.** The builder and the server run as separate users: the builder can reach the internet but
+  listens on no port; the server listens but cannot reach the internet. The box has a default-deny firewall, the
+  Python and Qdrant builds are pinned by hash, and the updater rolls itself back if a new version starts unhealthy.
 
-Lightweight MCP servers that call Wikipedia's live API already exist, for example
-[wikipedia-mcp](https://github.com/Rudra-ravi/wikipedia-mcp), which installs in a minute, covers every language
-edition and always returns today's revision. For occasional lookups that is the simpler choice. Its own documentation
-notes the trade-off: "Wikipedia API has rate limits; consider adding delays between requests", and it suggests a
-personal access token to avoid 403 errors.
+## How it works
 
-Self-hosting is worth its disk space and setup when:
+```mermaid
+flowchart LR
+    WME[Wikimedia Enterprise<br/>snapshot] -->|one download a month| PARSE
+    subgraph host [Your mirror host]
+        PARSE[parse to clean text<br/>cut into passages] --> STORE[(article store<br/>SQLite)]
+        PARSE --> KW[keyword vectors]
+        PARSE -.-> EMB[embeddings<br/>W2]
+        KW --> QD[(Qdrant)]
+        EMB -.-> QD
+        QD -->|fused ranking| API[MCP server + HTTP API<br/>:8300]
+        STORE --> API
+    end
+    GPU[your embedding server<br/>Ollama-compatible] -.-> EMB
+    API -->|MCP| AGENTS[AI agents]
+    API -->|HTTP| APPS[programs]
+```
 
-| | Live-API MCP server | This mirror |
-|---|---|---|
-| Request volume | Bounded by Wikipedia's rate limits; heavy agent loops get throttled | Unbounded: limited only by your hardware |
-| Latency | A round trip to Wikipedia per call | About 27 ms per search from the local network, 1-2 ms per article read |
-| Load on Wikipedia | Every agent call | One bulk download a month |
-| Availability | Needs internet access | Works on an isolated network |
-| Privacy | Queries reach a third party | Queries never leave your network |
-| Search | Wikipedia's own search | Passage-level keyword search, semantic search next, under your control |
-| Reproducible citations | The live revision, which may change | A fixed monthly snapshot and an exact `?oldid=` permalink |
-| Freshness and coverage | Live, every language | Up to a month old, English only today |
-| Cost | Nothing to host | About 250 GB of local disk plus 300 GB for snapshots, a 32 GB box, and compute for the build ([SIZING](docs/SIZING.md)) |
+1. **Download.** On the 2nd of each month the build fetches the English Wikipedia snapshot (151 GB compressed) from
+   Wikimedia Enterprise's Snapshot API, which its free tier includes.
+2. **Parse.** Each article's HTML is reduced to plain text, section by section, and stored in a SQLite article store.
+3. **Cut.** The sections are cut into passages: 41.6 million of them for 7.2 million articles.
+4. **Index.** Each passage gets a keyword vector and, from W2, an embedding. Both are stored in Qdrant, in a new
+   collection built beside the one being served.
+5. **Serve.** A search queries the keyword index (from W2, both indexes, fusing their rankings), keeps the best
+   passage per article and returns it with its section and citation. `wiki_read` then pages through the full article in windows a model can take.
 
-### Other ways to self-host Wikipedia
-
-Offline Wikipedia is not new; Wikipedia keeps its own
-[list of offline readers](https://en.wikipedia.org/wiki/Wikipedia:Database_download#Offline_Wikipedia_readers).
-The one to know is [Kiwix](https://www.kiwix.org/): it packs a wiki into a single ZIM file with a built-in full-text
-index, and reads it in apps for every platform or serves it over HTTP with `kiwix-serve`.
-[openzim-mcp](https://github.com/cameronrye/openzim-mcp) puts an MCP server in front of ZIM files, so an agent
-already gets throttle-free, offline Wikipedia from a file and a `uvx` command. Older routes exist too:
-[XOWA](https://en.wikipedia.org/wiki/XOWA) builds a desktop reader from the XML dumps (no longer actively
-developed), and importing the dumps into your own MediaWiki gives you its full API, but at English Wikipedia's size
-that is a project in itself ([WP-MIRROR](https://www.mediawiki.org/wiki/Wp-mirror), which automated it, has been
-unsupported since 2014).
-
-If you want Wikipedia on a laptop, a phone or a Raspberry Pi, or for one agent on one machine, Kiwix and openzim-mcp
-are far less to run, and they carry images. This project is for a different job: a search service on your network
-that several agents and programs share, where finding the right passage matters and so does citing exactly what was
-read.
-
-| | Kiwix ZIM (+ openzim-mcp) | This mirror |
-|---|---|---|
-| What you run | One file and a reader or server; no build step | A service, Qdrant and a monthly build on a server or container |
-| Footprint | English ZIM: 13 GB intros only, 49 GB text, 119 GB with images | 62 GB today (store + keyword index); about 160 GB with the semantic index |
-| Search | The archive's own full-text index, over whole articles | Ranked keyword search over 41.6M passages; the best passage per article, with its section; semantic search next |
-| Updates | Download a new file when Kiwix publishes one; English builds come every few months | A new Wikimedia Enterprise snapshot built monthly while the old index keeps serving (scheduled; the first build was started by hand and the timer's first unattended run is 2026-11-02, so unattended operation is not yet proven) |
-| Citations | The article as packed in that file | The revision id and an `?oldid=` permalink to the exact revision, on every search and article reply |
-| Sharing | openzim-mcp: stdio, or Streamable HTTP with a bearer token | Streamable HTTP and a REST API, one revocable key per client, request ids in every log line |
-| Content | Rendered pages, with images in the large builds | Plain text cut for models, in pageable windows; no images |
-
-ZIM sizes and dates are from [Kiwix's download index](https://download.kiwix.org/zim/wikipedia/) in October 2026
-(latest English builds: images 2026-08, text-only 2026-06, intros 2026-09).
-
-## What it does
-
-- **Search:** keyword search over 41.6M passages of 7.2M articles, one result per article, with a snippet and the
-  article's title and section. Semantic (embedding) search is designed and next ([ROADMAP](docs/ROADMAP.md)).
-- **Read:** the text of any article by title or page id, in windows a model can take, with paging.
-- **MCP:** two read-only tools, `wiki_search` and `wiki_read`, over Streamable HTTP at `/mcp`.
-- **HTTP:** `POST /v1/wiki/search`, `GET /v1/wiki/article`, `GET /v1/wiki/health`.
-- **Keys:** one bearer key per client, stored as a hash, revocable in seconds.
-- **No live Wikipedia traffic** at query time; no rate limit applied by this service.
-
-## State (2026-10-19)
-
-Phase names used in these docs: **W2** is the planned semantic (embedding) index and hybrid search; **W3** is the
-planned in-place monthly update. Both are defined in [docs/DESIGN.md §7](docs/DESIGN.md#7-phases) and neither is
-built.
-
-| | |
-|---|---|
-| Snapshot served | 2026-10-01 (`enwiki_namespace_0`, English Wikipedia articles only) |
-| Articles | 7,245,149 |
-| Passages in the keyword index | 41,590,915 |
-| Search latency | about 27 ms with the index cached, 241 ms (p50) on first touch; article reads 1 to 2 ms (measured over the API on 2026-10-18) |
-| Search mode | keyword (BM25-style sparse vectors in Qdrant); the semantic bge-m3 index is next |
-| Updates | A new Wikipedia snapshot is built monthly (scheduled, not yet proven unattended). Code updates are by hand (`wiki-mirror update`), or nightly from `main` with a guard and rollback if you opt in with `--auto-update`. |
-
-**Sizing** (measured unless marked estimate; details and the arithmetic in [docs/SIZING.md](docs/SIZING.md)):
-
-| | |
-|---|---|
-| Snapshot download | 151 GB compressed, about 45 minutes; about 700 GB of HTML uncompressed (estimate) |
-| Article store | 25 GB |
-| Keyword index | 37 GB on disk, about 4-5 GB RAM |
-| Semantic index (estimate) | about 95 GB on disk, about 10 GB RAM; total local disk about 160 GB, so plan on 250 GB with the headroom a monthly build needs |
-| Embedding the corpus (estimate) | about 4.7 exaFLOPs: about 45 h at 29 effective TFLOPS (measured), roughly 1,300 / TFLOPS hours |
-
-What is built and what is not: [docs/ROADMAP.md](docs/ROADMAP.md). The monthly job is currently a full build beside
-the live index; in-place monthly updates are designed but not built.
+Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the measurements behind each choice in
+[docs/DESIGN.md](docs/DESIGN.md).
 
 ## Connect an agent
 
@@ -114,8 +70,8 @@ claude mcp add --transport http wikipedia http://<mirror-host>:8300/mcp \
   --header "Authorization: Bearer <key>"
 ```
 
-Then ask the agent to look something up. Setup for Claude Desktop, other MCP clients and the Python SDK, with
-every tool's schema, replies and errors, is in [docs/MCP.md](docs/MCP.md). The same data over HTTP:
+Then ask the agent to look something up. Setup for Claude Desktop, other MCP clients and the Python SDK, with every
+tool's schema, replies and errors, is in [docs/MCP.md](docs/MCP.md). The same data over HTTP:
 
 ```bash
 curl -s -X POST http://<mirror-host>:8300/v1/wiki/search \
@@ -126,23 +82,49 @@ curl -s -X POST http://<mirror-host>:8300/v1/wiki/search \
 Parameters, replies, errors, health semantics and capacity: [docs/API.md](docs/API.md). Keys are issued on the host
 with `wiki-mirror key add <name>`.
 
-## Architecture
+## How it compares
 
-```mermaid
-flowchart LR
-    WME[Wikimedia Enterprise<br/>monthly snapshot] -->|download, once a month| BUILD
-    subgraph The mirror host
-        BUILD[build<br/>download, parse, index] --> STORE[(article store<br/>SQLite)]
-        BUILD --> QD[(Qdrant<br/>passage index)]
-        STORE --> API[MCP server + HTTP API<br/>:8300]
-        QD --> API
-    end
-    API -->|MCP /mcp + key| AGENTS[Claude Code, Claude Desktop,<br/>other MCP clients]
-    API -->|HTTP + key| APPS[Applications]
-```
+| | Live-API MCP servers | Kiwix ZIM + openzim-mcp | sfn-wiki-mirror |
+|---|---|---|---|
+| Search | Wikipedia's own search | The archive's full-text index, over whole articles | Ranked passages, best one per article; hybrid semantic next |
+| Volume | Bounded by Wikipedia's rate limits | Your hardware | Your hardware, shared by every client on the network |
+| Latency | A round trip to Wikipedia per call | Local | About 27 ms per search, 1-2 ms per read |
+| Privacy | Queries reach a third party | Local | Local |
+| Freshness | Live, every language | A new file when Kiwix publishes one (English: every few months) | Rebuilt monthly; English only today |
+| Citations | Today's revision, which may change | The article as packed in that file | Revision id and `?oldid=` permalink on every reply |
+| Content | Article text | Rendered pages, with images in the large builds | Plain text for models; no images |
+| Footprint | None | One file: 13 GB (intros) to 119 GB (with images) | 62 GB today, about 160 GB with the semantic index |
+| Setup | A minute | A file and a command | A dedicated container, a free Enterprise account, a 14-hour first build |
 
-The build runs as one Unix user with internet access and no listening port; the API runs as another with a
-listening port and no internet. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+For occasional lookups, a live-API server such as [wikipedia-mcp](https://github.com/Rudra-ravi/wikipedia-mcp) is
+simpler and covers every language. For Wikipedia on a laptop, a phone or one machine,
+[Kiwix](https://www.kiwix.org/) with [openzim-mcp](https://github.com/cameronrye/openzim-mcp) is far less to run and
+carries images; Wikipedia keeps a fuller
+[list of offline readers](https://en.wikipedia.org/wiki/Wikipedia:Database_download#Offline_Wikipedia_readers).
+This project is for a different job: a search service that several agents and programs share, where finding the right
+passage matters and so does citing exactly what was read.
+
+ZIM sizes are from [Kiwix's download index](https://download.kiwix.org/zim/wikipedia/) in October 2026.
+
+## Status (2026-10-19)
+
+Phase names used in these docs: **W2** is the semantic index and hybrid search; **W3** is the in-place monthly
+update. Both are defined in [docs/DESIGN.md §7](docs/DESIGN.md#7-phases); neither is built yet.
+
+| | |
+|---|---|
+| Snapshot served | 2026-10-01 (`enwiki_namespace_0`, English Wikipedia articles only) |
+| Articles | 7,245,149 |
+| Passages in the keyword index | 41,590,915 |
+| Search mode | Keyword (BM25-style sparse vectors in Qdrant); semantic bge-m3 and hybrid fusion next (W2) |
+| Latency | About 27 ms per search with the index cached, 241 ms (p50) on first touch; article reads 1-2 ms (measured over the API, 2026-10-18) |
+| Disk and memory | Article store 25 GB; keyword index 37 GB on disk and 4-5 GB of RAM; semantic index about 95 GB and 10 GB of RAM (estimate) |
+| Embedding the corpus | About 45 hours at 29 effective TFLOPS (estimate from measured rates) |
+| Updates | A new snapshot is built monthly beside the live index (scheduled; the first unattended run is 2026-11-02, so that is not yet proven). Code updates are by hand (`wiki-mirror update`), or nightly with a guard and rollback if you opt in with `--auto-update`. |
+
+Every figure, measured or estimated, with its arithmetic: [docs/SIZING.md](docs/SIZING.md). What is built and what is
+planned, including article annotations (links, references, infoboxes, tables) and a web reader:
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Running it
 
@@ -150,15 +132,16 @@ listening port and no internet. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTUR
 
 * **A dedicated x86_64 Debian 12 or 13 container or VM.** A Proxmox LXC is the tested path. The installer owns the
   box's nftables firewall, which is default-drop, so do not use a shared host or a Docker host.
-* **CPU and RAM:** 6 cores (the parse stage runs 5 workers by default) and 32 GB of RAM advised, 8 GB at the
-  least ([docs/SIZING.md](docs/SIZING.md)).
-* **Disk:** 250 GB of fast local disk for the article store and the index, plus about 300 GB of bulk storage for the
-  two retained snapshots ([docs/SIZING.md](docs/SIZING.md)). On a single disk, plan for about 550 GB.
+* **CPU and RAM:** 6 cores (the parse stage runs 5 workers by default) and 32 GB of RAM advised, 8 GB at the least.
+* **Disk:** 250 GB of fast local disk for the article store and the indexes, plus about 300 GB of bulk storage for
+  the two retained snapshots. On a single disk, plan for about 550 GB.
 * **Storage mounted at `/mnt/wikipedia`.** The snapshots go there, and the build refuses to run unless it is a mount
   point: NFS from a NAS, or a directory on a big local disk bind-mounted onto it
   ([docs/OPERATIONS.md](docs/OPERATIONS.md#2-storage-at-mntwikipedia)).
 * **A free Wikimedia Enterprise account** at <https://enterprise.wikimedia.com/>; its free tier includes the Snapshot
   API this mirror downloads from ([docs/OPERATIONS.md](docs/OPERATIONS.md#3-the-enterprise-account-and-sign-in)).
+* **For the semantic index (W2, optional today):** an Ollama-compatible embedding server with a GPU on the same
+  network.
 * **Time:** about 30 minutes to install, about 151 GB to download, about 14 hours for the first build (measured:
   2026-10-17 to 10-18).
 
