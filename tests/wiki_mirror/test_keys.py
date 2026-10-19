@@ -49,7 +49,7 @@ def _edit(path: Path, text: str) -> None:
 
 
 def _keys(path: Path, clock: FrozenClock) -> ClientKeys:
-    """The registry under test: the main client's key plus the file, on the test clock."""
+    """The registry under test: the primary key plus the file, on the test clock."""
     return ClientKeys(path, _PRIMARY_KEY, clock=clock.monotonic)
 
 

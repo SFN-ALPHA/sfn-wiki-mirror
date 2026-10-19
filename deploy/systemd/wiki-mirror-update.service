@@ -11,7 +11,8 @@
 # outcome is also written to state/update.json, which /v1/wiki/health and `wiki-mirror status` show.
 #
 # **Root, not a service account.** The checkout is root-owned on purpose (no service account
-# may change the code it runs), so root fetches it, over the read-only deploy key in /root/.ssh. Hardening is therefore
+# may change the code it runs), so root fetches it: anonymously over HTTPS, or - for a checkout
+# cloned from a private fork - over the read-only deploy key in /root/.ssh. Hardening is therefore
 # narrower than the build unit's: it keeps the filesystem read-only except for the places the
 # updater writes (the checkout and its venv, the unit files, the wiki-mirror link, the data directory's
 # state), and reads /root for the deploy key (ProtectHome=read-only, so pip's cache is off).
@@ -20,8 +21,9 @@
 # in `systemctl --failed`, in `wiki-mirror status` (last update) and on /v1/wiki/health. A deferral
 # (a build running) and a hold (a format change) exit 0 deliberately: they need no retry.
 #
-# Install: install.sh does it. See docs/DESIGN.md section 12 and docs/OPERATIONS.md
-# "The nightly update" (R.9 and R.10).
+# Install: install.sh does it (the timer that starts this nightly is opt-in there, with
+# --auto-update). See docs/DESIGN.md section 12 and docs/OPERATIONS.md "The nightly update" (R.9
+# and R.10).
 
 [Unit]
 Description=Wikipedia mirror update from GitHub

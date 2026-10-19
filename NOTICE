@@ -1,0 +1,30 @@
+sfn-wiki-mirror
+
+Code and documentation
+  Copyright (c) 2026 SFN-ALPHA, released under the MIT License (see LICENSE).
+
+Wikipedia content in the test fixtures
+  Two files under tests/fixtures/ are not covered by the MIT License. They contain
+  text from English Wikipedia, which is licensed under the Creative Commons
+  Attribution-ShareAlike 4.0 International licence (CC BY-SA 4.0,
+  https://creativecommons.org/licenses/by-sa/4.0/), and is attributed to
+  Wikipedia contributors:
+
+    tests/fixtures/wme/records.ndjson
+      Eight whole English Wikipedia article records, taken unchanged from the
+      Wikimedia Enterprise snapshot enwiki_namespace_0 dated 2026-10-01 (only
+      the wikitext field was removed). Each record carries its own license and
+      url fields, and the url leads to the article's page history, which lists
+      its authors.
+
+    tests/fixtures/vendored_golden.json
+      Test data derived from text in those articles. It is a derivative work
+      and is shared under the same CC BY-SA 4.0 licence.
+
+  If you redistribute this repository, keep these two files under CC BY-SA 4.0
+  with this notice, or leave them out (the service itself does not need them;
+  only the test suite reads them).
+
+The Wikipedia mirror this software builds holds Wikipedia text under the same
+CC BY-SA 4.0 licence. Quote it with attribution: the snapshot date and the
+oldid permalink in every search and article reply identify the exact revision.

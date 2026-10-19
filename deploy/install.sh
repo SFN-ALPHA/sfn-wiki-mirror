@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Provision the mirror's LXC (the Wikipedia mirror) from a bare Debian container to a
-# running API, a running Qdrant, a monthly build timer and a nightly update timer. Idempotent:
+# running API, a running Qdrant, a monthly build timer and, if you ask for it, a nightly update
+# timer. Idempotent:
 # run it again after a failure, a restore or a template change and it repairs what is missing without touching what
 # is already right. `--dry-run` shows every step and what would stop the real run.
 #
@@ -10,22 +11,29 @@
 # steps, in order, each logged and skipped when already done:
 #
 #   1. Preflight      Debian 12/13, x86_64, disk, the site file, resolver, the NAS mount, the
-#                     deploy key. Everything that can stop the run is checked BEFORE the
-#                     20-minute Python build, not after it.
+#                     repository URL (and, for an SSH one only, the deploy key). Everything that
+#                     can stop the run is checked BEFORE the 20-minute Python build, not after it.
 #   2. Packages       git, nftables, sqlite3, zstd, and (only if Python must be built) the
 #                     compiler and -dev libraries.
 #   3. Users, dirs    wikimirror (API), wikimirror-sync (build jobs), qdrant; the directory contract.
-#   4. Deploy key     verified registered on GitHub (never generated here; see below).
+#   4. Deploy key     only when the repository is fetched over SSH (git@github.com:path or
+#                     ssh://git@github.com/path; GitHub is the only SSH host supported), which is
+#                     for mirroring a private fork: verified registered on GitHub (never
+#                     generated here; see below). The default https:// URL needs none, and this
+#                     step is skipped without a word. On a re-run, "the repository" is the
+#                     existing checkout's own origin, whatever REPO_URL says.
 #   5. Python         the newest interpreter >= 3.12, else CPython 3.13 built from source.
-#   6. Checkout       /opt/wiki-mirror, root-owned, via the read-only deploy key;
+#   6. Checkout       /opt/wiki-mirror, root-owned, by an anonymous HTTPS clone (or, for an SSH
+#                     REPO_URL, through the read-only deploy key);
 #                     a venv with `pip install "."` (not editable), every dependency
 #                     held to the version in deploy/constraints.txt and installed from
 #                     wheels only (no compiler on the box beyond a one-off Python build).
 #   7. Qdrant         the pinned release, checksum-verified, and its config.
-#   8. Config         mirror.yaml, mirror.env with a generated API key, and an empty
-#                     clients.json (the other agents' key hashes; `wiki-mirror key add`).
-#   9. Units          the six systemd units; qdrant + API + the monthly build timer + the nightly
-#                     update timer (02:20 local time) enabled.
+#   8. Config         mirror.yaml, mirror.env with a generated API key (the primary key), and an
+#                     empty clients.json (the other agents' key hashes; `wiki-mirror key add`).
+#   9. Units          the six systemd units installed; qdrant + API + the monthly build timer
+#                     enabled. The nightly update timer (02:20 local time) is enabled only with
+#                     --auto-update, or when it already is (a re-run never turns it off).
 #  10. Firewall       nftables per-user egress, rendered from the template and the site file,
 #                     checked with `nft -c` before it is applied. Transactional: the file it
 #                     replaces is kept until the whole ruleset checks clean, and put back (or the
@@ -34,11 +42,13 @@
 #  11. Operator CLI   /usr/local/bin/wiki-mirror.
 #  12. Verify         Qdrant and the API answer; the firewall admits and refuses what it should.
 #
-# **Per-site settings.** The firewall names the LAN, the embedding server and its port, which
-# differ at every site, so they are not in the repository: they live in /etc/wiki-mirror/site.env
-# (root:root 0644, no secrets; the template is deploy/site.env.example). A first run installs the
-# example there and STOPS; so does a file that still equals the example or holds anything but
-# three valid literals. The file is parsed as data, never sourced, and each value must match a
+# **Per-site settings.** The firewall names the LAN and, optionally, an embedding server and its
+# port, which differ at every site, so they are not in the repository: they live in
+# /etc/wiki-mirror/site.env (root:root 0644, no secrets; the template is deploy/site.env.example).
+# A first run installs the example there and STOPS; so does a file that still equals the example
+# or holds anything but a valid LAN_CIDR and either both embedding values or neither (the
+# embedding server is for the planned semantic index; without it the ruleset has no rule for it at
+# all). The file is parsed as data, never sourced, and each value must match a
 # strict IPv4 / CIDR / port pattern before it is substituted into a ruleset that loads as root.
 # The LAN must be /8 or longer and inside RFC 1918 or 100.64.0.0/10, since SSH and the API are
 # admitted from everything in it. The file must be root's and not writable by anyone else, and
@@ -51,7 +61,12 @@
 # **Deliberately not automated**, because each is a human decision or a secret that must not
 # pass through a script's arguments:
 #
-#   * Registering the deploy key on GitHub. The script prints the exact commands and stops.
+#   * Registering a deploy key on GitHub, for an SSH REPO_URL only. The script prints the exact
+#     commands and stops.
+#   * Following upstream. The nightly update pulls the repository's main branch and applies it
+#     as root, so trusting what gets pushed there is the operator's call: pass --auto-update to
+#     enable the timer, or run `systemctl enable --now wiki-mirror-update.timer` later.
+#     `wiki-mirror update` works by hand either way.
 #   * The values in site.env. The example is installed; choosing your network is yours.
 #   * The Wikimedia Enterprise sign-in (/etc/wiki-mirror/enterprise.env). docs/OPERATIONS.md
 #     has the `read -r -s` command; the installer only fixes its owner and mode.
@@ -70,12 +85,19 @@
 
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-git@github.com:SFN-ALPHA/sfn-wiki-mirror.git}"
+# Anonymous HTTPS by default: the repository is public, so a stranger's box needs no account and
+# no key. An SSH URL (git@github.com:path or ssh://git@github.com/path) is for mirroring a private
+# fork and brings the deploy-key checks with it; see url_transport.
+REPO_URL="${REPO_URL:-https://github.com/SFN-ALPHA/sfn-wiki-mirror.git}"
+# The four paths below are hard-coded in the systemd units (and update.sh), so changing one here
+# would install a box the units cannot run: they are not advertised in --help. They are variables
+# only so a test can point them at a scratch directory.
 APP_DIR="${APP_DIR:-/opt/wiki-mirror}"
 DATA_DIR="${DATA_DIR:-/var/lib/wiki-mirror}"
 CONF_DIR="${CONF_DIR:-/etc/wiki-mirror}"
 SNAPSHOT_MOUNT="${SNAPSHOT_MOUNT:-/mnt/wikipedia}"
 SNAPSHOT_DIR="${SNAPSHOT_DIR:-$SNAPSHOT_MOUNT/snapshots}"
+# Used only when REPO_URL is an SSH URL.
 DEPLOY_KEY="${DEPLOY_KEY:-/root/.ssh/wiki_mirror_deploy}"
 KNOWN_HOSTS="${KNOWN_HOSTS:-/root/.ssh/known_hosts}"
 BRANCH="${BRANCH:-main}"
@@ -87,6 +109,8 @@ QDRANT_PORT=6333
 NFT_INSTALLED="${NFT_INSTALLED:-/etc/nftables.d/wiki-mirror.nft}"
 NFT_CONF="${NFT_CONF:-/etc/nftables.conf}"
 RESOLV_CONF="${RESOLV_CONF:-/etc/resolv.conf}"
+# Where the systemd units are installed (update.sh has the same variable, for the same reason).
+UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 # `ip`, which lists the box's own addresses for the site check (a test points it at a stub), and
 # the uid and gid the site file must belong to: root, always, on a real box. Tests, which cannot
 # be root, set them to their own ids; nothing else does.
@@ -127,9 +151,16 @@ NEED_VENV_PACKAGE=false
 DRY_RUN=false
 ADOPT_CONFIG=false
 SHOW_FIREWALL=false
+# --auto-update asks for the nightly update timer to be enabled; UPDATES_ENABLED records whether
+# install_units ended up enabling it (the flag, or a timer that was already enabled), for the
+# closing summary.
+AUTO_UPDATE=false
+UPDATES_ENABLED=false
 
 # The validated site settings (read_site_file). Empty until the site file has been read and passed;
-# a dry run that found the file unusable leaves them empty and says so.
+# a dry run that found the file unusable leaves them empty and says so. The two EMBEDDING_ values
+# are also empty on a site that has no embedding server, which is allowed: they are set together
+# or not at all.
 LAN_CIDR=""
 EMBEDDING_HOST=""
 EMBEDDING_PORT=""
@@ -188,14 +219,22 @@ Provision the mirror's container (Wikipedia mirror). Idempotent - safe to re-run
                     template (the old file is kept as <name>.bak-<timestamp>)
   --show-firewall   print the nftables ruleset the checkout's template and the site file
                     produce, and exit; needs no root and changes nothing
-  --repo URL        clone from somewhere other than the default origin
+  --auto-update     enable the nightly update timer (02:20 local time). Off by default: the
+                    update applies the repository's main branch as root, so following upstream
+                    is your choice. A timer that is already enabled stays enabled. Later:
+                    systemctl enable --now wiki-mirror-update.timer
+  --repo URL        clone from somewhere other than the default origin. An https:// URL is
+                    cloned anonymously (a user name, token, query string or fragment in the
+                    URL is refused); git@github.com:path or ssh://git@github.com/path (a
+                    private fork on GitHub; SSH to any other host is refused) needs the
+                    read-only deploy key, whose setup this script checks and explains
   -h, --help        this
 
-Per-site settings (the LAN, the embedding server) are read from CONF_DIR/site.env, by default
-/etc/wiki-mirror/site.env; a first run installs deploy/site.env.example there and stops so you
-can edit it.
+Per-site settings (the LAN, and optionally an embedding server) are read from
+CONF_DIR/site.env, by default /etc/wiki-mirror/site.env; a first run installs
+deploy/site.env.example there and stops so you can edit it.
 
-Environment overrides: REPO_URL APP_DIR DATA_DIR CONF_DIR SNAPSHOT_MOUNT DEPLOY_KEY BRANCH
+Environment overrides: REPO_URL DEPLOY_KEY (SSH URLs only) BRANCH
 PYTHON (force an interpreter, e.g. PYTHON=python3.13).
 USAGE
 }
@@ -205,6 +244,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN=true ;;
         --adopt-config) ADOPT_CONFIG=true ;;
         --show-firewall) SHOW_FIREWALL=true ;;
+        --auto-update) AUTO_UPDATE=true ;;
         --repo) REPO_URL="${2:?--repo needs a URL}"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option $1 (try --help)" ;;
@@ -215,10 +255,9 @@ done
 SRC_DIR="$APP_DIR/deploy"
 VENV="$APP_DIR/.venv"
 # The tested set of dependency versions. `--only-binary=:all:` makes a pin with no wheel for
-# this Python fail the install instead of compiling on the box; http-ece (pure Python, published
-# only as an sdist) is the one package built locally. See the header of constraints.txt.
+# this Python fail the install instead of compiling on the box. See the header of constraints.txt.
 CONSTRAINTS="$SRC_DIR/constraints.txt"
-PIP_PINNED=(-c "$CONSTRAINTS" --only-binary=:all: --no-binary=http-ece)
+PIP_PINNED=(-c "$CONSTRAINTS" --only-binary=:all:)
 ENTERPRISE_ENV="$CONF_DIR/enterprise.env"
 MIRROR_ENV="$CONF_DIR/mirror.env"
 CLIENTS_FILE="$CONF_DIR/clients.json"
@@ -297,8 +336,8 @@ api_get() {
 # Site settings: /etc/wiki-mirror/site.env
 # ---------------------------------------------------------------------------
 #
-# The LAN, the embedding server's address and its port differ at every site and reach the
-# firewall. They are read here as DATA and checked against strict literal patterns, because the
+# The LAN and, if there is one, the embedding server's address and its port differ at every site
+# and reach the firewall. They are read here as DATA and checked against strict literal patterns, because the
 # firewall stage substitutes them into a ruleset that nft loads as root: a value that is not
 # one of these literals must never get that far (docs/OPERATIONS.md "The site file").
 
@@ -403,12 +442,18 @@ embedding_port_problem() {
 # in SITE_PROBLEMS rather than stopping at the first, so one pass tells the operator all there is
 # to fix; if there is any, the three variables are left empty so nothing half-valid can be used.
 #
+# LAN_CIDR is required. The embedding server is optional (nothing in the service calls one yet; it
+# is for the planned semantic index), but its two values come as a pair: both given, or neither.
+# A key that is absent or has an empty value counts as not given; exactly one given is a problem,
+# because half an egress rule cannot be rendered. A given value is validated whether or not its
+# partner is, so a typo is reported as a typo and not only as a missing half.
+#
 # The file is never sourced or evaluated. A line is accepted only if it is blank, a comment, or
 # exactly one of the three known keys, `=`, and a value with no whitespace; the value must then
 # pass the strict check for its key. No quoting, expansion or continuation exists: a quote is
 # simply a character that fails the pattern.
 read_site_file() {
-    local line key value problem lineno=0 seen=" "
+    local line key value problem lineno=0 seen=" " given=" "
     SITE_PROBLEMS=()
     LAN_CIDR=""
     EMBEDDING_HOST=""
@@ -427,10 +472,20 @@ read_site_file() {
             continue
         fi
         seen+="$key "
+        problem=""
         case "$key" in
             LAN_CIDR) problem="$(lan_cidr_problem "$value")" ;;
-            EMBEDDING_HOST) problem="$(embedding_host_problem "$value")" ;;
-            EMBEDDING_PORT) problem="$(embedding_port_problem "$value")" ;;
+            EMBEDDING_HOST|EMBEDDING_PORT)
+                # Empty means "not given" (the optional pair); anything else is checked.
+                if [[ -n "$value" ]]; then
+                    given+="$key "
+                    if [[ "$key" == EMBEDDING_HOST ]]; then
+                        problem="$(embedding_host_problem "$value")"
+                    else
+                        problem="$(embedding_port_problem "$value")"
+                    fi
+                fi
+                ;;
         esac
         if [[ -n "$problem" ]]; then
             SITE_PROBLEMS+=("line $lineno: $problem")
@@ -438,9 +493,12 @@ read_site_file() {
             printf -v "$key" '%s' "$value"
         fi
     done < "$SITE_FILE"
-    for key in LAN_CIDR EMBEDDING_HOST EMBEDDING_PORT; do
-        [[ "$seen" == *" $key "* ]] || SITE_PROBLEMS+=("$key is missing")
-    done
+    [[ "$seen" == *" LAN_CIDR "* ]] || SITE_PROBLEMS+=("LAN_CIDR is missing: add a line LAN_CIDR=<your network>, e.g. LAN_CIDR=192.168.1.0/24 (the shipped example has it commented out)")
+    if [[ "$given" == *" EMBEDDING_HOST "* && "$given" != *" EMBEDDING_PORT "* ]]; then
+        SITE_PROBLEMS+=("EMBEDDING_HOST is set but EMBEDDING_PORT is not: set both, or neither (the embedding server is optional)")
+    elif [[ "$given" != *" EMBEDDING_HOST "* && "$given" == *" EMBEDDING_PORT "* ]]; then
+        SITE_PROBLEMS+=("EMBEDDING_PORT is set but EMBEDDING_HOST is not: set both, or neither (the embedding server is optional)")
+    fi
     if [[ ${#SITE_PROBLEMS[@]} -gt 0 ]]; then
         LAN_CIDR=""
         EMBEDDING_HOST=""
@@ -532,11 +590,11 @@ check_lan_reach() {
 }
 
 # Preflight: the site file exists, is not the unedited example, belongs to root and cannot be
-# written by anyone else, holds three valid values, and a LAN_CIDR that this box and the SSH
-# session running the installer are actually inside. On a first run it installs the example and
-# stops, because the firewall built from example values would lock the real LAN out. Run before
-# the long steps for the usual reason: an operator who has to edit a file should learn that now,
-# not after a compile.
+# written by anyone else, holds a valid LAN_CIDR and either both embedding values or neither, and
+# a LAN_CIDR that this box and the SSH session running the installer are actually inside. On a
+# first run it installs the example and stops, because the firewall built from example values
+# would lock the real LAN out. Run before the long steps for the usual reason: an operator who has
+# to edit a file should learn that now, not after a compile.
 check_site() {
     local example trust
     example="$(find_site_example)"
@@ -544,9 +602,13 @@ check_site() {
     if [[ ! -e "$SITE_FILE" ]]; then
         if [[ -z "$example" ]]; then
             blocker "no $SITE_FILE, and site.env.example is neither beside this script nor in $SRC_DIR.
-    Create $SITE_FILE (root:root 0644) with these three lines, using your own values:
+    Create $SITE_FILE (root:root 0644) with this line, using your own network:
 
       LAN_CIDR=192.168.1.0/24
+
+    and, only if you run an embedding server for the planned semantic index, these two as well
+    (both or neither):
+
       EMBEDDING_HOST=192.168.1.60
       EMBEDDING_PORT=8080
 
@@ -559,18 +621,25 @@ check_site() {
         run install -m 0644 -o "$SITE_OWNER_UID" -g "$SITE_OWNER_GID" "$example" "$SITE_FILE"
         ok "installed $SITE_FILE from $example"
         blocker "no site file: the shipped example $($DRY_RUN && echo 'would be' || echo 'was') installed as $SITE_FILE and must be edited first.
-    It holds the three values that differ between sites and that the firewall is built from:
+    It holds the values that differ between sites and that the firewall is built from, all of
+    them commented out as shipped:
       LAN_CIDR         your IPv4 network, e.g. 192.168.1.0/24 (SSH, the API and DNS use it)
-      EMBEDDING_HOST   IPv4 address of the embedding server the build user may reach
-      EMBEDDING_PORT   that server's TCP port
-    Edit all three, then run this installer again. Nothing else has been changed."
+      EMBEDDING_HOST   optional: IPv4 address of an embedding server the build user may reach,
+      EMBEDDING_PORT   and its TCP port. Both or neither.
+    Remove the leading '# ' from the LAN_CIDR line and write your own network there, then run
+    this installer again. Nothing else has been changed."
         return 0
     fi
 
+    # Reported on its own, before the generic "LAN_CIDR is missing" that read_site_file would give
+    # the same file, because the fix is a specific one: the setting is commented out, and has to
+    # be written, even when the network the example shows happens to be the operator's.
     if [[ -n "$example" ]] && cmp -s "$example" "$SITE_FILE"; then
-        blocker "$SITE_FILE is still the shipped example, which holds example values for someone else's network.
-    Edit LAN_CIDR, EMBEDDING_HOST and EMBEDDING_PORT for this site, then run this installer
-    again. No firewall is built from example values. Nothing has been changed."
+        blocker "$SITE_FILE is still the shipped example, and every setting in it is commented out.
+    Edit it: remove the leading '# ' from the LAN_CIDR line and write your own network there
+    (the 192.168.1.0/24 shown is only an example), and uncomment the EMBEDDING_ pair too if you
+    run an embedding server. Then run this installer again. No firewall is built from the
+    example. Nothing has been changed."
         return 0
     fi
 
@@ -595,7 +664,11 @@ $(site_problem_lines)
     been changed."
         return 0
     fi
-    info "site file $SITE_FILE: LAN $LAN_CIDR, embedding server $EMBEDDING_HOST port $EMBEDDING_PORT"
+    if [[ -n "$EMBEDDING_HOST" ]]; then
+        info "site file $SITE_FILE: LAN $LAN_CIDR, embedding server $EMBEDDING_HOST port $EMBEDDING_PORT"
+    else
+        info "site file $SITE_FILE: LAN $LAN_CIDR, no embedding server (the ruleset gets no rule for one)"
+    fi
     check_lan_reach
 }
 
@@ -684,6 +757,161 @@ then, on the Proxmox host: pct reboot <ctid>
     fi
 }
 
+# The origin of the checkout at APP_DIR, or nothing when there is no checkout (or no origin). Only
+# read: asking never changes the checkout.
+repo_url_from_checkout() {
+    [[ -e "$APP_DIR/.git" ]] || return 0
+    git -C "$APP_DIR" remote get-url origin 2>/dev/null || true
+}
+
+# The URL the repository is, or is about to be, fetched from. update.sh fetches an existing
+# checkout from that checkout's own origin, whatever REPO_URL says now, so on a re-run the origin
+# decides how the repository has to be treated: an SSH checkout still gets its deploy key checked
+# (a revoked key is caught here, not at 02:20), and an HTTPS one is not reported as something
+# else. With no checkout (a first run) it is REPO_URL, which --repo and the environment set.
+repo_url() {
+    local origin
+    origin="$(repo_url_from_checkout)"
+    printf '%s' "${origin:-$REPO_URL}"
+}
+
+# Where repo_url took its answer from, as the start of a sentence: "REPO_URL" or the checkout's
+# origin.
+repo_url_source() {
+    if [[ -n "$(repo_url_from_checkout)" ]]; then
+        printf 'The origin of the checkout at %s' "$APP_DIR"
+    else
+        printf REPO_URL
+    fi
+}
+
+# The host an SSH URL (git@host:path or ssh://[user@]host[:port]/path) names, lower-cased; nothing
+# for any other URL.
+url_ssh_host() {
+    local url="$1" authority=""
+    case "$url" in
+        git@*) authority="${url#git@}"; authority="${authority%%:*}" ;;
+        ssh://*)
+            authority="${url#ssh://}"; authority="${authority%%/*}"
+            authority="${authority##*@}"; authority="${authority%%:*}"
+            ;;
+    esac
+    printf '%s' "${authority,,}"
+}
+
+# How URL $1 is fetched, from its form alone: `https` (anonymous: the default, for the public
+# repository), `ssh` (git@github.com:path or ssh://git@github.com/path: a private fork on GitHub,
+# read through a deploy key), `credentials` (a user name or token in an https URL, a query string
+# or fragment on one, or a password in an ssh:// one) or `unsupported` (anything else: http://,
+# git://, file://, a bare path, or SSH to any host but github.com). Plain http is refused on
+# purpose, since this checkout is code that runs as root and nothing authenticates it in transit.
+#
+# SSH is GitHub-only because that is all the rest of the installer knows how to do: the deploy
+# key is probed against git@github.com, only github.com's host key is pinned, and the firewall
+# admits root's git-over-SSH to GitHub's published ranges alone (set github_git).
+#
+# Credentials are refused because a URL is copied into things that outlive the install: this
+# script's output and the checkout's .git/config, which the service accounts can read. An anonymous
+# URL has no '@' at all, so any '@' in an https URL counts (not only one in the authority: a URL
+# whose secret holds a stray '/' would otherwise slip through as "anonymous"), and so does a '?'
+# or '#' (`?access_token=...`). An ssh:// URL may name a user (`ssh://git@github.com/...`; the key
+# is the credential) but not a `user:password`.
+url_transport() {
+    local url="$1" rest
+    case "$url" in
+        https://*@*|https://*[?#]*) printf credentials ;;
+        https://*) printf https ;;
+        ssh://*)
+            rest="${url#ssh://}"
+            if [[ "$rest" == *@* && "${rest%@*}" == *:* ]]; then
+                printf credentials
+            elif [[ "$(url_ssh_host "$url")" == github.com ]]; then
+                printf ssh
+            else
+                printf unsupported
+            fi
+            ;;
+        git@*)
+            if [[ "$(url_ssh_host "$url")" == github.com ]]; then
+                printf ssh
+            else
+                printf unsupported
+            fi
+            ;;
+        *) printf unsupported ;;
+    esac
+}
+
+# URL $1 as it may be printed. An https or ssh URL that url_transport accepted holds no secret and
+# is shown as it is. Anything else is shown without its user information (everything up to the
+# last '@') and without any query string or fragment, so a blocker that names the offending URL
+# never repeats a token or password in it.
+url_shown() {
+    local url="$1" rest
+    case "$(url_transport "$url")" in
+        https|ssh) printf '%s' "$url" ;;
+        *)
+            if [[ "$url" == *://* ]]; then
+                rest="${url#*://}"
+                rest="${rest##*@}"
+                printf '%s://%s' "${url%%://*}" "${rest%%[?#]*}"
+            elif [[ "$url" == *@* ]]; then
+                rest="${url##*@}"
+                printf '...@%s' "${rest%%[?#]*}"
+            else
+                printf '%s' "${url%%[?#]*}"
+            fi
+            ;;
+    esac
+}
+
+# The repository URL as seen by repo_transport and repo_url_shown: see repo_url.
+repo_transport() { url_transport "$(repo_url)"; }
+repo_url_shown() { url_shown "$(repo_url)"; }
+
+# Why the repository URL cannot be used, or nothing when it can. The URL appears only through
+# url_shown. When it came from an existing checkout, the message says how to fix that checkout.
+repo_url_problem() {
+    local url source hint=""
+    url="$(repo_url)"
+    source="$(repo_url_source)"
+    if [[ "$source" != REPO_URL ]]; then
+        hint=" Fix it with: git -C $APP_DIR remote set-url origin <URL>, then run this installer again."
+    fi
+    case "$(url_transport "$url")" in
+        credentials) printf '%s (%s) carries credentials: a user name, token or password, or a
+    query string or fragment that could hold one. A URL is printed by this installer and stored
+    in the checkout'"'"'s .git/config, which the service accounts can read, so it must hold no
+    secret. Use an anonymous https:// URL (the default) or, for a private fork on GitHub,
+    git@github.com:owner/repo.git with a read-only deploy key.%s Nothing has been changed.' \
+            "$source" "$(url_shown "$url")" "$hint" ;;
+        unsupported)
+            if [[ "$url" == git@* || "$url" == ssh://* ]]; then
+                printf '%s (%s) is an SSH URL for a host other than github.com.
+    SSH clones are supported from github.com only; use an https URL.%s Nothing has been
+    changed.' "$source" "$(url_shown "$url")" "$hint"
+            else
+                printf '%s (%s) is neither an https:// URL nor an SSH one.
+    Use an https:// URL (anonymous; the default) or, for a private fork on GitHub,
+    git@github.com:owner/repo.git (needs a read-only deploy key).%s Nothing has been changed.' \
+                    "$source" "$(url_shown "$url")" "$hint"
+            fi
+            ;;
+    esac
+}
+
+# Preflight for the repository: nothing to check for an anonymous HTTPS clone, the deploy key for
+# an SSH one, a stop for a URL that is neither (or that carries credentials). Run before the long
+# steps, like the site file.
+check_repo_access() {
+    case "$(repo_transport)" in
+        https) info "repository: $(repo_url_shown) ($(repo_url_source)), fetched anonymously over HTTPS" ;;
+        ssh) check_deploy_key ;;
+        *) blocker "$(repo_url_problem)" ;;
+    esac
+}
+
+# SSH URLs only (check_repo_access): the key the checkout reads a private fork with.
 check_deploy_key() {
     if [[ -f "$DEPLOY_KEY" ]]; then
         return 0
@@ -696,10 +924,10 @@ check_deploy_key() {
       ssh-keygen -t ed25519 -N '' -C \"wiki-mirror-\$(hostname)\" -f $DEPLOY_KEY
       cat ${DEPLOY_KEY}.pub
 
-    GitHub -> sfn-wiki-mirror -> Settings -> Deploy keys -> Add deploy key. Paste the line
-    printed by 'cat', leave \"Allow write access\" UNCHECKED (this host only ever reads).
-    GitHub refuses a key already used on any repository, so this must be a new key, not
-    any other deploy key on this host."
+    GitHub -> your repository (the one $(repo_url_shown) names) -> Settings -> Deploy keys ->
+    Add deploy key. Paste the line printed by 'cat', leave \"Allow write access\" UNCHECKED (this
+    host only ever reads). GitHub refuses a key already used on any repository, so this must be
+    a new key, not any other deploy key on this host."
 }
 
 preflight() {
@@ -721,8 +949,8 @@ preflight() {
     local free_gb
     free_gb="$(df --output=avail -BG / | tail -1 | tr -dc '0-9')"
     if [[ ${free_gb:-0} -lt 100 ]]; then
-        warn "only ${free_gb}G free on / - the article store and the Qdrant index need about 110 GB,"
-        warn "and about 150 GB at peak while a refresh builds beside the serving index (docs/DESIGN.md section 9)"
+        warn "only ${free_gb}G free on / - the article store and the Qdrant index need far more than that,"
+        warn "and more again at peak while a refresh builds beside the serving index (docs/SIZING.md has the figures)"
     else
         info "${free_gb}G free on /"
     fi
@@ -759,9 +987,10 @@ preflight() {
         REMAINING+=("Create $ENTERPRISE_ENV (Enterprise username and password) before the first build")
     fi
 
-    # Before the long steps: a missing or unregistered deploy key is the likeliest reason for
-    # a first run to stop, and it must stop before a 20-minute compile, not after.
-    check_deploy_key
+    # Before the long steps: for an SSH repository URL a missing or unregistered deploy key is the
+    # likeliest reason for a first run to stop, and it must stop before a 20-minute compile, not
+    # after. An https:// URL has nothing to check.
+    check_repo_access
     resolve_python
 
     ok "preflight"
@@ -771,8 +1000,10 @@ preflight() {
 # 2. Packages
 # ---------------------------------------------------------------------------
 
-#: Always needed. `openssh-client` for the deploy key and ssh-keyscan, `util-linux` (runuser)
-#: is essential on Debian. `openssl` is not needed: the API key comes from Python's secrets.
+#: Always needed. `openssh-client` is for an SSH repository URL (the deploy key, ssh-keyscan) and
+#: is kept for an https one too, so switching a box to a private fork later needs no package step.
+#: `util-linux` (runuser) is essential on Debian. `openssl` is not needed: the API key comes from
+#: Python's secrets.
 BASE_PACKAGES=(git curl ca-certificates openssh-client nftables zstd sqlite3 xz-utils)
 
 #: Needed only to compile CPython with ssl, sqlite3, lzma, bz2, ctypes, uuid, zlib and
@@ -890,10 +1121,14 @@ setup_users_and_dirs() {
 }
 
 # ---------------------------------------------------------------------------
-# 4. Deploy key: registered, and the host key pinned
+# 4. Deploy key: registered, and the host key pinned (SSH repository URLs only)
 # ---------------------------------------------------------------------------
 
+# Does nothing, and prints nothing, unless REPO_URL is an SSH URL: an anonymous HTTPS clone has no
+# key to register, no host key to pin (TLS and the system's CA store do that) and no ssh probe to
+# make. The key and the pinned github.com host key below are what a private fork's reads rely on.
 verify_deploy_key() {
+    [[ "$(repo_transport)" == ssh ]] || return 0
     step "Deploy key"
     if $DRY_RUN && [[ ! -f "$DEPLOY_KEY" ]]; then
         info "would verify $DEPLOY_KEY is registered on GitHub"
@@ -920,8 +1155,8 @@ verify_deploy_key() {
         return 0
     fi
     blocker "GitHub does not accept $DEPLOY_KEY.
-    Add ${DEPLOY_KEY}.pub as a deploy key on sfn-wiki-mirror (Settings -> Deploy keys, write
-    access UNCHECKED) and run this installer again. ssh said: ${reply##*$'\n'}"
+    Add ${DEPLOY_KEY}.pub as a deploy key on the repository $(repo_url_shown) names (Settings ->
+    Deploy keys, write access UNCHECKED) and run this installer again. ssh said: ${reply##*$'\n'}"
 }
 
 # ---------------------------------------------------------------------------
@@ -985,27 +1220,51 @@ build_python() {
 # 6. Checkout and virtualenv
 # ---------------------------------------------------------------------------
 
+# Clone REPO_URL into APP_DIR unless a checkout is already there. An existing checkout's origin is
+# never changed, so a box installed over SSH keeps fetching that way when this script is re-run
+# with the (https) default: update.sh reads the checkout's own configuration and never REPO_URL,
+# and repo_transport follows the checkout's origin for the same reason.
 clone_checkout() {
     step "Repository"
-    local ssh_cmd="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes"
+    local transport ssh_cmd=""
+    transport="$(repo_transport)"
+    if [[ "$transport" == ssh ]]; then
+        ssh_cmd="ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o StrictHostKeyChecking=yes"
+    fi
 
     if [[ -e "$APP_DIR/.git" ]]; then
         skip "checkout at $APP_DIR"
+    elif [[ "$transport" != https && "$transport" != ssh ]]; then
+        # Only a dry run gets here: check_repo_access already stopped a real one. Neither the
+        # clone command nor the message repeats a URL that carries credentials.
+        $DRY_RUN || die "$(repo_url_problem)"
+        info "would not clone: REPO_URL is not usable (see above)"
     else
         if [[ -e "$APP_DIR" && -n "$(ls -A "$APP_DIR" 2>/dev/null)" ]]; then
             blocker "$APP_DIR exists, is not empty, and is not a git checkout; move it aside and re-run"
         fi
-        run env GIT_SSH_COMMAND="$ssh_cmd" git clone --quiet --branch "$BRANCH" "$REPO_URL" "$APP_DIR" \
-            || blocker "clone failed; the key authenticated but $REPO_URL did not resolve"
+        if [[ "$transport" == ssh ]]; then
+            run env GIT_SSH_COMMAND="$ssh_cmd" git clone --quiet --branch "$BRANCH" "$REPO_URL" "$APP_DIR" \
+                || blocker "clone failed; the key authenticated but $REPO_URL did not resolve"
+        else
+            # GIT_TERMINAL_PROMPT=0: this URL is anonymous, so a 401 (a repository that is not
+            # public, a typo in the name) must fail at once, not stop at a "Username for" prompt.
+            run env GIT_TERMINAL_PROMPT=0 git clone --quiet --branch "$BRANCH" "$REPO_URL" "$APP_DIR" \
+                || blocker "clone failed (git's message is above). Is $REPO_URL right, and can this box reach it (DNS, outbound tcp 443)?"
+        fi
         ok "cloned $REPO_URL ($BRANCH)"
     fi
 
-    # Set on the checkout so every later fetch - update.sh's - uses the deploy key with the
-    # pinned host key, without an environment variable anyone has to remember. The checkout
-    # stays root-owned and read-only to the service accounts: the services run its code, so
-    # a service account that could write it could run its own code as another service.
-    if [[ -e "$APP_DIR/.git" ]]; then
-        run git -C "$APP_DIR" config core.sshCommand "$ssh_cmd"
+    # SSH only. Set on the checkout so every later fetch - update.sh's - uses the deploy key with
+    # the pinned host key, without an environment variable anyone has to remember. An https
+    # checkout needs nothing: anonymous fetches use git's defaults. Written only when it differs
+    # from what the checkout already holds, so a re-run on a working box changes nothing. The
+    # checkout stays root-owned and read-only to the service accounts: the services run its code,
+    # so a service account that could write it could run its own code as another service.
+    if [[ -n "$ssh_cmd" && -e "$APP_DIR/.git" ]]; then
+        if [[ "$(git -C "$APP_DIR" config --get core.sshCommand 2>/dev/null || true)" != "$ssh_cmd" ]]; then
+            run git -C "$APP_DIR" config core.sshCommand "$ssh_cmd"
+        fi
     fi
 }
 
@@ -1098,8 +1357,8 @@ install_config() {
     install_template "$SRC_DIR/mirror.yaml" "$CONF_DIR/mirror.yaml" 0640 root "$SHARED_GROUP"
     install_template "$SRC_DIR/qdrant.yaml" "$CONF_DIR/qdrant.yaml" 0644 root root
 
-    # The API key the main client presents. Generated here and nowhere else, never regenerated (a
-    # new key would silently lock the client out), never printed. Root-owned 0600: systemd
+    # The primary API key (the one the primary client presents). Generated here and nowhere else,
+    # never regenerated (a new key would silently lock the client out), never printed. Root-owned 0600: systemd
     # reads EnvironmentFile as root before dropping to `wikimirror`, so the service itself, and
     # the build user, never need to read it.
     if [[ -f "$MIRROR_ENV" ]] && grep -q '^WIKI_MIRROR_API_KEY=.' "$MIRROR_ENV"; then
@@ -1118,7 +1377,7 @@ install_config() {
         chmod 0600 "$MIRROR_ENV"
         unset key
         ok "generated WIKI_MIRROR_API_KEY (not shown; docs/OPERATIONS.md has the copy-to-client command)"
-        REMAINING+=("Copy WIKI_MIRROR_API_KEY to the main client and point it at this API (docs/OPERATIONS.md)")
+        REMAINING+=("Give WIKI_MIRROR_API_KEY (the primary key) to the client that will call this API; docs/OPERATIONS.md section 6 covers clients and keys")
     fi
 
     # The other agents' keys (Claude Code, ...), managed with `wiki-mirror key add|revoke`.
@@ -1156,8 +1415,8 @@ install_units() {
             continue
         fi
         [[ -f "$SRC_DIR/systemd/$unit" ]] || die "missing unit $SRC_DIR/systemd/$unit - the checkout is incomplete"
-        if ! cmp -s "$SRC_DIR/systemd/$unit" "/etc/systemd/system/$unit"; then
-            run install -m 0644 "$SRC_DIR/systemd/$unit" /etc/systemd/system/
+        if ! cmp -s "$SRC_DIR/systemd/$unit" "$UNIT_DIR/$unit"; then
+            run install -m 0644 "$SRC_DIR/systemd/$unit" "$UNIT_DIR/"
             changed=true
         fi
     done
@@ -1168,48 +1427,113 @@ install_units() {
         skip "units"
     fi
 
-    # Qdrant, the API and the two timers. NOT the build or update services: they are started by
-    # their timers (or by the operator: `wiki-mirror build-now`, `wiki-mirror update`), never by this installer.
-    run systemctl enable wiki-mirror-qdrant.service wiki-mirror.service \
-        wiki-mirror-build.timer wiki-mirror-update.timer
+    # Qdrant, the API and the monthly build timer, always. NOT the build or update services: they
+    # are started by their timers (or by the operator: `wiki-mirror build-now`, `wiki-mirror
+    # update`), never by this installer.
+    #
+    # The nightly update timer is opt-in. Its unit is always installed (above), but it is enabled
+    # only on --auto-update, or when it is already enabled: update.sh pulls the repository's main
+    # branch and applies it as root, and on a box that cloned anonymously that is a trust decision
+    # the operator makes, not one a default makes for them. Nothing here ever disables it, so
+    # re-running the installer on a box that follows upstream does not stop it. "Already enabled"
+    # is the state `enabled` exactly, as `wiki-mirror status` reads it: `is-enabled` also exits 0
+    # for enabled-runtime, static, indirect and alias, none of which is an operator's decision to
+    # follow upstream (and an enabled-runtime timer would not survive a reboot).
+    local to_enable=(wiki-mirror-qdrant.service wiki-mirror.service wiki-mirror-build.timer)
+    local what="qdrant, the API and the monthly build timer"
+    if $AUTO_UPDATE || [[ "$(systemctl is-enabled wiki-mirror-update.timer 2>/dev/null || true)" == enabled ]]; then
+        to_enable+=(wiki-mirror-update.timer)
+        what+=" and the nightly update timer"
+        UPDATES_ENABLED=true
+    fi
+    run systemctl enable "${to_enable[@]}"
     # Started separately and without `--now` semantics that abort the run: if the API cannot
     # start (bad config, a missing key) the installer must still finish the firewall and then
     # say so in the verify step, not die half-configured with the box wide open.
-    for unit in wiki-mirror-qdrant.service wiki-mirror.service \
-                wiki-mirror-build.timer wiki-mirror-update.timer; do
+    for unit in "${to_enable[@]}"; do
         run systemctl start "$unit" || warn "$unit did not start - journalctl -u ${unit%.*} -n 50"
     done
-    ok "qdrant, the API, the monthly build timer and the nightly update timer enabled (no build started)"
+    ok "$what enabled (no build started)"
+    if ! $UPDATES_ENABLED; then
+        info "the nightly update timer is installed but NOT enabled; to follow upstream: systemctl enable --now wiki-mirror-update.timer"
+    fi
 }
 
 # ---------------------------------------------------------------------------
 # 10. Firewall
 # ---------------------------------------------------------------------------
 
-# Print the firewall template $1 with the validated site values (LAN_CIDR, EMBEDDING_HOST,
-# EMBEDDING_PORT) in place of its three placeholders. Returns 1, printing nothing to stdout, if the
-# template is missing or empty, or any placeholder is left afterwards (a template that gained
-# one this script does not know would otherwise load as a syntax error, or worse).
+# The template puts everything that exists only because there is an embedding server - its two
+# `define` lines and its one egress rule - between these two comment lines. nft rejects a rule
+# that names an undefined variable, so a site without an embedding server cannot just leave the
+# values empty: render_firewall drops the bracketed lines, markers included, and keeps them
+# (as plain comments) when there is one.
+EMBEDDING_BEGIN='# >>> embedding-server'
+EMBEDDING_END='# <<< embedding-server'
+
+# Print the firewall template $1 with the validated site values (LAN_CIDR and, if the site has an
+# embedding server, EMBEDDING_HOST and EMBEDDING_PORT) in place of its placeholders; with no
+# embedding server, the lines between the EMBEDDING_BEGIN and EMBEDDING_END markers are left out
+# instead. Returns 1, printing nothing to stdout, if the template is missing or empty, its
+# markers are not paired, the embedding server is half-set (read_site_file never lets that
+# through), the embedding rule is still referred to outside its markers, or any placeholder is
+# left afterwards (a template that gained one this script does not know would otherwise load as
+# a syntax error, or worse).
 #
 # The substitution is plain parameter expansion, so nothing is evaluated; and the values are
 # digits, dots and one slash by construction (read_site_file), so none of them can carry
 # the `&` that bash 5.2 treats specially in a replacement.
 render_firewall() {
-    local template="$1" text
-    if [[ -z "$LAN_CIDR" || -z "$EMBEDDING_HOST" || -z "$EMBEDDING_PORT" ]]; then
+    local template="$1" text="" line trimmed skipping=false
+    if [[ -z "$LAN_CIDR" ]]; then
         echo "render_firewall: the site settings are not loaded" >&2
+        return 1
+    fi
+    if [[ ( -n "$EMBEDDING_HOST" && -z "$EMBEDDING_PORT" ) || ( -z "$EMBEDDING_HOST" && -n "$EMBEDDING_PORT" ) ]]; then
+        echo "render_firewall: EMBEDDING_HOST and EMBEDDING_PORT must be set together or not at all" >&2
         return 1
     fi
     if [[ ! -s "$template" ]]; then
         echo "render_firewall: $template is missing or empty" >&2
         return 1
     fi
-    # -d '' reads to end of file keeping every newline; read returns 1 at the end, which is
-    # expected here and not an error.
-    IFS= read -r -d '' text < "$template" || true
+    if [[ -n "$EMBEDDING_HOST" ]]; then
+        # -d '' reads to end of file keeping every newline; read returns 1 at the end, which is
+        # expected here and not an error.
+        IFS= read -r -d '' text < "$template" || true
+        text="${text//@EMBEDDING_HOST@/$EMBEDDING_HOST}"
+        text="${text//@EMBEDDING_PORT@/$EMBEDDING_PORT}"
+    else
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            if [[ "$trimmed" == "$EMBEDDING_BEGIN" ]]; then
+                if $skipping; then
+                    echo "render_firewall: $template opens '$EMBEDDING_BEGIN' twice without closing it" >&2
+                    return 1
+                fi
+                skipping=true
+            elif [[ "$trimmed" == "$EMBEDDING_END" ]]; then
+                if ! $skipping; then
+                    echo "render_firewall: $template has '$EMBEDDING_END' with no '$EMBEDDING_BEGIN' before it" >&2
+                    return 1
+                fi
+                skipping=false
+            elif ! $skipping; then
+                text+="$line"$'\n'
+            fi
+        done < "$template"
+        if $skipping; then
+            echo "render_firewall: $template opens '$EMBEDDING_BEGIN' and never closes it" >&2
+            return 1
+        fi
+        # What is left must not name the embedding values: a rule outside the markers would load
+        # as "undefined variable" and fail the whole ruleset, at boot included.
+        if [[ "$text" == *'$EMBEDDING_'* || "$text" == *'@EMBEDDING_'* ]]; then
+            echo "render_firewall: $template refers to the embedding server outside its '$EMBEDDING_BEGIN' markers" >&2
+            return 1
+        fi
+    fi
     text="${text//@LAN_CIDR@/$LAN_CIDR}"
-    text="${text//@EMBEDDING_HOST@/$EMBEDDING_HOST}"
-    text="${text//@EMBEDDING_PORT@/$EMBEDDING_PORT}"
     if [[ "$text" =~ (@[A-Z][A-Z0-9_]*@) ]]; then
         echo "render_firewall: $template still holds the placeholder ${BASH_REMATCH[1]} after rendering" >&2
         return 1
@@ -1329,6 +1653,9 @@ install_firewall() {
         info "would render $src with $SITE_FILE; the site-specific lines would read:"
         render_firewall "$src" | grep -E '^[[:space:]]*define (LAN_V4|EMBEDDING_V4|EMBEDDING_PORT) ' \
             | sed 's/^[[:space:]]*/        /' || true
+        if [[ -z "$EMBEDDING_HOST" ]]; then
+            info "        (no embedding server in $SITE_FILE: the ruleset would have no rule for one)"
+        fi
         if [[ -f "$dst" ]] && render_firewall "$src" | cmp -s - "$dst"; then
             skip "$dst matches the rendered template"
         else
@@ -1482,7 +1809,12 @@ summary() {
     printf '%sMirror install %s%s\n' "$BOLD" "$($DRY_RUN && echo 'dry run complete' || echo complete)" "$RESET"
     printf '%s%s%s\n\n' "$BOLD" "================================================" "$RESET"
 
-    local item
+    local item update_note
+    if $UPDATES_ENABLED; then
+        update_note="The box also updates itself at 02:20 local time (timedatectl shows its zone)."
+    else
+        update_note="Automatic nightly updates are OFF. To follow upstream at 02:20 local time: systemctl enable --now wiki-mirror-update.timer"
+    fi
     if [[ ${#DONE_STEPS[@]} -gt 0 ]]; then
         printf '%s%s%s\n' "$BOLD" "$($DRY_RUN && echo 'Would be done (nothing was changed):' || echo 'Done:')" "$RESET"
         for item in "${DONE_STEPS[@]}"; do printf '  %s+%s %s\n' "$GREEN" "$RESET" "$item"; done
@@ -1502,7 +1834,8 @@ ${BOLD}Next:${RESET}
   Status        wiki-mirror status
   First build   wiki-mirror build-now      (about 150 GB of downloads; run it when you choose)
   Logs          wiki-mirror logs api|build|qdrant
-  Update        wiki-mirror update         (the box also updates itself at 02:20 local time; timedatectl shows its zone)
+  Update        wiki-mirror update
+                ${update_note}
   Firewall      nft list counters    (what has been refused)
   Site values   $SITE_FILE; after editing it, run this installer again to re-render the firewall
 

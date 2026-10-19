@@ -53,6 +53,9 @@ NEW_FORMAT = "store=3 chunker=v1:512/50 index=1"
 KEY = "test-key-not-a-secret-0123456789"
 #: A valid site file in the shared address space (100.64.0.0/10), as the firewall note renders it.
 SITE = "LAN_CIDR=100.64.1.0/24\nEMBEDDING_HOST=100.64.1.77\nEMBEDDING_PORT=11434\n"
+#: Variables that change how git reaches a remote. The machine running the tests may set them (an
+#: ssh wrapper, no prompts), and a test of what the script itself sets must not inherit them.
+_AMBIENT_GIT = frozenset({"GIT_SSH_COMMAND", "GIT_SSH", "GIT_TERMINAL_PROMPT"})
 
 _STUBS = {
     # `id -u` says 0 so the root check passes; anything else is the real `id`.
@@ -130,7 +133,7 @@ class Box:
     def git_env(self) -> dict[str, str]:
         """An environment in which git has an identity and ignores the machine's config."""
         return {
-            **os.environ,
+            **{k: v for k, v in os.environ.items() if k not in _AMBIENT_GIT},
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_AUTHOR_NAME": "Test",
@@ -495,6 +498,39 @@ def test_update_unreachable_origin_is_failed_and_the_record_has_no_target(box: B
     assert box.head() == before
 
 
+def test_update_fetch_uses_the_ssh_command_configured_on_the_checkout(box: Box) -> None:
+    # A box installed over SSH (a private fork) keeps fetching through the deploy key's ssh
+    # command that install.sh set on the checkout: update.sh passes nothing of its own.
+    used = box.root / "ssh-used"
+    fake_ssh = box.root / "stubs" / "fake-ssh"
+    fake_ssh.write_text(f'#!/bin/sh\necho "$@" > "{used}"\nexit 255\n', encoding="utf-8")
+    fake_ssh.chmod(0o755)
+    box.git(box.app, "remote", "set-url", "origin", "ssh://git@git.example.invalid/team/repo.git")
+    box.git(box.app, "config", "core.sshCommand", str(fake_ssh))
+    result = box.run("--unattended")
+    assert result.returncode == 1
+    assert used.exists(), "the checkout's own ssh command was the one used"
+    assert "could not fetch from origin" in box.record()["detail"]
+
+
+def test_update_fetch_never_stops_at_a_credentials_prompt(box: Box) -> None:
+    # By hand, a repository that stopped being public answers 401 and git would wait at a
+    # "Username for" prompt; the fetch runs with GIT_TERMINAL_PROMPT=0 so it fails at once. The
+    # checkout's ssh command is the one place a test can see the environment git ran with.
+    seen = box.root / "prompt-seen"
+    fake_ssh = box.root / "stubs" / "fake-ssh"
+    fake_ssh.write_text(
+        f'#!/bin/sh\nprintf "%s" "${{GIT_TERMINAL_PROMPT-unset}}" > "{seen}"\nexit 255\n',
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    box.git(box.app, "remote", "set-url", "origin", "ssh://git@git.example.invalid/team/repo.git")
+    box.git(box.app, "config", "core.sshCommand", str(fake_ssh))
+    result = box.run("--unattended")
+    assert result.returncode == 1
+    assert seen.read_text(encoding="utf-8") == "0"
+
+
 def test_update_local_changes_in_the_checkout_are_failed_and_never_discarded(box: Box) -> None:
     box.publish({"README.md": "new\n"})
     (box.app / "deploy/wiki-mirror").write_text("# edited in production\n", encoding="utf-8")
@@ -646,6 +682,40 @@ def test_update_firewall_for_a_changed_site_file_is_noted_against_the_installed_
     _write_site(box, SITE.replace("EMBEDDING_PORT=11434", "EMBEDDING_PORT=9090"))
     box.publish({"README.md": "another change\n"})
     assert "differs from the installed one" in box.run("--unattended").stdout
+
+
+def test_update_firewall_for_a_site_without_an_embedding_server_is_rendered_and_compared(
+    box: Box,
+) -> None:
+    # An embedding server is optional: a site file holding the LAN alone must render through
+    # the installer's own --show-firewall, differ from nothing installed, and then match itself.
+    _publish_firewall_files(box)
+    _write_site(box, "LAN_CIDR=100.64.1.0/24\n")
+    first = box.run("--unattended")
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "differs from the installed one" in first.stdout
+    assert "cannot be rendered" not in first.stdout
+    rendered = box.show_firewall()
+    assert rendered.returncode == 0, rendered.stderr
+    assert "EMBEDDING" not in rendered.stdout
+    (box.root / "installed.nft").write_text(rendered.stdout, encoding="utf-8")
+    box.publish({"README.md": "another change\n"})
+    second = box.run("--unattended")
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert "firewall" not in second.stdout
+    assert box.record()["outcome"] == "updated"
+
+
+def test_update_firewall_with_only_one_embedding_value_is_noted_and_the_update_still_succeeds(
+    box: Box,
+) -> None:
+    _publish_firewall_files(box)
+    _write_site(box, "LAN_CIDR=100.64.1.0/24\nEMBEDDING_HOST=100.64.1.77\n")
+    result = box.run("--unattended")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "cannot be rendered" in result.stdout
+    assert "EMBEDDING_HOST is set but EMBEDDING_PORT is not" in result.stderr
+    assert box.record()["outcome"] == "updated"
 
 
 def test_update_firewall_without_a_site_file_is_noted_and_the_update_still_succeeds(

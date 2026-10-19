@@ -10,8 +10,8 @@ script is right, so fix this file. Elsewhere in the docs the mirror's address is
 | The LAN (clients, this box, the NAS, the Proxmox host) | `192.168.1.0/24` | `LAN_CIDR` in `site.env` |
 | Your router, which is also the LAN's DNS resolver | `192.168.1.1` | the resolver the container will use |
 | This box (reserved in your router's DHCP server) | `192.168.1.50` | `<mirror-host>` |
-| The embedding server (needed from W2 on) | `192.168.1.60`, port `8080` | `EMBEDDING_HOST`, `EMBEDDING_PORT` in `site.env` |
-| The NAS export holding the snapshots | `192.168.1.40:/mnt/tank/wikipedia-mirror` | your NFS export |
+| The embedding server (optional; for the planned semantic index, W2, see [ROADMAP.md](ROADMAP.md)) | `192.168.1.60`, port `8080` | `EMBEDDING_HOST`, `EMBEDDING_PORT` in `site.env` |
+| The NFS export holding the snapshots (if you use a NAS) | `192.168.1.40:/mnt/tank/wikipedia-mirror` | your NFS export |
 | The Proxmox container ID | `<ctid>` | `pct list` shows it |
 
 Paths are inside the container unless a step says **Proxmox host**. `#` is a root prompt, `$` is any shell.
@@ -28,11 +28,11 @@ The reference deployment, with the example addresses above:
 |---|---|
 | Container | an LXC, hostname `wikipedia-mirror`, 192.168.1.50 (a DHCP reservation), Debian 12 |
 | Size | 6 vCPU, 32 GB RAM (8 GB is the minimum), local NVMe disk |
-| Snapshots | NFS dataset `192.168.1.40:/mnt/tank/wikipedia-mirror`, mounted on the Proxmox host and bind-mounted at `/mnt/wikipedia` |
+| Snapshots | NFS dataset `192.168.1.40:/mnt/tank/wikipedia-mirror` (a NAS), mounted on the Proxmox host and bind-mounted at `/mnt/wikipedia` |
 | Python | 3.13, built from source by the installer (Debian 12 ships 3.11) |
 | Users | `wikimirror` (API), `wikimirror-sync` (download, parse, index), `qdrant`, `root` |
 | Services | `wiki-mirror-qdrant`, `wiki-mirror` (API), `wiki-mirror-build` (oneshot) |
-| Timers | `wiki-mirror-build.timer` (monthly), `wiki-mirror-update.timer` (nightly) |
+| Timers | `wiki-mirror-build.timer` (monthly), `wiki-mirror-update.timer` (nightly; opt-in, see [The nightly update](#the-nightly-update)) |
 
 ### Memory and disk guidance
 
@@ -40,7 +40,7 @@ Memory, with the box at 32 GB:
 
 | Process | Cap | Notes |
 |---|---|---|
-| Qdrant | `MemoryMax=12G` | The first full keyword build peaked at 5.1 GB of anonymous memory during segment merges and rests at 4.3 GB. The cap leaves room for W2's binary vectors; W2 needs it near 20G ([ROADMAP.md](ROADMAP.md)). |
+| Qdrant | `MemoryMax=12G` | The first full keyword build peaked at 5.1 GB of anonymous memory during segment merges and rests at 4.3 GB. The cap leaves room for the planned semantic index's (W2) binary vectors, which needs it near 20G ([ROADMAP.md](ROADMAP.md)). |
 | API | `MemoryMax=1500M` | |
 | Build | `MemoryMax=5G` | `Nice=10`, idle I/O priority: a build never makes search slow. |
 
@@ -56,18 +56,57 @@ There is deliberately no `MemoryHigh` on Qdrant: it throttled the build into tim
 Disk, as measured on 2026-10-18 after the move to NVMe: 45 GB used with compression (article store 25 GB,
 Qdrant 37 GB logical), 206 GB free. A monthly build needs the new store beside the old one for a few hours, about
 100 GB at peak. The build refuses to create a store or collection with fewer than `min_free_disk_gb` (20) GB
-free. The NAS holds two snapshots of about 151 GB each. Never put the store or Qdrant on the NAS.
+free. The snapshot storage holds two snapshots of about 151 GB each. Never put the store or Qdrant on network
+storage.
 
-`vm.max_map_count` (a kernel setting, changeable only on the Proxmox host) may need raising before W2's dense
-index: `sysctl -w vm.max_map_count=1048576` on the host.
+**One figure to plan with** ([SIZING.md](SIZING.md) has the arithmetic): **250 GB of fast local disk** for the
+store, the index and the headroom a monthly build needs, plus **about 300 GB** of bulk storage for the two retained
+snapshots. On a single disk that is about 550 GB.
+
+`vm.max_map_count` (a kernel setting, changeable only on the Proxmox host) may need raising before the planned
+semantic index (W2): `sysctl -w vm.max_map_count=1048576` on the host.
 
 ## Install
 
 One-time provisioning, then the installer. Background: [DESIGN.md §11](DESIGN.md#11-w0-what-the-box-and-the-account-turned-out-to-be-2026-10-16).
+Before you start: a dedicated x86_64 Debian 12 or 13 container or VM (the installer owns the box's firewall, so not a
+shared or Docker host), the sizes in [Memory and disk guidance](#memory-and-disk-guidance), and a free Wikimedia
+Enterprise account (step 3). Time: about 30 minutes to install, about 151 GB to download and about 14 hours for the
+first build (measured: [The first build](#the-first-build)).
 
-### 1. The NAS mount
+### 1. Get the installer onto the box
 
-An unprivileged container cannot mount NFS, so the host mounts it and binds it in. On the **Proxmox host**:
+The installer is one script that clones the rest. It reads the site file's example from beside itself, so copy both
+files first. From a checkout or a download of this repository, on your workstation:
+
+```bash
+$ scp deploy/install.sh deploy/site.env.example root@192.168.1.50:/root/
+```
+
+A container without root SSH has no `scp` route. On the **Proxmox host**, push the files in instead:
+
+```bash
+# pct push <ctid> deploy/install.sh /root/install.sh --perms 0755
+# pct push <ctid> deploy/site.env.example /root/site.env.example
+```
+
+Or, in a root shell on the box (needs `curl`; read the script before you run it):
+
+```bash
+# curl -fsSLO https://raw.githubusercontent.com/SFN-ALPHA/sfn-wiki-mirror/main/deploy/install.sh
+# curl -fsSLO https://raw.githubusercontent.com/SFN-ALPHA/sfn-wiki-mirror/main/deploy/site.env.example
+# chmod 0755 install.sh
+```
+
+### 2. Storage at `/mnt/wikipedia`
+
+The downloaded snapshots (about 300 GB for two) live at `/mnt/wikipedia/snapshots`. The build unit refuses to run
+unless `/mnt/wikipedia` is a **mount point** ("is not a mount point"), so a plain directory is not enough. The
+article store and Qdrant stay on the container's own local disk, never on network storage.
+
+**Option A: NFS from a NAS (the reference setup).** Any NFS server will do (TrueNAS, a Linux box with `nfsd`, a
+commercial NAS). An unprivileged Proxmox container cannot mount NFS, so the host mounts it and binds it in. On the
+**Proxmox host**:
 
 ```bash
 # mkdir -p /mnt/wikipedia-mirror
@@ -83,17 +122,48 @@ container's firewall allows DNS to the site's `LAN_CIDR` only ([The site file](#
 rewrites `resolv.conf` on every start.
 
 **NFS user mapping.** In the unprivileged container, `wikimirror-sync` writes as UID 100000 plus its own. On the
-NFS share, map every user and group to the dataset's owner (on TrueNAS, set **Mapall** user and group), and
-restrict the authorized hosts to the Proxmox host alone. Map-all, not map-root (TrueNAS's Maproot): Maproot maps
-only requests that arrive as uid 0, and none of the container's writes do. The installer creates
-`/mnt/wikipedia/snapshots` as `wikimirror-sync` and writes a test file; if that test fails, this mapping is the
-cause.
+NFS share, map every user and group to the dataset's owner (on TrueNAS, set **Mapall** user and group; other
+servers call it `all_squash` with `anonuid`/`anongid`), and restrict the authorized hosts to the Proxmox host alone.
+Map-all, not map-root (TrueNAS's Maproot): Maproot maps only requests that arrive as uid 0,
+and none of the container's writes do. The installer creates `/mnt/wikipedia/snapshots` as `wikimirror-sync` and
+writes a test file; if that test fails, this mapping is the cause.
 
-### 2. The Enterprise sign-in
+**Option B: one local disk, no NAS.** Put the snapshots in a directory on a big local disk and bind-mount that
+directory onto `/mnt/wikipedia`, so that it is a mount point. You need about 550 GB in all (250 GB local plus 300 GB
+of snapshots).
 
-The Wikimedia Enterprise account (free tier) is a username and password in a 0600 file. Type it in a root shell
-in the container so it never reaches a command line, a log or a repository (the username is lower-cased, as the API
-requires):
+* On a **VM or a privileged container or bare metal**, as root on the box:
+
+  ```bash
+  # mkdir -p /srv/wikipedia /mnt/wikipedia
+  # echo '/srv/wikipedia /mnt/wikipedia none bind 0 0' >> /etc/fstab
+  # mount /mnt/wikipedia
+  # findmnt /mnt/wikipedia           # must print a line
+  ```
+
+* In an **unprivileged Proxmox container**, the container cannot mount anything itself, so bind the directory in
+  from the **Proxmox host**. Give the directory to the container's root (host uid 100000 in the default mapping), so
+  the installer can create `snapshots` inside it as `wikimirror-sync`:
+
+  ```bash
+  # mkdir -p /srv/wikipedia
+  # chown 100000:100000 /srv/wikipedia
+  # pct set <ctid> -mp1 /srv/wikipedia,mp=/mnt/wikipedia,backup=0
+  # pct reboot <ctid>
+  ```
+
+  Inside the container, `findmnt /mnt/wikipedia` must print a line.
+
+### 3. The Enterprise account and sign-in
+
+Wikimedia Enterprise's **free tier** includes the Snapshot API this mirror downloads from, and needs no credit card.
+Create the account at <https://enterprise.wikimedia.com/> (the free sign-up is at
+`https://dashboard.enterprise.wikimedia.com/signup/`), verify your email, and note the username and password you chose. The
+free tier allows 30 full-snapshot and 1,500 chunk downloads a month ([The first build](#the-first-build) shows how
+the service stays within that), and a snapshot refreshes monthly.
+
+The credentials are a username and password in a 0600 file. Type them in a root shell in the container so they never
+reach a command line, a log or a repository (the username is lower-cased, as the API requires):
 
 ```bash
 # install -d -m 0750 /etc/wiki-mirror
@@ -104,39 +174,26 @@ requires):
 The installer makes it `wikimirror-sync`-owned, 0600. The API user cannot read it. To change the password later, write
 the file again the same way. This file exists only on the box.
 
-### 3. The deploy key
-
-A read-only GitHub deploy key on this repository, separate from any other box's (GitHub refuses one key on two
-repositories, and a separate key can be revoked alone):
-
-```bash
-# install -d -m 0700 /root/.ssh
-# ssh-keygen -t ed25519 -N '' -C "wiki-mirror-$(hostname)" -f /root/.ssh/wiki_mirror_deploy
-# cat /root/.ssh/wiki_mirror_deploy.pub
-```
-
-GitHub, repository Settings, Deploy keys, Add deploy key; paste the line; leave **Allow write access**
-unchecked. The installer stops, before doing anything long, if the key is missing or not registered. The
-repository it clones is `REPO_URL` at the top of `deploy/install.sh` (override with `--repo`).
-
 ### 4. The site file
 
-Three values differ from one network to the next, and the firewall is built from them, so they are yours to set.
-They live in `/etc/wiki-mirror/site.env` (root:root 0644; no secret belongs in it), never in the repository:
+One value differs from every network to the next, and the firewall is built from it, so it is yours to set. It
+lives in `/etc/wiki-mirror/site.env` (root:root 0644; no secret belongs in it), never in the repository:
 
-| Key | What it is | Example |
-|---|---|---|
-| `LAN_CIDR` | The IPv4 network your clients and this box share. SSH and the API port are admitted from it, and DNS, NTP and ping go to it. It must be a private network (see below), this box must have an address inside it, and the resolver in `/etc/resolv.conf` must be inside it. | `192.168.1.0/24` |
-| `EMBEDDING_HOST` | IPv4 address of the Ollama-compatible embedding server. The only LAN host the build user (`wikimirror-sync`) may open a connection to. | `192.168.1.60` |
-| `EMBEDDING_PORT` | That server's TCP port. Required; there is no default. | `8080` |
+| Key | Required | What it is | Example |
+|---|---|---|---|
+| `LAN_CIDR` | yes | The IPv4 network your clients and this box share. SSH and the API port are admitted from it, and DNS, NTP and ping go to it. It must be a private network (see below), this box must have an address inside it, and the resolver in `/etc/resolv.conf` must be inside it. | `192.168.1.0/24` |
+| `EMBEDDING_HOST` | no | IPv4 address of an Ollama-compatible embedding server, for the planned semantic index (W2, see [ROADMAP.md](ROADMAP.md)). It opens one egress rule: the only LAN host the build user (`wikimirror-sync`) may open a connection to. Nothing uses an embedding server today, so leave it out unless you are preparing for W2. | `192.168.1.60` |
+| `EMBEDDING_PORT` | no | That server's TCP port. Give both `EMBEDDING_HOST` and `EMBEDDING_PORT`, or neither; there is no default. | `8080` |
 
 The file is plain `KEY=value` lines, one per key, no quotes and no spaces; blank lines and whole-line `#` comments
-are fine (`deploy/site.env.example` is the template). **Create it before the first run:**
+are fine (`deploy/site.env.example` is the template). Every key in it ships commented out, `LAN_CIDR` included,
+so an unedited copy is refused: remove the `# ` from `LAN_CIDR` and write your own network, even if it happens to be
+the example's `192.168.1.0/24`. **Create it before the first run:**
 
 ```bash
 # install -d -m 0751 /etc/wiki-mirror
-# install -m 0644 /root/site.env.example /etc/wiki-mirror/site.env     # from the repository's deploy/
-# $EDITOR /etc/wiki-mirror/site.env
+# install -m 0644 /root/site.env.example /etc/wiki-mirror/site.env     # copied to /root/ in step 1
+# $EDITOR /etc/wiki-mirror/site.env                                   # uncomment and set LAN_CIDR
 ```
 
 If you skip this, the installer copies the example there itself and stops, telling you to edit it. It stops the
@@ -153,8 +210,8 @@ blockers):
   The firewall admits SSH and the API from everything in `LAN_CIDR`, so a prefix shorter than `/8` is refused
   (`/0` would admit the whole internet, `128.0.0.0/1` half of it), and so is any network outside those four blocks:
   a public block as "the LAN" is the same hole at a smaller size.
-* `EMBEDDING_HOST`: a dotted-quad IPv4 address, not a name.
-* `EMBEDDING_PORT`: digits only, 1 to 65535, no leading zero.
+* `EMBEDDING_HOST` (optional): a dotted-quad IPv4 address, not a name.
+* `EMBEDDING_PORT` (optional): digits only, 1 to 65535, no leading zero. Set both embedding keys or neither.
 * Only these three keys, each once. A quote, a space, a trailing comment, `export`, `$(...)` or anything else on a
   line is a problem, not something the installer tries to interpret.
 * **Who owns the file.** It decides what a firewall applied as root admits, so the installer refuses a file that
@@ -185,38 +242,69 @@ for the SSH session it runs in, but not for a different machine you will connect
 
 ### 5. Run the installer
 
+Run it as root on the box, with the two files from step 1 in `/root/`:
+
 ```bash
-$ scp deploy/install.sh deploy/site.env.example root@192.168.1.50:/root/
 # /root/install.sh --dry-run        # every step, and anything that would stop the real run
 # /root/install.sh                  # about 30 minutes the first time (Python compiles)
+# /root/install.sh --auto-update    # the same, and also turn on the nightly self-update (see below)
 ```
 
-Copy `site.env.example` beside `install.sh` when you run a copy of it (there is no checkout yet to find it in).
+`site.env.example` must sit beside `install.sh` when you run a copy of it (there is no checkout yet to find it in).
+
+By default it clones this repository over anonymous HTTPS (`https://github.com/SFN-ALPHA/sfn-wiki-mirror.git`), so no
+account or key is needed. To install from your own fork, pass `--repo <url>`; an SSH URL (`git@github.com:<you>/<fork>.git`)
+needs the read-only deploy key described in [Private fork](#private-fork-the-deploy-key) below.
 
 It is idempotent: re-run it after a failure, a restore, a site-file edit or a template change. It checks Debian
-12/13, free disk (warns under 100 GB), the site file, the NAS mount and writability, the resolver (inside
-`LAN_CIDR`) and the deploy key; installs packages; creates
-the users and directories; builds CPython 3.13 from python.org source (checksum-verified); clones to
+12/13, free disk (it warns when it is low; [SIZING.md](SIZING.md) has the figures), the site file, the snapshot
+mount and writability and the resolver (inside `LAN_CIDR`), plus the deploy key for an SSH clone; installs packages;
+creates the users and directories; builds CPython 3.13 from python.org source (checksum-verified); clones to
 `/opt/wiki-mirror`; installs the package into a venv with every dependency at the exact version in
 `deploy/constraints.txt`, from wheels only (nothing compiles on the box, nothing newer arrives by
 accident); installs Qdrant 1.12.4 (checksum-verified); writes `mirror.yaml`, `qdrant.yaml`, a generated
-`WIKI_MIRROR_API_KEY` and an empty `clients.json`; installs and enables the Qdrant unit, the API, the monthly
-build timer and the nightly update timer; renders the firewall from the template and the site file and applies it;
-installs `/usr/local/bin/wiki-mirror`; and proves
+`WIKI_MIRROR_API_KEY` and an empty `clients.json`; installs and enables the Qdrant unit, the API and the monthly
+build timer, and installs the nightly update timer, enabling it only with `--auto-update`; renders the firewall from
+the template and the site file and applies it; installs `/usr/local/bin/wiki-mirror`; and proves
 Qdrant, the API and the firewall by behaviour (including a fetch as apt's own user).
 
 It never starts a build, never prints a secret, and never overwrites an edited config or an edited site file.
-`--adopt-config` replaces `mirror.yaml` or `qdrant.yaml` from the template and keeps a dated backup.
+`--adopt-config` replaces `mirror.yaml` or `qdrant.yaml` from the template and keeps a dated backup. Re-running it
+never turns an enabled update timer off.
 
-**Time zone.** The nightly update timer fires at 02:20 *local* time, so the container's time zone decides when it
-runs: a new container is usually on UTC, so set yours once (`timedatectl set-timezone <Region/City>`; plain
+**The nightly self-update is opt-in.** With `--auto-update` (or later `systemctl enable --now
+wiki-mirror-update.timer`) the box pulls the `main` branch at 02:20 local time and applies it as root. That means
+the box runs whatever lands on the upstream `main` branch (or on your fork's, if you cloned a fork), as root,
+unreviewed by you. Without it, nothing changes until you run `wiki-mirror update` yourself. See
+[The nightly update](#the-nightly-update).
+
+**Time zone.** If you enable the nightly update, it fires at 02:20 *local* time, so the container's time zone decides
+when it runs: a new container is usually on UTC, so set yours once (`timedatectl set-timezone <Region/City>`; plain
 `timedatectl` shows the current zone). The monthly build timer is in UTC on purpose and does not follow it.
+
+#### Private fork: the deploy key
+
+Only for an SSH clone URL (for example a private fork); SSH clones are supported from `github.com` only, and
+any other host needs an `https://` URL. A URL carrying a user name, token or query string is refused. Create a
+read-only GitHub deploy key on that repository,
+separate from any other box's (GitHub refuses one key on two repositories, and a separate key can be revoked alone):
+
+```bash
+# install -d -m 0700 /root/.ssh
+# ssh-keygen -t ed25519 -N '' -C "wiki-mirror-$(hostname)" -f /root/.ssh/wiki_mirror_deploy
+# cat /root/.ssh/wiki_mirror_deploy.pub
+```
+
+On GitHub open the repository's Settings, Deploy keys, Add deploy key; paste the line; leave **Allow write access**
+unchecked. Then run `/root/install.sh --repo git@github.com:<you>/<fork>.git`. The installer stops, before doing
+anything long, if the key is missing or not registered, and prints these same steps.
 
 ### 6. Give clients their keys
 
 The installer generates one primary key, `WIKI_MIRROR_API_KEY` in `/etc/wiki-mirror/mirror.env`
-(root, 0600); it authenticates as the client `primary`. Use it for one application, or leave it alone and issue every
-client a key of its own, which is better because the logs then name the caller and one key can be revoked alone:
+(root, 0600); it authenticates as the client `primary`. Give it to the primary client, the one application that will
+call the API first, or leave it alone and issue every client a key of its own, which is better because the logs then
+name the caller and one key can be revoked alone:
 
 ```bash
 # wiki-mirror key add my-application
@@ -333,10 +421,14 @@ delay). Wikimedia Enterprise publishes on the 1st at 00:00 UTC and recommends co
 UTC; the 2nd gives a day of margin. `Persistent=true` runs a missed build at the next boot. Check it with
 `wiki-mirror status` (Schedule) or `systemctl list-timers wiki-mirror-build.timer`.
 
+**Not yet proven unattended.** The first build, in October 2026, was started by hand with `wiki-mirror build-now`.
+The timer is scheduled, and its first unattended run is due on 2026-11-02. Until that has run, treat the monthly
+rebuild as designed and tested, not as demonstrated: check `wiki-mirror status` after the 2nd.
+
 Today the monthly job is a full build beside the live collection, then an alias swap (the rare-path design).
-W3 will replace it with an in-place update that reuses unchanged work ([ROADMAP.md](ROADMAP.md),
-[DESIGN.md §12.6](DESIGN.md#126-the-monthly-update-w3)). On the 2nd the nightly update will usually find the
-build running and defer.
+W3 (monthly in-place updates, [ROADMAP.md](ROADMAP.md)) will replace it with an update that reuses unchanged work
+([DESIGN.md §12.6](DESIGN.md#126-the-monthly-update-w3)). On the 2nd the nightly update, if you enabled it, will
+usually find the build running and defer.
 
 ## The nightly update
 
@@ -351,15 +443,22 @@ up within 60 seconds. A firewall change in the checkout is reported, not applied
 `site.env` first, so only a real difference is reported): apply it deliberately with
 `/opt/wiki-mirror/deploy/install.sh`. If `site.env` cannot be rendered, the update says so and carries on.
 
-**The box updates itself every night** ([D4](DECISIONS.md#d4)): `wiki-mirror-update.timer` runs
-`update.sh --unattended` at **02:20 local time**, plus up to five minutes' random delay,
-`Persistent=true`. "Local" is the container's own time zone (see [Run the installer](#5-run-the-installer)); check the
-next run with `systemctl list-timers wiki-mirror-update`. The service runs
-as root (the checkout is root-owned), with no retry and no alert unit; a failure shows on `wiki-mirror status`,
-`/v1/wiki/health` and `systemctl --failed`.
+**The automatic nightly update is opt-in** ([D4](DECISIONS.md#d4) built it; the installer leaves it off). Enable it
+with `install.sh --auto-update` or, any time, `systemctl enable --now wiki-mirror-update.timer`; turn it off with
+`systemctl disable --now wiki-mirror-update.timer`. Re-running the installer never turns an enabled timer off.
+**The trust model, plainly:** an enabled timer means your box runs whatever lands on the upstream `main` branch (or
+on your fork's, if you cloned a fork), as root, every night, with a rollback only for code that fails to start.
+Enable it only if you trust that branch and its maintainers that far. Without it, update by hand with
+`wiki-mirror update` when you have read what changed.
 
-* **A box installed before this timer existed** needs it enabled once: `systemctl enable --now
-  wiki-mirror-update.timer`. A new timer arriving with an update is installed but never enabled.
+Once enabled, `wiki-mirror-update.timer` runs `update.sh --unattended` at **02:20 local time**, plus up to five
+minutes' random delay, `Persistent=true`. "Local" is the container's own time zone (see
+[Run the installer](#5-run-the-installer)); check the next run with `systemctl list-timers wiki-mirror-update`. The
+service runs as root (the checkout is root-owned), with no retry and no alert unit; a failure shows on
+`wiki-mirror status`, `/v1/wiki/health` and `systemctl --failed`.
+
+* **A box installed before the timer was opt-in** may already have it enabled; `systemctl list-timers
+  wiki-mirror-update` shows. A new timer arriving with an update is installed but never enabled.
 * **Every run is recorded** in `/var/lib/wiki-mirror/state/update.json` (`at`, `from`, `to`, `outcome`,
   `detail`, `unattended`). Health carries it as `update` (reporting only), and `wiki-mirror status` prints a
   `last update` row.
@@ -390,7 +489,8 @@ Outcomes:
 **Both services run `python -I`** (no `PYTHONPATH`, no user site, no working directory on `sys.path`). The API
 unit has `RestartPreventExitStatus=2`: a configuration error stops it instead of looping.
 
-**Because `main` ships nightly, never push untested work to `main`.** See [CLAUDE.md](../CLAUDE.md).
+**Because `main` can ship to boxes with the nightly update enabled, never push untested work to `main`.** See
+[CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ### Refreshing `constraints.txt`
 
@@ -414,10 +514,9 @@ take a newer set deliberately. On the workstation:
    >     --target "$(mktemp -d)" --quiet "$pin" >/dev/null 2>&1 || echo "NOWHEEL $pin"; done
    ```
 
-   Every `--platform` is listed because pip does not expand `manylinux_2_36` to the older tags. The only line
-   allowed is `http-ece` (pure Python, published only as an sdist; the installer builds it with
-   `--no-binary=http-ece`). Anything else means that version has no wheel for the box: pin the previous one,
-   because the installer fails loudly rather than compile on the box.
+   Every `--platform` is listed because pip does not expand `manylinux_2_36` to the older tags. It must print
+   nothing. A `NOWHEEL` line means that version has no wheel for the box: pin the previous one, because the
+   installer installs wheels only and fails loudly rather than compile on the box.
 5. Commit the new file with the change that needed it. `tests/deploy/` checks it is exact, covers the direct
    dependencies, meets `pyproject.toml`'s floors, and is what both scripts install with.
 
@@ -425,8 +524,11 @@ take a newer set deliberately. On the workstation:
 
 Input is SSH and :8300 from the site's LAN (`LAN_CIDR` in [`site.env`](#4-the-site-file)), nothing else. Output is
 per user: `wikimirror-sync` gets tcp 443
-anywhere (Enterprise and the S3 bucket its downloads redirect to cannot be named by address) and the embedding server
-(`EMBEDDING_HOST` and `EMBEDDING_PORT` in `site.env`); root gets 80/443 (PyPI, GitHub), git-over-SSH to GitHub's published ranges and DHCP renewals (udp 68 to
+to the internet, meaning anywhere except the private and shared ranges (10/8, 172.16/12, 192.168/16, 100.64/10),
+so the parse job, which handles editable web content, cannot reach a router or NAS admin page on the LAN
+(Enterprise and the S3 bucket its downloads redirect to cannot be named by address) and, if you set
+`EMBEDDING_HOST` and `EMBEDDING_PORT` in `site.env`, that one embedding server; root gets 80/443 (PyPI, GitHub),
+git-over-SSH to GitHub's published ranges (for an SSH clone) and DHCP renewals (udp 68 to
 67, LAN only); `_apt` gets tcp 80/443 over IPv4; `wikimirror` and `qdrant` get nothing. DNS goes to the LAN resolver
 only.
 
@@ -440,10 +542,10 @@ connection into a hang for the whole connect timeout. Input stays a drop.
 
 | Symptom | Cause | What to do |
 |---|---|---|
-| `wiki-mirror logs build` shows a login failure or 401 | Wrong Enterprise credentials, or the account was changed | Rewrite `enterprise.env` (Install, step 2). The client logs in again on any 401 and refreshes its token for 90 days, so a persistent 401 is the credentials. |
+| `wiki-mirror logs build` shows a login failure or 401 | Wrong Enterprise credentials, or the account was changed | Rewrite `enterprise.env` ([Install, step 3](#3-the-enterprise-account-and-sign-in)). The client logs in again on any 401 and refreshes its token for 90 days, so a persistent 401 is the credentials. |
 | Build unit fails at once, "Assertion failed ... is not a mount point" | The NAS bind mount is missing (the host rebooted before NFS, or the share is down) | On the Proxmox host: `mount /mnt/wikipedia-mirror`, check `ls` shows the data, `pct reboot <ctid>`. The API is unaffected: it serves from local disk. |
-| Installer or build says `wikimirror-sync` cannot write to the snapshots directory | NFS user mapping | Map all users on the share to the dataset's owner (on TrueNAS, **Mapall**; Install, step 1); restart the build. |
-| The installer stops at "site file": missing, "still the shipped example", or a list of problems | `/etc/wiki-mirror/site.env` is absent, unedited, not owned by root or writable by others, holds a value that is not a valid network, address or port, or a `LAN_CIDR` that is not private, that your SSH session is outside of, or that this box has no address in | Edit or fix it (Install, step 4) and run `install.sh` again. `install.sh --dry-run` lists every problem; `install.sh --show-firewall` prints what a valid file would produce. |
+| Installer or build says `wikimirror-sync` cannot write to the snapshots directory | NFS user mapping | Map all users on the share to the dataset's owner (on TrueNAS, **Mapall**; [Install, step 2](#2-storage-at-mntwikipedia)); restart the build. |
+| The installer stops at "site file": missing, "still the shipped example", or a list of problems | `/etc/wiki-mirror/site.env` is absent, unedited, not owned by root or writable by others, holds a value that is not a valid network, address or port, or a `LAN_CIDR` that is not private, that your SSH session is outside of, or that this box has no address in | Edit or fix it ([Install, step 4](#4-the-site-file)) and run `install.sh` again. `install.sh --dry-run` lists every problem; `install.sh --show-firewall` prints what a valid file would produce. |
 | The installer stops at "resolv.conf names a resolver outside the LAN" | A public resolver in `/etc/resolv.conf` (Proxmox or the DHCP lease put it there), or `LAN_CIDR` does not contain the real resolver | Pin the LAN resolver as the message says, or correct `LAN_CIDR`. |
 | `wiki-mirror status` says `degraded` with an `error` row "<stage>: ... (see the build log)", and the build unit "last run FAILED" | A stage raised. The unit retries hourly, five times in a day, then stays failed | `wiki-mirror logs build` has the traceback. Fix the cause, then `wiki-mirror build-now` (clears the retry limit, resumes from the checkpoints). Exit 2 in the log is a configuration error and is not retried. |
 | `wiki-mirror: build: a build is already running` (exit 1) | `state/build.lock` is held: a build, a hand-run stage, or the update | `wiki-mirror status` / `wiki-mirror logs build`. Nothing was changed. The lock goes with the process, so no stale lock survives a crash or reboot. |
@@ -459,17 +561,81 @@ connection into a hang for the whole connect timeout. Input stays a drop.
 | `wiki-mirror status` says `degraded`; `wiki-mirror logs api` says "the article store for snapshot <date tag> (collection wikipedia_lexical_...) cannot be opened" | A build moved the alias (or the collection's `applied_snapshot` moved) but that snapshot's store is missing, unfinished or damaged | The old snapshot is still serving. `ls /var/lib/wiki-mirror/articles`; `wiki-mirror build-now` repeats parse and index (it resumes). The API picks the result up within 30 seconds. |
 | `wiki-mirror status` says `degraded`, or the serving section has a `problem`; `wiki-mirror logs api` says "wikipedia_lexical_... has no usable index state" | `state/index_lexical_<born>.json` is missing, unreadable or unfinished: the collection has no record of which store it matches. The API will not guess "the newest store": a snippet cut from the wrong text would be cited with the wrong revision | Restore the file from a backup of `/var/lib/wiki-mirror/state/`; failing that delete the collection (`curl -X DELETE http://127.0.0.1:6333/collections/wikipedia_lexical_<born>` in the container; search is down until the rebuild ends) and run `wiki-mirror build-now`. |
 | `wiki-mirror.service` fails at start, exit status 2, the log names `clients.json` | The clients file is not valid (a hand edit) | Fix or move it aside; it holds only key hashes. Restore agents with `wiki-mirror key add <name>` (a new key each). While running, a bad edit is ignored: the log says "keeping the last good client list". |
-| `wiki-mirror update` fails "could not fetch from origin" | GitHub changed its SSH addresses and the `github_git` set in the firewall is stale | Root also has 443: `git -C /opt/wiki-mirror remote set-url origin ssh://git@ssh.github.com:443/SFN-ALPHA/sfn-wiki-mirror.git`, update, and refresh the set from `api.github.com/meta` at the next change. |
+| `wiki-mirror update` fails "could not fetch from origin" on a box cloned over SSH (a private fork) | GitHub changed its SSH addresses and the `github_git` set in the firewall is stale | If the repository is public, switch to HTTPS for good: `git -C /opt/wiki-mirror remote set-url origin https://github.com/<owner>/<repo>.git`. For a private fork, root also has 443: `git -C /opt/wiki-mirror remote set-url origin ssh://git@ssh.github.com:443/<you>/<fork>.git` lets `wiki-mirror update` fetch, but the installer accepts SSH from `github.com` only, so set it back to `git@github.com:<you>/<fork>.git` once the set is refreshed from `api.github.com/meta`, before you re-run `install.sh`. A box cloned over HTTPS (the default) is not affected. |
 | Health `update` says `deferred` ("update to <commit> waits: the build ...") | The nightly update found a build running or the lock held (a semantic build can run for days). Nothing changed; exit 0 | Nothing: it tries again the next night. To update now, wait for the build (`wiki-mirror logs build`) or stop it (`systemctl stop wiki-mirror-build`, it resumes later) and run `wiki-mirror update`. |
 | Health `update` says `held` ("format store=... -> ...") | The target commit changes `FORMAT` and built data exists, so restarting the API on it would serve unreadable or misaligned data until a rebuild of many hours. Nothing changed; exit 0 | Decide: leave it (the old code keeps serving, and the update stays held every night; it is not a fault), or accept it: `wiki-mirror update --accept-format-change`, then `wiki-mirror build-now`. |
 | Health `update` says `rolled_back`, the update unit is `failed` | The new commit installed but the API did not become healthy within 60 s, or its install or restart failed. The previous commit is back and serving | `journalctl -u wiki-mirror-update -n 80` and `journalctl -u wiki-mirror -n 50` name why. The same commit is tried again the next night (and fails again); fix it on `main`, or `systemctl disable --now wiki-mirror-update.timer` until you have. |
 | Health `update` says `failed` ("stopped unexpectedly (exit N)", "the checkout has local changes", "could not fetch from origin", "cannot fast-forward") | The update stopped before or without a clean rollback: a dirty or diverged checkout, no route to GitHub, or an unexpected shell error. Only a message saying the rollback was incomplete means the box may be in neither version | The journal line starting `update:` names it. `git -C /opt/wiki-mirror status` for a local change (commit, stash or discard it: someone edited production). If the rollback was incomplete: compare `git -C /opt/wiki-mirror log --oneline -1` with `/opt/wiki-mirror/.venv/.installed-commit`, then `wiki-mirror update` or `git reset --hard <good commit>` and the pip lines in `update.sh`. |
 | `wiki-mirror: command not found` after `pct enter <ctid>` | `pct enter` gives a shell whose PATH lacks `/usr/local/bin` | `exec bash -l`, or use `/usr/local/bin/wiki-mirror`. |
 | Locked out of SSH | A firewall mistake, often a `LAN_CIDR` that does not contain the machine you connect from | On the Proxmox host: `pct enter <ctid>`, then `nft flush ruleset`; fix `site.env` or the file and run `install.sh`. |
-| Whole container lost | | Recreate the container and the bind mount, rewrite `/etc/wiki-mirror/site.env` (three lines; worth keeping a copy off the box), redo the Enterprise sign-in and the deploy key, run `install.sh`, then give clients their keys (a *new* primary key is generated, and the client keys must be re-issued with `wiki-mirror key add`), then `wiki-mirror build-now`. Nothing on the box is irreplaceable: the snapshot is re-downloadable and everything else rebuilds from it. |
+| Whole container lost | | Recreate the container and the bind mount, rewrite `/etc/wiki-mirror/site.env` (worth keeping a copy off the box), redo the Enterprise sign-in (and the deploy key, for a private fork), run `install.sh`, then give clients their keys (a *new* primary key is generated, and the client keys must be re-issued with `wiki-mirror key add`), then `wiki-mirror build-now`. Nothing on the box is irreplaceable: the snapshot is re-downloadable and everything else rebuilds from it. |
 
 Where to look first, in order: `wiki-mirror status`, `wiki-mirror logs api`, `wiki-mirror logs build`, `wiki-mirror logs qdrant`,
 `journalctl -u wiki-mirror-update`, `journalctl -k | grep wiki-mirror` on the Proxmox host.
+
+## Uninstall
+
+The installer puts everything in the places below and nothing else, so removing it is a short list. If the box is
+dedicated, deleting the container or VM is simpler and removes the firewall too. As root on the box:
+
+1. **Stop and disable the units** (the timers first, so nothing starts again):
+
+   ```bash
+   # systemctl disable --now wiki-mirror-update.timer wiki-mirror-build.timer
+   # systemctl disable --now wiki-mirror.service wiki-mirror-build.service wiki-mirror-update.service wiki-mirror-qdrant.service
+   ```
+
+   (`wiki-mirror-build.service` and `wiki-mirror-update.service` are oneshots; a "not loaded" message for an idle one
+   is fine.)
+2. **Remove the unit files:**
+
+   ```bash
+   # rm /etc/systemd/system/wiki-mirror.service /etc/systemd/system/wiki-mirror-qdrant.service
+   # rm /etc/systemd/system/wiki-mirror-build.service /etc/systemd/system/wiki-mirror-build.timer
+   # rm /etc/systemd/system/wiki-mirror-update.service /etc/systemd/system/wiki-mirror-update.timer
+   # systemctl daemon-reload
+   ```
+
+3. **Remove the firewall.** Take the line `include "/etc/nftables.d/wiki-mirror.nft"` out of `/etc/nftables.conf`
+   (edit the file; if the installer created `/etc/nftables.conf` it holds only that line and a `flush ruleset`), delete
+   the ruleset file, and drop the live table, or the default-deny rules stay until the next reboot:
+
+   ```bash
+   # rm -f /etc/nftables.d/wiki-mirror.nft /etc/nftables.d/wiki-mirror.nft.previous
+   # nft delete table inet wiki_mirror
+   ```
+4. **Remove the program, its data and its configuration:**
+
+   ```bash
+   # rm /usr/local/bin/wiki-mirror
+   # rm -rf /opt/wiki-mirror /var/lib/wiki-mirror /etc/wiki-mirror
+   ```
+
+   `/var/lib/wiki-mirror` holds the article store, the Qdrant index and the build state (rebuildable, but it is the
+   14-hour build). `/etc/wiki-mirror` holds `enterprise.env` (your Enterprise password) and `mirror.env` (the primary
+   key) and `clients.json` (key hashes); deleting it revokes every client key. Copy out anything you want to keep first.
+5. **Remove the users and group:**
+
+   ```bash
+   # userdel wikimirror
+   # userdel wikimirror-sync
+   # userdel qdrant          # also removes the group qdrant, which the installer made with it
+   # groupdel wikimirror
+   ```
+
+   The installer created these three system users and the shared group `wikimirror`, with no home directories.
+6. **The downloaded snapshots** are on your storage, not in the paths above: delete `/mnt/wikipedia/snapshots`
+   (about 300 GB) if you want the space back. The mount itself (the NFS or bind-mount line in `/etc/fstab`, or the
+   Proxmox `mp1` entry) is yours to remove; the installer never made it.
+7. **If you cloned over SSH**, delete the deploy key (`/root/.ssh/wiki_mirror_deploy` and `.pub`) and remove it from
+   the repository's Settings, Deploy keys on GitHub. The installer also added GitHub's host key to
+   `/root/.ssh/known_hosts` if it was not there; leave it or remove that line.
+
+**What the installer leaves behind**, on purpose: the Debian packages it installed (`git`, `curl`, `ca-certificates`,
+`openssh-client`, `nftables`, `zstd`, `sqlite3`, `xz-utils`, and any build packages for Python; remove them with
+`apt` if nothing else needs them), the CPython 3.13 it built from source under `/usr/local` (the interpreter in
+`/usr/local/bin/python3.13` and its libraries), and the Qdrant binary `/usr/local/bin/qdrant`, which you can delete
+(`rm /usr/local/bin/qdrant`). `nftables.service` stays enabled; with the include line gone it loads no wiki-mirror rules.
 
 ## Rules that are easy to get wrong
 

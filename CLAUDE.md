@@ -3,7 +3,8 @@
 Standing guidance for all development in this repository. Read alongside [docs/DESIGN.md](docs/DESIGN.md), the design
 with its measurements, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), the map of what is built. Where this file and
 the design disagree, the design wins on *what* is built; this file governs *how* it is built. Where the design and the
-code disagree, the code wins, and the design gets fixed.
+code disagree, the code wins, and the design gets fixed. This file is for coding agents; human contributors start at
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Project
 
@@ -23,19 +24,21 @@ Reading order: [README](README.md) -> [ARCHITECTURE](docs/ARCHITECTURE.md) -> [M
 Read these before any change. They are the ways this repository can lose data or break a running box.
 
 1. **The chunker and the keyword encoder must stay byte-identical** unless a rebuild is planned. They live in the
-   vendored `src/wiki_mirror/text/` package (a vendored copy of an earlier library). Every passage in the
+   `src/wiki_mirror/text/` package (the sanitizer and heading-aware chunker, the hashed-BM25 keyword encoder and
+   the indexed-text rules). Every passage in the
    41.6M-passage index was cut and encoded by them; a snippet is made by re-cutting the stored article and taking
    chunk `n`; a query is encoded with the same encoder as the documents. Change either and the index silently
    mismatches: wrong snippets, wrong citations, lost recall. Any change there also changes the chunker fingerprint
    or the index format, which means a `deploy/FORMAT` change, which holds the nightly update and needs a
    rebuild of many hours ([docs/DESIGN.md §12.7](docs/DESIGN.md#127-what-forces-a-full-rebuild)). Do not reformat,
    "clean up" or lint-fix those files without checking that the tests that pin the cut still pass unchanged.
-2. **`main` ships to production.** The box updates itself from `main` every night at about 02:20 local time
-   (`wiki-mirror-update.timer`, [D4](docs/DECISIONS.md#d4)). **Never push untested work to `main`.** Tests,
+2. **`main` ships to production.** Boxes with the opt-in nightly update enabled (the maintainer's is) update
+   themselves from `main` every night at about 02:20 local time (`wiki-mirror-update.timer`,
+   [D4](docs/DECISIONS.md#d4)). **Never push untested work to `main`.** Tests,
    ruff and mypy must pass first; work in progress goes on a branch. A broken `main` rolls the box back, then fails
    again every night, and a bad format change is held until a person decides.
 3. **Format changes move together.** `deploy/FORMAT` (`store=<schema> chunker=<fingerprint>
-   index=<format>`) must change in the same commit as `store._SCHEMA_VERSION`, `index.CHUNKER_VERSION` or the chunk
+   index=<format>`) must change in the same commit as `store._SCHEMA_VERSION`, `passages.CHUNKER_VERSION` or the chunk
    sizes, or `index.INDEX_FORMAT`. A test keeps it equal to the code. The parser version is deliberately not in it.
 4. **Live installs, deploys and `wiki-mirror build-now` are run by the operator**, not by an agent or CI. Do not run
    `install.sh`, `wiki-mirror update`, `wiki-mirror build-now` or anything that starts a build or restarts a service on the box.

@@ -3,7 +3,7 @@
 Claude Code on the workstation and agents not yet built reach the mirror through MCP
 (Streamable HTTP, mounted at `/mcp` on the API's own port by `api.create_app`), each with its own
 key. The two tools, `wiki_search` and `wiki_read`, call the same `WikiSearch` methods as the REST
-routes the main client uses and return the same JSON as text, so a result ranks and reads
+routes the primary client uses and return the same JSON as text, so a result ranks and reads
 identically whichever door it came through.
 
 Non-obvious constraints:

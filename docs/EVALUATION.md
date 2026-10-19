@@ -3,11 +3,13 @@
 **Audience:** whoever changes search: the passage cut, the snippet, the ranking, the embedding model, the
 quantization. Nothing in the retrieval path should change on a hunch. This file describes the two tools that
 measure it, what they found on 2026-10-19, and how to run them again. The reasoning behind them is in
-[DESIGN.md §12.5](DESIGN.md#125-first-semantic-build-w2) and [§12.8](DESIGN.md#128-phases); the decision they
+[DESIGN.md §12.5](DESIGN.md#125-first-semantic-build-w2) and [§12.8](DESIGN.md#128-phases-and-measurements); the decision they
 produced is [D5](DECISIONS.md#d5).
 
 Throughout, "the embedding server" is an Ollama-compatible server reached by URL (`/api/embed`, `/api/chat`); the
-tools' `--router` option names it. In the measured deployment it fronts four GPU nodes.
+tools' `--router` option names it. In the measured deployment it was the maintainer's own embedding router in front
+of four GPU nodes; a plain Ollama server, or any server that offers the same `/api/embed` call, is the expected
+general case.
 
 ## The golden set: `tools/wiki_golden.py`
 
@@ -61,7 +63,8 @@ $ python tools/wiki_golden.py --out golden.jsonl --count 50 --describe-share 0.5
 ```
 
 It needs `WIKI_MIRROR_API_KEY` (a key for the mirror, issued with `wiki-mirror key add`) and `EMBEDDING_API_KEY`
-(the embedding server's key) in the environment. Point the tools at your
+(the embedding server's key) in the environment. The tools refuse to start without `EMBEDDING_API_KEY`, even
+against a server that checks no key: set it to any value then. Point the tools at your
 deployment with `--mirror http://<mirror-host>:8300` and `--router http://<embedding-server>:<port>`; their
 built-in defaults are `http://localhost:8300` and `http://localhost:11434` (Ollama's own port; see
 `tools/wiki_common.py`), which suit only a run on the mirror host with a local server. Keep the golden file out of
@@ -135,7 +138,7 @@ focused snippet. If every packing loses more than that, keep v1 and raise Qdrant
 
 ### Results, 2026-10-19
 
-Run from a LAN client, 07:42 to 08:55 CDT: 300 golden questions (225 fact, 75 describe), 15,000 articles
+Run from a LAN client, one run of about 73 minutes on the morning of that day: 300 golden questions (225 fact, 75 describe), 15,000 articles
 (6,027 golden or hard negatives, 8,981 random). Hybrid scores, with hard negatives / random articles only:
 
 | Cut | Passages | hit@5 | Answer in focused snippet | Answer in live snippet | Paired vs v1, focused snippet (random only) |
@@ -173,8 +176,10 @@ were written by a small local model from single paragraphs.
 
 ## Embedding rates
 
-Measured through the embedding server (`/api/embed` or `/api/embeddings`) with `X-Priority: 3` (the server's
-background priority).
+Measured through the embedding server (`/api/embed` or `/api/embeddings`) with `X-Priority: 3`. That header, and
+everything below about a queue, a ledger or `throughput_mode`, belongs to **the embedding router used for these
+measurements** (the maintainer's own, over four Ollama nodes). A plain Ollama server has none of it; the numbers
+show what one deployment did, not what the mirror requires.
 
 **2026-10-16**, one text per request, about 2,000-character passages, whichever nodes were awake:
 
@@ -204,7 +209,7 @@ for the server's bookkeeping and query latency, not speed. The build plan uses 8
 
 * The knee is **16 in flight** and structural: each node's bge-m3 runner takes one sequence at a time, and the
   server admits 4 per node.
-* The server's queue is 32 deep and shared with every other client's query embeddings. A full queue refuses
+* The router's queue is 32 deep and shared with every other client's query embeddings. A full queue refuses
   whatever the priority, so **the job's concurrency is the only thing protecting other clients' live requests.**
   Do not raise it.
 * The 2026-10-19 evaluation sample ran at 145 texts/s; the whole snapshot (about 30 billion characters) embeds

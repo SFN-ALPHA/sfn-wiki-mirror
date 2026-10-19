@@ -12,8 +12,9 @@ Wikipedia locally. Any MCP-capable agent (Claude Code, Claude Desktop, other MCP
 articles as often and as fast as it likes, with no throttling by Wikipedia, and any other program can do the same
 over HTTP. Wikipedia itself is contacted once a month, for one bulk download.
 
-Every reply carries the snapshot date, the revision id, a permalink to the exact revision it read
-(`https://en.wikipedia.org/wiki/<Title>?oldid=<revision>`) and the licence, so an answer can be cited precisely.
+Every search and article reply carries the snapshot date, the revision id and a permalink to the exact revision it
+read (`https://en.wikipedia.org/wiki/<Title>?oldid=<revision>`), so an answer can be cited precisely. An article
+reply also carries the licence (CC BY-SA 4.0); search replies do not, but the same licence covers them.
 
 ### Self-hosted, or an MCP server in front of Wikipedia's API?
 
@@ -35,7 +36,7 @@ Self-hosting is worth its disk space and setup when:
 | Search | Wikipedia's own search | Passage-level keyword search, semantic search next, under your control |
 | Reproducible citations | The live revision, which may change | A fixed monthly snapshot and an exact `?oldid=` permalink |
 | Freshness and coverage | Live, every language | Up to a month old, English only today |
-| Cost | Nothing to host | About 160 GB of disk, a 32 GB box, and compute for the build ([SIZING](docs/SIZING.md)) |
+| Cost | Nothing to host | About 250 GB of local disk plus 300 GB for snapshots, a 32 GB box, and compute for the build ([SIZING](docs/SIZING.md)) |
 
 ### Other ways to self-host Wikipedia
 
@@ -60,8 +61,8 @@ read.
 | What you run | One file and a reader or server; no build step | A service, Qdrant and a monthly build on a server or container |
 | Footprint | English ZIM: 13 GB intros only, 49 GB text, 119 GB with images | 62 GB today (store + keyword index); about 160 GB with the semantic index |
 | Search | The archive's own full-text index, over whole articles | Ranked keyword search over 41.6M passages; the best passage per article, with its section; semantic search next |
-| Updates | Download a new file when Kiwix publishes one; English builds come every few months | A new Wikimedia Enterprise snapshot built monthly, unattended, while the old index keeps serving |
-| Citations | The article as packed in that file | The revision id and an `?oldid=` permalink to the exact revision, on every reply |
+| Updates | Download a new file when Kiwix publishes one; English builds come every few months | A new Wikimedia Enterprise snapshot built monthly while the old index keeps serving (scheduled; the first build was started by hand and the timer's first unattended run is 2026-11-02, so unattended operation is not yet proven) |
+| Citations | The article as packed in that file | The revision id and an `?oldid=` permalink to the exact revision, on every search and article reply |
 | Sharing | openzim-mcp: stdio, or Streamable HTTP with a bearer token | Streamable HTTP and a REST API, one revocable key per client, request ids in every log line |
 | Content | Rendered pages, with images in the large builds | Plain text cut for models, in pageable windows; no images |
 
@@ -80,6 +81,10 @@ ZIM sizes and dates are from [Kiwix's download index](https://download.kiwix.org
 
 ## State (2026-10-19)
 
+Phase names used in these docs: **W2** is the planned semantic (embedding) index and hybrid search; **W3** is the
+planned in-place monthly update. Both are defined in [docs/DESIGN.md §7](docs/DESIGN.md#7-phases) and neither is
+built.
+
 | | |
 |---|---|
 | Snapshot served | 2026-10-01 (`enwiki_namespace_0`, English Wikipedia articles only) |
@@ -87,7 +92,7 @@ ZIM sizes and dates are from [Kiwix's download index](https://download.kiwix.org
 | Passages in the keyword index | 41,590,915 |
 | Search latency | about 27 ms with the index cached, 241 ms (p50) on first touch; article reads 1 to 2 ms (measured over the API on 2026-10-18) |
 | Search mode | keyword (BM25-style sparse vectors in Qdrant); the semantic bge-m3 index is next |
-| Updates | The host updates its own code from `main` nightly (with a guard and rollback). A new Wikipedia snapshot is built monthly. |
+| Updates | A new Wikipedia snapshot is built monthly (scheduled, not yet proven unattended). Code updates are by hand (`wiki-mirror update`), or nightly from `main` with a guard and rollback if you opt in with `--auto-update`. |
 
 **Sizing** (measured unless marked estimate; details and the arithmetic in [docs/SIZING.md](docs/SIZING.md)):
 
@@ -96,7 +101,7 @@ ZIM sizes and dates are from [Kiwix's download index](https://download.kiwix.org
 | Snapshot download | 151 GB compressed, about 45 minutes; about 700 GB of HTML uncompressed (estimate) |
 | Article store | 25 GB |
 | Keyword index | 37 GB on disk, about 4-5 GB RAM |
-| Semantic index (estimate) | about 95 GB on disk, about 10 GB RAM; total local disk about 160 GB |
+| Semantic index (estimate) | about 95 GB on disk, about 10 GB RAM; total local disk about 160 GB, so plan on 250 GB with the headroom a monthly build needs |
 | Embedding the corpus (estimate) | about 4.7 exaFLOPs: about 45 h at 29 effective TFLOPS (measured), roughly 1,300 / TFLOPS hours |
 
 What is built and what is not: [docs/ROADMAP.md](docs/ROADMAP.md). The monthly job is currently a full build beside
@@ -141,12 +146,31 @@ listening port and no internet. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTUR
 
 ## Running it
 
-The mirror runs on a Linux host or container (Debian 12 or 13) with about 32 GB of RAM, a few hundred GB of fast
-local disk and a few hundred GB of bulk storage for the downloaded snapshots, plus a free Wikimedia Enterprise
-account ([docs/SIZING.md](docs/SIZING.md) has the figures). `deploy/` holds the installer, the updater, the `wiki-mirror` operator command, systemd units and a
-default-deny firewall (a template: your network's three values go in `/etc/wiki-mirror/site.env`, see
-[`deploy/site.env.example`](deploy/site.env.example)). Install, operation, the nightly update, memory and disk guidance and failure recovery:
-[docs/OPERATIONS.md](docs/OPERATIONS.md).
+### Before you start
+
+* **A dedicated x86_64 Debian 12 or 13 container or VM.** A Proxmox LXC is the tested path. The installer owns the
+  box's nftables firewall, which is default-drop, so do not use a shared host or a Docker host.
+* **CPU and RAM:** 6 cores (the parse stage runs 5 workers by default) and 32 GB of RAM advised, 8 GB at the
+  least ([docs/SIZING.md](docs/SIZING.md)).
+* **Disk:** 250 GB of fast local disk for the article store and the index, plus about 300 GB of bulk storage for the
+  two retained snapshots ([docs/SIZING.md](docs/SIZING.md)). On a single disk, plan for about 550 GB.
+* **Storage mounted at `/mnt/wikipedia`.** The snapshots go there, and the build refuses to run unless it is a mount
+  point: NFS from a NAS, or a directory on a big local disk bind-mounted onto it
+  ([docs/OPERATIONS.md](docs/OPERATIONS.md#2-storage-at-mntwikipedia)).
+* **A free Wikimedia Enterprise account** at <https://enterprise.wikimedia.com/>; its free tier includes the Snapshot
+  API this mirror downloads from ([docs/OPERATIONS.md](docs/OPERATIONS.md#3-the-enterprise-account-and-sign-in)).
+* **Time:** about 30 minutes to install, about 151 GB to download, about 14 hours for the first build (measured:
+  2026-10-17 to 10-18).
+
+### What is in `deploy/`
+
+`deploy/` holds the installer, the updater, the `wiki-mirror` operator command, systemd units and a default-deny
+firewall (a template: your network goes in `/etc/wiki-mirror/site.env`, where `LAN_CIDR` is required and
+`EMBEDDING_HOST` and `EMBEDDING_PORT` are optional, see [`deploy/site.env.example`](deploy/site.env.example)).
+The installer clones this repository over anonymous HTTPS; no deploy key is needed. The nightly self-update is opt-in:
+`install.sh --auto-update` turns it on, and it means your box runs whatever lands on `main` as root; without it, update
+by hand with `wiki-mirror update`. Install, operation, the update, memory and disk guidance, uninstalling and failure
+recovery: [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Development
 
@@ -161,11 +185,12 @@ python3 -m venv .venv
 ```
 
 The tests need no network, no GPU, no Qdrant and no Enterprise account; all of those are faked. Read
-[CLAUDE.md](CLAUDE.md) before changing anything. Two points matter most:
+[CONTRIBUTING.md](CONTRIBUTING.md) before changing anything (coding agents: [CLAUDE.md](CLAUDE.md)). Two points
+matter most:
 
 * The passage chunker and keyword encoder (`src/wiki_mirror/text/`) must stay byte-identical, or the
   41.6M-passage index no longer matches the code.
-* **`main` is deployed to the host every night.** Do not push untested work to it.
+* **`main` is deployed to every box that has the nightly update enabled.** Do not push untested work to it.
 
 | Path | Holds |
 |---|---|
@@ -187,12 +212,18 @@ The tests need no network, no GPU, no Qdrant and no Enterprise account; all of t
 | [docs/DESIGN.md](docs/DESIGN.md) | Maintainers | The design, with the measurements behind each choice |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Maintainers | The dated decision log (D1 onward) |
 | [docs/EVALUATION.md](docs/EVALUATION.md) | Whoever changes search | The golden set, the passage-length evaluation and its results, embedding rates, how to rerun |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Planning | The semantic build and monthly in-place updates |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Planning | Article annotations (links, references, infoboxes, tables) and a web reader, the semantic build, monthly in-place updates |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Contributors | The constraints that bind a change, setup, tests, linters |
+| [SECURITY.md](SECURITY.md) | Anyone who finds a vulnerability | How to report one privately, and what is in scope |
+| [CHANGELOG.md](CHANGELOG.md) | Everyone | What each release contains |
 | [CLAUDE.md](CLAUDE.md) | Coding agents | Conventions, constraints and the verification commands |
 
 ## Licence and attribution
 
-The code is MIT-licensed (see [LICENSE](LICENSE)). Wikipedia text is licensed CC BY-SA 4.0; replies carry the
-snapshot date, a permanent revision link and the licence so that quoted text can be attributed. This repository
-holds code and documentation only, not Wikipedia content. Clone from
+The code is MIT-licensed (see [LICENSE](LICENSE)). Wikipedia text is licensed CC BY-SA 4.0. Search and article
+replies carry the snapshot date and a permanent revision link, and article replies carry the licence, so that quoted
+text can be attributed. This repository is code and documentation, with one exception: two test fixtures hold
+Wikipedia content under CC BY-SA 4.0, attributed to Wikipedia contributors. `tests/fixtures/wme/records.ndjson` is
+eight whole English Wikipedia articles, and `tests/fixtures/vendored_golden.json` holds text derived from them.
+[NOTICE](NOTICE) states this; each article's page history is at the `url` in its record. Clone from
 `https://github.com/SFN-ALPHA/sfn-wiki-mirror`.

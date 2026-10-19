@@ -1,9 +1,10 @@
 # The mirror API - search and read over a local mirror of English Wikipedia.
 #
-# Serves /v1/wiki/search, /v1/wiki/article and /v1/wiki/health on :8300 to the main client, and /mcp
-# (MCP over Streamable HTTP) to other agents on the LAN. nftables admits only the site's LAN
-# (LAN_CIDR in /etc/wiki-mirror/site.env) on that port and every route requires a key: the main client's from mirror.env, each other agent's
-# from clients.json (hashes; `wiki-mirror key add|revoke`, picked up within seconds, no restart).
+# Serves /v1/wiki/search, /v1/wiki/article and /v1/wiki/health on :8300 to the primary client, and
+# /mcp (MCP over Streamable HTTP) to other agents on the LAN. nftables admits only the site's LAN
+# (LAN_CIDR in /etc/wiki-mirror/site.env) on that port and every route requires a key: the primary
+# key from mirror.env, each other agent's from clients.json (hashes; `wiki-mirror key add|revoke`,
+# picked up within seconds, no restart).
 # It reads the article store, build state and clients.json from disk and queries Qdrant over
 # loopback; it never writes data and has no egress (nftables drops anything it tries to open).
 # A monthly rebuild is picked up by itself: no restart (it follows the Qdrant alias).
@@ -57,8 +58,8 @@ TimeoutStopSec=30
 
 MemoryMax=1500M
 
-# Hardening. MemoryDenyWriteExecute is left off on purpose: cffi (argon2, cryptography)
-# allocates executable memory.
+# Hardening. MemoryDenyWriteExecute is left off on purpose: cffi (cryptography) allocates
+# executable memory.
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true

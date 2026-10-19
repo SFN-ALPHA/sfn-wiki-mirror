@@ -18,8 +18,7 @@ venv/
 .coverage
 htmlcov/
 
-# Agent credentials and local state. Never committed: .agent/ holds the standing SSH key
-# and its env file for the mirror's container.
+# Local agent scratch files and state. Never committed.
 .agent/
 
 # Local secrets and editor state

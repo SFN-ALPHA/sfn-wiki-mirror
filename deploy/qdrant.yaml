@@ -35,8 +35,8 @@ storage:
 
   performance:
     # Search threads: 2 of 6 cores. The default (0 = all cores) is for a box that serves
-    # queries alone; here a build runs on the same cores, and the API serves one client
-    # (the main client), so two concurrent searches are plenty.
+    # queries alone; here a build runs on the same cores, and the API serves a handful of
+    # LAN clients, so two concurrent searches are plenty.
     max_search_threads: 2
     # Total CPU the segment optimizers (HNSW builds, merges) may use: 3 of 6 cores. The
     # default (0 = cores minus one) would let indexing starve the parse workers and push

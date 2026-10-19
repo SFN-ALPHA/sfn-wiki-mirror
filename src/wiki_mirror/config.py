@@ -2,7 +2,7 @@
 
 Read by every entry point in `wiki_mirror.__main__`. Paths and knobs live in
 `/etc/wiki-mirror/mirror.yaml` (every field has a default, so the file may be absent);
-the one secret the service itself holds, the bearer key the main client presents, comes from the
+the one secret the service itself holds, the primary bearer key, comes from the
 environment (`WIKI_MIRROR_API_KEY`, set by systemd from `/etc/wiki-mirror/mirror.env`,
 0600). The Wikimedia Enterprise sign-in is a separate file read only by the download stage
 (`enterprise_env_file`), so the API process never holds it. Like every configuration in this
@@ -17,7 +17,7 @@ Non-obvious constraints:
   NAS holds only the downloaded snapshots, which are read sequentially once per build.
 * **Secrets are `SecretStr`**, and `load_mirror_config` builds its error text from field names
   and fixed messages, never from the input that failed.
-* **Only one key is a setting.** The main client's key (`WIKI_MIRROR_API_KEY`) comes from the
+* **Only one key is a setting.** The primary key (`WIKI_MIRROR_API_KEY`) comes from the
   environment; every other agent's key lives, hashed, in `clients_file` so that adding or
   revoking one needs no restart and no secret in a config file.
 
@@ -43,7 +43,7 @@ __all__ = [
     "load_mirror_config",
 ]
 
-#: The bearer key the main client presents (`WIKI_MIRROR_API_KEY` in the client's env file too).
+#: The environment variable of the primary bearer key (a client's env file may use the same name).
 API_KEY_ENV: Final = "WIKI_MIRROR_API_KEY"
 
 #: Where the installer puts the settings file.
@@ -74,7 +74,7 @@ class MirrorConfig(BaseModel):
     enterprise_env_file: Path = Path("/etc/wiki-mirror/enterprise.env")
     #: Qdrant on the same LXC. Loopback only (see the module docstring).
     qdrant_url: str = "http://127.0.0.1:6333"
-    #: The API's listen address. All interfaces: nftables admits only the main client on this port.
+    #: The API's listen address. All interfaces: nftables admits only the site's LAN on this port.
     listen_host: str = "0.0.0.0"  # noqa: S104 - deliberate; the firewall is the boundary
     #: The API's port.
     listen_port: int = Field(default=8300, ge=1, le=65535)
@@ -106,7 +106,7 @@ class MirrorConfig(BaseModel):
     #: the key>"}`, root:wikimirror 0640, managed with `wiki-mirror key add|list|revoke`. Hashes
     #: only, so the API user can read it. Absent means no extra clients; see `keys.py`.
     clients_file: Path = Path("/etc/wiki-mirror/clients.json")
-    #: The main client's bearer key. Required by `serve`; the build stages never need it.
+    #: The primary bearer key. Required by `serve`; the build stages never need it.
     api_key: SecretStr | None = None
 
     @field_validator("qdrant_url")

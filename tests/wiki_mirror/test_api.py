@@ -2,12 +2,11 @@
 
 Runs the FastAPI app in-process through `TestClient` over a real finalized store and an
 in-memory index (search and article routes) or a stub search (error paths), so the contract with
-the main client (JSON shapes, status codes, `X-Request-ID`) is checked without a server. Failure
-paths
-named here: no key, a wrong key and a revoked key (401), a bad request id (replaced), unknown
-fields and out-of-range values (422), no snapshot yet (503 not_ready), Qdrant refusing (503
-index_unavailable), a crash (JSON 500), a malformed clients file (refused at start, ignored at
-runtime), the alias moving or its store being unusable, and every health state.
+the primary client (JSON shapes, status codes, `X-Request-ID`) is checked without a server.
+Failure paths named here: no key, a wrong key and a revoked key (401), a bad request id
+(replaced), unknown fields and out-of-range values (422), no snapshot yet (503 not_ready),
+Qdrant refusing (503 index_unavailable), a crash (JSON 500), a malformed clients file (refused at
+start, ignored at runtime), the alias moving or its store being unusable, and every health state.
 
 See docs/DESIGN.md section 6.
 """

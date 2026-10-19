@@ -27,7 +27,7 @@ flowchart LR
     QD --> API[API + MCP door<br/>:8300, user wikimirror]
     API -->|HTTP, bearer key| APPS[Applications]
     API -->|MCP /mcp, own key each| AGENTS[MCP clients and agents]
-    GH[GitHub main] -->|02:20 nightly, user root| UPD[update.sh]
+    GH[GitHub main] -->|02:20 nightly if enabled, user root| UPD[update.sh]
     UPD -.restarts.-> API
 ```
 
@@ -43,7 +43,7 @@ flowchart LR
 | Search | `search.py` | Query encoding, article folding, exact-title priority, snippets cut from the store, windowed article reads. |
 | API and MCP door | `api.py`, `mcp_server.py`, `keys.py` | FastAPI app with a pure-ASGI guard in front: authentication, request ids, JSON errors. `/mcp` is the MCP SDK's Streamable HTTP endpoint behind the same guard. |
 | CLI | `__main__.py`, `deploy/wiki-mirror` | `python -m wiki_mirror <download|parse|index|build|serve|status|key>`; `wiki-mirror` is the operator wrapper. |
-| Update path | `deploy/update.sh`, `update_record.py` | Nightly self-update from `main` with a format guard and rollback; writes `state/update.json`. |
+| Update path | `deploy/update.sh`, `update_record.py` | Self-update from `main` (nightly, if the operator opted in) with a format guard and rollback; writes `state/update.json`. |
 
 DESIGN.md sections: the article store and index in [§5](DESIGN.md#5-the-design), the Enterprise snapshot in
 [§2](DESIGN.md#2-what-wikimedia-publishes-checked-2026-10-16) and [§11](DESIGN.md#11-w0-what-the-box-and-the-account-turned-out-to-be-2026-10-16).
@@ -71,7 +71,7 @@ Paths are inside the container. The defaults are in `config.py` and can be chang
 
 | Path | Holds | Disk | Backed up |
 |---|---|---|---|
-| `/mnt/wikipedia/snapshots/<identifier>_<yyyymmdd>/` | Downloaded Enterprise chunks (`.tar.gz`, about 151 GB), `.etag` sidecars, `snapshot.json`. Two kept (`retain_snapshots`). | NAS (NFS, bind-mounted by the Proxmox host) | No: re-downloadable |
+| `/mnt/wikipedia/snapshots/<identifier>_<yyyymmdd>/` | Downloaded Enterprise chunks (`.tar.gz`, about 151 GB), `.etag` sidecars, `snapshot.json`. Two kept (`retain_snapshots`). | Bulk storage mounted at `/mnt/wikipedia` (NFS from a NAS, bind-mounted by the Proxmox host, or a bind-mounted local directory) | No: re-downloadable |
 | `/var/lib/wiki-mirror/articles/<identifier>_<yyyymmdd>.db` | The article store, 25 GB for the 2026-10-01 snapshot | Local (NVMe) | No: rebuildable from the snapshot |
 | `/var/lib/wiki-mirror/qdrant/` | Qdrant storage (37 GB for the keyword index) | Local | No: rebuildable |
 | `/var/lib/wiki-mirror/state/` | `build.json`, `build.lock`, `index_lexical_<born>.json` (index state and checkpoint), `enterprise_budget.json`, `update.json` | Local | Should be: losing an index state file takes search down until it is restored (DESIGN.md §12.8) |
@@ -129,7 +129,7 @@ a hit whose `text_hash` differs from the stored article's (logged with the page 
 The chunker, the store schema, the index format and the parser version are all part of the stored data's
 contract. `deploy/FORMAT` records the first three (`store=2 chunker=v1:512/50 index=1`) and a test
 keeps it equal to the code. [DESIGN.md §12.7](DESIGN.md#127-what-forces-a-full-rebuild) lists what each change
-rebuilds. The vendored `src/wiki_mirror/text/` package (chunker and sparse encoder) must stay
+rebuilds. The `src/wiki_mirror/text/` package (chunker and sparse encoder) must stay
 byte-identical, or the keyword index and every snippet cut from it drift apart.
 
 ## The API and MCP door
@@ -168,8 +168,8 @@ Details and the reasoning are in [DESIGN.md §6](DESIGN.md#6-security).
 
 * **Egress is per Unix user, not per address.** Enterprise downloads redirect (307) to presigned S3 URLs whose
   addresses rotate, so an address allowlist cannot work. nftables (`deploy/nftables/`) lets only
-  `wikimirror-sync` open HTTPS to the internet, plus the embedding server (its address and port come from
-  `/etc/wiki-mirror/site.env`) for the W2 embedding job. `wikimirror` (the
+  `wikimirror-sync` open HTTPS to the internet, plus, when set, the optional embedding server (its address and port come from
+  `/etc/wiki-mirror/site.env`) for the planned semantic index's embedding job (W2). `wikimirror` (the
   API) and `qdrant` get nothing: a flaw in the code that parses and serves untrusted text cannot phone out.
   `root` gets 80/443 and git-over-SSH to GitHub for installs and updates, `_apt` gets 80/443 over IPv4 for
   package fetches, and DNS goes to the LAN resolver only. Refused egress is rejected (fails at once, counted in

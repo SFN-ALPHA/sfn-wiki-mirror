@@ -1,6 +1,6 @@
 """Per-agent API keys: which named client may call the mirror, changeable live.
 
-The service answers its main client (its key is `WIKI_MIRROR_API_KEY`, client name `primary`)
+The service answers its primary client (its key is `WIKI_MIRROR_API_KEY`, client name `primary`)
 and any number of other agents on the LAN over MCP (Claude Code, agents not built yet).
 Each of those has its own key so the logs name the caller and one key can be revoked alone.
 Their keys live in `clients_file` (`/etc/wiki-mirror/clients.json`) as
@@ -70,7 +70,7 @@ __all__ = [
 
 logger = logging.getLogger("wiki_mirror.keys")
 
-#: The client name of the environment key (`WIKI_MIRROR_API_KEY`): the main client.
+#: The client name of the environment key (`WIKI_MIRROR_API_KEY`): the primary client.
 PRIMARY_CLIENT: Final = "primary"
 
 #: What a client may be called: it appears in logs and in the file, so it stays short and plain.
@@ -274,7 +274,7 @@ def _write_clients(path: Path, clients: dict[str, str]) -> None:
 
 
 class ClientKeys:
-    """The keys the service accepts: the main client's, plus those in the live clients file.
+    """The keys the service accepts: the primary key, plus those in the live clients file.
 
     One instance serves every request. `authenticate` is safe to call from any thread.
     """

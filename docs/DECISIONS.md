@@ -13,7 +13,7 @@ only the conclusion, and say what was accepted as a cost.
 | [D1](#d1) | 2026-10-16 | A local Wikipedia mirror from Enterprise HTML snapshots on a dedicated container; keyword and semantic search; binary quantization |
 | [D2](#d2) | 2026-10-16 | The first service build: Enterprise download, parser, article store, keyword index, HTTP API and an MCP server with a key per client |
 | [D3](#d3) | 2026-10-17 | Two collections updated in place each month; a per-article `text_hash`; a format change before the first build |
-| [D4](#d4) | 2026-10-17 | The container updates itself nightly at 02:20 local time |
+| [D4](#d4) | 2026-10-17 | The container updates itself nightly at 02:20 local time (opt-in for other installations, 2026-10-19) |
 | [D5](#d5) | 2026-10-19 | The semantic build embeds the live passage cut with bge-m3; packing rejected on measurement |
 | [D6](#d6) | 2026-10-19 | A site's network lives in `/etc/wiki-mirror/site.env`; the firewall in the repository is a template |
 
@@ -107,6 +107,12 @@ any non-zero stop after the merge rolls back to the previous commit. Every run w
 no alert unit on this box); the update that installs this feature runs the old script, so only later updates are
 guarded; and anything merged to `main` reaches the box within a day.
 
+**Amended 2026-10-19, before the public release.** For an installation other than the maintainer's, the timer is
+opt-in: the installer enables it only with `--auto-update` (or the operator runs `systemctl enable --now
+wiki-mirror-update.timer`), and re-running the installer never turns an enabled timer off. Reason: an enabled timer
+means the box runs, as root, whatever lands on the upstream `main` (or the fork's), which is a trust decision for
+each operator and not a default. The maintainer's own box keeps it on.
+
 <a id="d5"></a>
 ## D5 - 2026-10-19 - The semantic build embeds the live passage cut
 
@@ -119,7 +125,7 @@ article as often but lost the answer from a 320-character query-focused snippet 
 (paired +9/-30 to +12/-49), so every packing failed the rule set before the run. A reviewer caught that the first
 version's whole-passage metric favoured packing by length alone (chance 27% against 9%); the rule was fixed before
 any number was read. **bge-m3 kept:** newer open models (Qwen3-Embedding 0.6B, EmbeddingGemma) were offered, and
-the maintainer chose to stay with bge-m3 as long as it does well enough, since the priority is the wider system,
+the maintainer chose to stay with bge-m3 as long as it does well enough, since the priority is the work the mirror serves,
 not a perfect Wikipedia lookup. **Also measured:** the canary showed identical vectors across all four embedding
 nodes despite different Ollama versions; about 0.17M chars/s, so the build takes about two days; the focused
 snippet beats today's snippet by 8-12 points on the live cut. **Accepted:** 85 GB of float16 originals on disk
@@ -130,13 +136,14 @@ full-scale golden check (hybrid at least 90% top 5) is the guard.
 <a id="d6"></a>
 ## D6 - 2026-10-19 - A site's network lives in `site.env`
 
-**Decision.** The three values that differ between networks - the LAN (`LAN_CIDR`), the embedding server's address
-(`EMBEDDING_HOST`) and its port (`EMBEDDING_PORT`) - are read by `deploy/install.sh` from
+**Decision.** The values that differ between networks - the LAN (`LAN_CIDR`, required) and, optionally, the
+embedding server's address (`EMBEDDING_HOST`) and its port (`EMBEDDING_PORT`), both or neither - are read by `deploy/install.sh` from
 `/etc/wiki-mirror/site.env` and rendered into `deploy/nftables/wiki-mirror.nft`, which is a template. Nothing of
 any site's network is in the repository. Decided by the maintainer when the repository was prepared for
 publication.
 
-**Reasoning.** The firewall is the control that keeps the API off the internet and the build user off the LAN, and
+**Reasoning.** The firewall is the control that keeps the API off the internet and the build user off the LAN (except the
+embedding server, when one is set), and
 its three site values used to be literals in the ruleset, the installer's resolver check and the docs. A public
 repository cannot carry one site's addresses, and a deployer should not have to edit a root-loaded file by hand.
 **The values reach a ruleset that loads as root**, so the file is data, never sourced: each line must be one of

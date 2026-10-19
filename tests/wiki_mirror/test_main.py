@@ -789,7 +789,7 @@ def test_key_list_prints_names_only(tmp_path: Path) -> None:
 def test_key_list_with_no_clients_says_so_on_stderr(tmp_path: Path) -> None:
     code, out, err = _run(["--config", str(_settings(tmp_path)), "key", "list"])
     assert (code, out) == (0, "")
-    assert "only the main client's key" in err
+    assert "only the primary key" in err
 
 
 def test_key_revoke_removes_the_client(tmp_path: Path) -> None:

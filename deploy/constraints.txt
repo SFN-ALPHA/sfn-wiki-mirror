@@ -1,58 +1,45 @@
 # Exact versions of everything `pip install "."` brings onto the mirror's container.
 #
-# Used as `pip install -c deploy/constraints.txt --only-binary=:all:
-# --no-binary=http-ece ...` by install.sh and update.sh. A constraints file does not add
-# packages; it fixes the version of any package pip decides to install, so these pins are the
-# tested set and nothing newer arrives by accident on a later `wiki-mirror update` (the box runs
-# unattended for weeks between looks, and a dependency that moved under it is the kind of failure
-# nobody sees until the monthly build).
+# Used as `pip install -c deploy/constraints.txt --only-binary=:all: ...` by install.sh and
+# update.sh. A constraints file does not add packages; it fixes the version of any package pip
+# decides to install, so these pins are the tested set and nothing newer arrives by accident on a
+# later `wiki-mirror update` (the box runs unattended for weeks between looks, and a dependency
+# that moved under it is the kind of failure nobody sees until the monthly build).
 #
 # `--only-binary=:all:` means pip never compiles anything on the box: a version without a wheel
 # for this interpreter fails the install at once, loudly, instead of needing a compiler.
-# `--no-binary=http-ece` is the one exception, deliberately: http-ece (a dependency of pywebpush,
-# which the project's base dependencies carry) is pure Python and is published only as an sdist,
-# so it is built locally; that needs setuptools, which pip fetches as a wheel, and no compiler.
 #
-# Source: the closure of the base dependencies in pyproject.toml,
-# walked from the metadata of the workstation's test environment (the versions the test suite
-# ran against), with environment markers evaluated for CPython 3.13 on linux x86_64, and
-# cross-checked against pip's own resolution of `.` under these constraints (the same
-# 64 packages, no version differing). That environment is Python 3.14 and the box is 3.13, so
-# each pin was resolved against PyPI for CPython 3.13 on manylinux x86_64 with glibc up to 2.36
-# (Debian 12; Debian 13 is newer): all of them have a wheel but http-ece. docs/OPERATIONS.md
-# has the commands, and how to refresh this file.
+# Source: the closure of the base dependencies in pyproject.toml, walked from the metadata of
+# the workstation's test environment (the versions the test suite ran against), with environment
+# markers evaluated for CPython 3.13 on linux x86_64, and cross-checked against pip's own
+# resolution of `.` under these constraints (no version differing). That environment is Python
+# 3.14 and the box is 3.13, so each pin was resolved against PyPI for CPython 3.13 on manylinux
+# x86_64 with glibc up to 2.36 (Debian 12; Debian 13 is newer): all of them have a wheel.
+# docs/OPERATIONS.md has the commands, and how to refresh this file.
+#
+# This file lists exactly that closure and nothing else: a pin for a package the base
+# dependencies do not bring in would be inert (pip ignores a constraint on a package it does not
+# install) and would only mislead the next reader about what the project uses.
 #
 # To refresh after a dependency change in pyproject.toml: rebuild the test environment, re-walk
 # the closure, run the suite, re-check the wheels (docs/OPERATIONS.md), and commit the new file
 # with the change that needed it. Do not edit a version by hand without doing the last two.
 #
-# The base dependencies do not include pywebpush or argon2-cffi, so the pins for them and for what only they bring in (http-ece
-# and py-vapid, for one) are inert: a constraint on a package pip does not install does nothing.
-# The next refresh drops them.
-#
 # Phase: W1 (docs/DESIGN.md section 6).
 
-aiohappyeyeballs==2.7.1
-aiohttp==3.14.5
-aiosignal==1.4.0
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
-argon2-cffi==25.1.0
-argon2-cffi-bindings==26.1.0
 attrs==26.1.0
 certifi==2026.7.22
 cffi==2.1.1
-charset-normalizer==3.5.2
 click==8.5.0
 cryptography==50.0.2
 fastapi==0.142.2
-frozenlist==1.8.0
 grpcio==1.84.0
 h11==0.16.0
 h2==4.4.1
 hpack==4.2.0
-http-ece==1.2.1
 httpcore==1.0.9
 httpcore2==2.13.1
 httptools==0.8.0
@@ -64,24 +51,19 @@ jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 mcp==2.2.0
 mcp-types==2.2.0
-multidict==7.1.0
 numpy==2.5.3
 opentelemetry-api==1.45.0
 portalocker==3.2.0
-propcache==0.5.4
 protobuf==7.36.2
-py-vapid==1.9.6
 pycparser==3.0
 pydantic==2.13.5
 pydantic-core==2.46.5
 pyjwt==2.15.1
 python-dotenv==1.2.4
 python-multipart==0.0.32
-pywebpush==2.5.0
 pyyaml==6.0.3
 qdrant-client==1.19.1
 referencing==0.37.0
-requests==2.34.2
 rpds-py==2026.6.3
 selectolax==1.0.0
 sse-starlette==3.5.0
@@ -94,5 +76,4 @@ uvicorn==0.54.0
 uvloop==0.23.0
 watchfiles==1.3.0
 websockets==17.1
-yarl==1.25.1
 zstandard==0.25.0

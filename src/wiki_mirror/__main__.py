@@ -403,7 +403,7 @@ def _key(
             names = list_clients(path)
             if not names:
                 err.write(
-                    "wiki-mirror: no agent has a key; only the main client's key is accepted\n"
+                    "wiki-mirror: no agent has a key; only the primary key is accepted\n"
                 )
             out.writelines(f"{name}\n" for name in names)
         elif args.key_command == "add":

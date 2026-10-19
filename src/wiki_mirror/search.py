@@ -1,11 +1,10 @@
 """Keyword search over the Wikipedia passage index, and windowed reads of whole articles.
 
 The logic behind `POST /v1/wiki/search` and `GET /v1/wiki/article` (`wiki_mirror.api`),
-and so behind the main client's `wiki__search` and `wiki__read` tools. Search asks Qdrant for the
-best
-passages by the lexical vector, folds them to one result per article, puts an article whose
-title is the whole query first, and shows each hit with a snippet taken from the article store.
-Read serves one article's text a window at a time, so a long article reaches a model that
+and so behind the search and read tools every client of the mirror uses. Search asks Qdrant for
+the best passages by the lexical vector, folds them to one result per article, puts an article
+whose title is the whole query first, and shows each hit with a snippet taken from the article
+store. Read serves one article's text a window at a time, so a long article reaches a model that
 cannot take 100K characters in a reply.
 
 Non-obvious constraints:

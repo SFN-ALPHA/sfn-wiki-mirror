@@ -3,7 +3,7 @@
 Clients never download from Wikimedia. This package runs on the mirror's own LXC
 (`wiki-mirror`), the only box with an egress rule for Wikimedia Enterprise and
 the S3 bucket its downloads redirect to, and it serves the mirror over the LAN with bearer keys:
-the main client over REST, and other agents and applications (Claude Code, ...) over
+the primary client over REST, and other agents and applications (Claude Code, ...) over
 MCP, each with a key of its own.
 
 What lives here:
@@ -20,7 +20,7 @@ What lives here:
 * `search` - ranked results with snippets, and windowed article reads;
 * `serving` - the snapshot being served, following the Qdrant alias so a rebuild needs no
   restart;
-* `keys` - the main client's key plus each other agent's hashed key, re-read live; add, list,
+* `keys` - the primary key plus each other agent's hashed key, re-read live; add, list,
   revoke;
 * `mcp_server` - the MCP front door, `wiki_search` and `wiki_read`, over the same search code;
 * `api` - the FastAPI app (`/v1/wiki/search`, `/v1/wiki/article`, `/v1/wiki/health`, `/mcp`) and

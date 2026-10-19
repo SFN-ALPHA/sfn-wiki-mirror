@@ -154,7 +154,9 @@ for label, value in rows:
     if [[ "$(systemctl is-enabled "$UPDATE_TIMER" 2>/dev/null || true)" == enabled ]]; then
         good "$(printf '%-40s next %s' "$UPDATE_TIMER" "$(systemctl show "$UPDATE_TIMER" -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)")"
     else
-        warn "$UPDATE_TIMER is not enabled - the box will not update itself (systemctl enable --now $UPDATE_TIMER)"
+        # Not a warning: the nightly update is opt-in (install.sh --auto-update), so off is the
+        # normal state of a box whose operator has not chosen to follow upstream.
+        dim "$UPDATE_TIMER is not enabled - the box does not update itself; to follow upstream nightly: systemctl enable --now $UPDATE_TIMER (by hand: wiki-mirror update)"
     fi
 
     head2 "Version"

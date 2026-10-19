@@ -2,11 +2,16 @@
 #
 # Update the mirror on its LXC from GitHub, or leave it exactly as it was.
 #
-# Run as root: by hand through `wiki-mirror update`, or every night at 02:20 local time by
-# wiki-mirror-update.timer with `--unattended`. Decided on 2026-10-17: the
-# mirror follows main by itself, around the time the main client's own nightly update runs. The checkout
+# Run as root: by hand through `wiki-mirror update`, or every night at 02:20 local time (a quiet
+# hour) by wiki-mirror-update.timer with `--unattended`. The timer is opt-in: install.sh enables
+# it only with --auto-update (or when it is already enabled), because following main means applying
+# whatever is pushed there, as root, unreviewed - a trust decision for the operator. The checkout
 # is root-owned and the services only read it, so root fetches it, and a service account never
 # holds a credential that can change the code it runs.
+#
+# The fetch is plain `git fetch origin`, so it follows however the checkout was cloned: anonymous
+# HTTPS (the default) needs nothing, and a checkout cloned over SSH from a private fork carries its
+# own core.sshCommand (install.sh sets it) and keeps using it, unchanged.
 #
 # Options:
 #   --unattended           the timer's mode. A running build is a quiet "deferred" (exit 0), and
@@ -96,9 +101,9 @@ NFT_INSTALLED="${NFT_INSTALLED:-/etc/nftables.d/wiki-mirror.nft}"
 SYNC_USER="${SYNC_USER:-wikimirror-sync}"
 SHARED_GROUP="${SHARED_GROUP:-wikimirror}"
 RECORD_OWNER="${RECORD_OWNER:-root:$SHARED_GROUP}"
-# The tested dependency versions, wheels only (http-ece, pure Python and sdist-only, excepted);
-# the same flags install.sh uses. See the header of constraints.txt.
-PIP_PINNED=(-c "$SRC_DIR/constraints.txt" --only-binary=:all: --no-binary=http-ece)
+# The tested dependency versions, wheels only; the same flags install.sh uses. See the header of
+# constraints.txt.
+PIP_PINNED=(-c "$SRC_DIR/constraints.txt" --only-binary=:all:)
 
 UNATTENDED=false
 ACCEPT_FORMAT_CHANGE=false
@@ -316,9 +321,13 @@ OUTCOME_ARMED=true
 # git's own words on failure, not a guess at them (blaming the deploy key for what was an
 # ownership error cost a week once). They go to the log, never into the record: they can name
 # the remote.
-if ! FETCH_ERROR="$(git fetch --quiet origin "$BRANCH" 2>&1)"; then
+#
+# GIT_TERMINAL_PROMPT=0: by hand, a 401 (a repository that stopped being public) must fail at once
+# with git's message, not stop at an interactive "Username for" prompt; the unit has no terminal,
+# so there it would only hang until its timeout.
+if ! FETCH_ERROR="$(GIT_TERMINAL_PROMPT=0 git fetch --quiet origin "$BRANCH" 2>&1)"; then
     [[ -n "$FETCH_ERROR" ]] && printf '%s\n' "$FETCH_ERROR" | sed 's/^/    /' >&2
-    die "could not fetch from origin. If git over SSH to GitHub is refused, the github_git set in the firewall may be stale; root also has 443 - see docs/OPERATIONS.md failure modes"
+    die "could not fetch from origin. Is GitHub reachable from this box (DNS, outbound 443)? For a checkout that fetches over SSH, the github_git set in the firewall may be stale; root also has 443 - see docs/OPERATIONS.md failure modes"
 fi
 TARGET="$(git rev-parse "origin/$BRANCH")"
 
@@ -379,8 +388,11 @@ fi
 printf '%s\n' "$TARGET" > "$VENV/.installed-commit"
 
 # Units: installed from the checkout whenever they differ. A unit change that deploys but
-# never reaches /etc is a feature that is silently inert. A timer that was not there before is installed but NOT enabled: enabling is a
-# decision, so it is said out loud here and in the record.
+# never reaches /etc is a feature that is silently inert. A timer that was not there before is
+# installed but NOT enabled: enabling is a decision, so it is said out loud here and in the record.
+# A timer that already exists keeps whatever state the operator gave it, since this script never
+# enables or disables one - which is also what keeps the update timer's opt-in (install.sh
+# --auto-update) from being undone by an update.
 units_changed=false
 new_timers=""
 for unit in "$SRC_DIR"/systemd/*.service "$SRC_DIR"/systemd/*.timer; do

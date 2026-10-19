@@ -1,10 +1,9 @@
 """The mirror's HTTP surface: search, windowed article reads, health and the MCP door.
 
-Called over the LAN with a bearer key: by the main client (an agent
-platform's `wiki__search` and `wiki__read` tools) on the REST
-routes, and by other agents (Claude Code, ...) through MCP at `/mcp` (`mcp_server`), each
-with a key of its own. Everything else, the download, parse and index stages, runs from the
-command line
+Called over the LAN with a bearer key: by the primary client (the one holding
+`WIKI_MIRROR_API_KEY`) on the REST routes, and by other agents (Claude Code, ...) through MCP at
+`/mcp` (`mcp_server`), each with a key of its own. Everything else, the download, parse and
+index stages, runs from the command line
 (`wiki_mirror.__main__`), never from a route: the API process runs as a user with no
 internet and no write access to the data.
 
@@ -12,7 +11,7 @@ Non-obvious constraints:
 
 * **Every route needs a key, including unknown paths and `/mcp`.** Authentication is a pure ASGI
   middleware (`_Guard`), so an unauthenticated caller cannot even learn which paths exist, and it
-  runs before request validation. The key is the main client's (`WIKI_MIRROR_API_KEY`, client
+  runs before request validation. The key is the primary key (`WIKI_MIRROR_API_KEY`, client
   `primary`) or one in the live clients file (`keys.ClientKeys`: hashed, compared in constant time,
   re-read when the file changes, so a key added or revoked works at once without a restart).
   The matched client name is on `request.state.client` and in every log line of the request.
@@ -370,7 +369,7 @@ def create_app(
         served: The snapshot being served. Routes borrow it per request (`lease()`); while it
             holds nothing, search and article answer 503 `not_ready` and health still answers.
         health_source: Produces the `/v1/wiki/health` body.
-        keys: Who may call. Defaults to the main client's key plus `config.clients_file`;
+        keys: Who may call. Defaults to the primary key plus `config.clients_file`;
             tests inject one with their own clock.
 
     Returns:

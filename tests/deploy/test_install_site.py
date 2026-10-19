@@ -3,10 +3,12 @@
 The firewall names the LAN, the embedding server and its port, which differ at every site; they
 come from `/etc/wiki-mirror/site.env` and are substituted into a ruleset that nft loads as root.
 What is under test is the part that must not be wrong: the file is parsed as data and never
-evaluated; every value must be one of three strict literals or the installer stops (a hostile or
-mistyped value never reaches the ruleset); a first run installs the example and stops; an
+evaluated; every value must be a strict literal or the installer stops (a hostile or
+mistyped value never reaches the ruleset); the embedding server is optional, its host and port
+come as a pair or not at all, and a site without one gets a ruleset with no rule for it and no
+variable that rule would need; a first run installs the example and stops; an
 unedited example is refused; an edited file is never overwritten; the rendered ruleset has no
-placeholder left and differs from the template only in its three `define` lines; LAN_CIDR must be
+placeholder left and differs from the template only in its `define` lines; LAN_CIDR must be
 a private network of /8 or longer; the SSH session running the installer and the box itself must
 be inside it; the site file must belong to root and not be writable by anyone else; the resolver
 preflight follows the site's LAN instead of a fixed network; the firewall install puts the
@@ -59,8 +61,23 @@ PORT = "11434"
 #: What the stubbed `ip -4 -o addr show scope global` prints by default: an address inside LAN.
 BOX_ADDRESS_LINE = "2: eth0    inet 100.64.1.50/24 brd 100.64.1.255 scope global eth0"
 VALID = f"LAN_CIDR={LAN}\nEMBEDDING_HOST={HOST}\nEMBEDDING_PORT={PORT}\n"
+#: A valid site file for a site with no embedding server: the LAN alone.
+NO_EMBEDDING = f"LAN_CIDR={LAN}\n"
+
+#: Every variable `install.sh` reads from its environment, plus the ones git and ssh would act on
+#: if a test reached them: none is inherited from the machine the suite runs on.
+_INSTALLER_ENVIRONMENT = frozenset(
+    {
+        "SSH_CONNECTION", "REPO_URL", "APP_DIR", "DATA_DIR", "CONF_DIR", "SNAPSHOT_MOUNT",
+        "SNAPSHOT_DIR", "DEPLOY_KEY", "KNOWN_HOSTS", "BRANCH", "NFT_INSTALLED", "NFT_CONF",
+        "RESOLV_CONF", "UNIT_DIR", "IP_BIN", "SITE_OWNER_UID", "SITE_OWNER_GID", "PYTHON",
+        "GIT_SSH_COMMAND", "GIT_TERMINAL_PROMPT",
+    }
+)  # fmt: skip
 
 PLACEHOLDER = re.compile(r"@[A-Z][A-Z0-9_]*@")
+#: The comment lines that bracket the embedding server's `define`s and rule in the template.
+EMBEDDING_MARKER = re.compile(r"^\s*# [<>]{3} embedding-server$", re.M)
 
 
 @dataclass
@@ -121,10 +138,12 @@ class Site:
         """The installer's variables, pointed at this scratch box.
 
         SSH_CONNECTION is dropped from the inherited environment (the suite may itself be run
-        over ssh); a test that wants one passes it. The owner the site file must have is the
-        test's own uid and gid, since a test cannot be root.
+        over ssh), and so is every other variable the installer reads and this fixture does not
+        set, so a developer's own BRANCH or REPO_URL cannot change what a test sees; a test that
+        wants one passes it. The owner the site file must have is the test's own uid and gid,
+        since a test cannot be root.
         """
-        inherited = {k: v for k, v in os.environ.items() if k != "SSH_CONNECTION"}
+        inherited = {k: v for k, v in os.environ.items() if k not in _INSTALLER_ENVIRONMENT}
         return {
             **inherited,
             "APP_DIR": str(self.app),
@@ -230,13 +249,30 @@ def test_show_firewall_output_has_no_placeholder_left(site: Site) -> None:
     assert not PLACEHOLDER.findall(result.stdout)
 
 
-def test_show_firewall_the_shipped_example_is_itself_valid(site: Site) -> None:
-    # A shipped example the installer rejects would stop every first install for the wrong reason.
-    shutil.copy(EXAMPLE, site.site_file)
+def test_show_firewall_the_shipped_example_with_lan_cidr_uncommented_is_itself_valid(
+    site: Site,
+) -> None:
+    # A shipped example the installer rejects once it is filled in would stop every first
+    # install for the wrong reason. The one edit it asks for is removing "# " from LAN_CIDR.
+    site.write(EXAMPLE.read_text(encoding="utf-8").replace("# LAN_CIDR=", "LAN_CIDR="))
     result = site.run("--show-firewall")
     assert result.returncode == 0, result.stderr
     assert not PLACEHOLDER.findall(result.stdout)
-    assert _defines(result.stdout)["LAN_V4"] == "192.168.1.0/24"
+    # The embedding pair ships commented out, so the example alone renders a ruleset without it.
+    assert _defines(result.stdout) == {"LAN_V4": "192.168.1.0/24"}
+
+
+def test_show_firewall_the_shipped_example_unedited_sets_nothing_and_is_refused(
+    site: Site,
+) -> None:
+    # Every setting is commented out as shipped, so a site on 192.168.1.0/24 has to write the
+    # line as well: nothing is assumed about the network.
+    shutil.copy(EXAMPLE, site.site_file)
+    result = site.run("--show-firewall")
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "LAN_CIDR is missing" in result.stderr
+    assert "commented out" in result.stderr
 
 
 def test_show_firewall_comments_and_blank_lines_are_ignored(site: Site) -> None:
@@ -432,12 +468,21 @@ def test_show_firewall_every_problem_is_listed_in_one_pass(site: Site) -> None:
     assert "EMBEDDING_PORT must" in stderr
 
 
-@pytest.mark.parametrize("missing", ["LAN_CIDR", "EMBEDDING_HOST", "EMBEDDING_PORT"])
-def test_show_firewall_a_missing_key_is_refused(site: Site, missing: str) -> None:
+@pytest.mark.parametrize(
+    ("missing", "message"),
+    [
+        ("LAN_CIDR", "LAN_CIDR is missing"),
+        # The embedding pair is optional, but only as a pair: losing one half is refused.
+        ("EMBEDDING_HOST", "EMBEDDING_PORT is set but EMBEDDING_HOST is not"),
+        ("EMBEDDING_PORT", "EMBEDDING_HOST is set but EMBEDDING_PORT is not"),
+    ],
+)
+def test_show_firewall_a_missing_key_is_refused(site: Site, missing: str, message: str) -> None:
     site.write("".join(line for line in VALID.splitlines(keepends=True) if missing not in line))
     result = site.run("--show-firewall")
     assert result.returncode == 1
-    assert f"{missing} is missing" in result.stderr
+    assert result.stdout == ""
+    assert message in result.stderr
 
 
 def test_show_firewall_a_key_set_twice_is_refused(site: Site) -> None:
@@ -495,6 +540,295 @@ def test_show_firewall_a_whole_line_of_shell_is_never_run(site: Site) -> None:
     result = site.run("--show-firewall")
     assert result.returncode == 1
     assert not marker.exists()
+
+
+# -- the embedding server is optional, but only as a pair ------------------------------------
+
+
+def _without_the_embedding_block(template: str) -> str:
+    """The template with everything between the embedding markers (and the markers) removed."""
+    return re.sub(
+        r"^[ \t]*# >>> embedding-server\n.*?^[ \t]*# <<< embedding-server\n",
+        "",
+        template,
+        flags=re.M | re.S,
+    )
+
+
+def test_show_firewall_without_an_embedding_server_renders_no_embedding_rule_or_define(
+    site: Site,
+) -> None:
+    site.write(NO_EMBEDDING)
+    result = site.run("--show-firewall")
+    assert result.returncode == 0, result.stderr
+    assert _defines(result.stdout) == {"LAN_V4": LAN}
+    # Nothing that could name an undefined variable, and no placeholder: nft rejects both.
+    assert "EMBEDDING" not in result.stdout
+    assert "tcp dport 443 accept" in result.stdout, "the build user's public 443 rule stays"
+    assert not PLACEHOLDER.findall(result.stdout)
+    assert not EMBEDDING_MARKER.search(result.stdout), "the markers go with what they bracket"
+
+
+def test_show_firewall_without_an_embedding_server_is_the_template_less_the_marked_block(
+    site: Site,
+) -> None:
+    site.write(NO_EMBEDDING)
+    template = TEMPLATE.read_text(encoding="utf-8")
+    expected = _without_the_embedding_block(template).replace("@LAN_CIDR@", LAN)
+    assert site.run("--show-firewall").stdout == expected
+
+
+def test_show_firewall_with_an_embedding_server_keeps_the_rule_and_resolves_its_defines(
+    site: Site,
+) -> None:
+    site.write(VALID)
+    result = site.run("--show-firewall")
+    assert result.returncode == 0, result.stderr
+    assert _defines(result.stdout) == {
+        "LAN_V4": LAN,
+        "EMBEDDING_V4": HOST,
+        "EMBEDDING_PORT": PORT,
+    }
+    rule = 'meta skuid "wikimirror-sync" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept'
+    assert rule in result.stdout
+    assert len(EMBEDDING_MARKER.findall(result.stdout)) == 4, "kept, as comments"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["EMBEDDING_HOST=\nEMBEDDING_PORT=\n", "EMBEDDING_HOST=\n", "EMBEDDING_PORT=\n"],
+)
+def test_show_firewall_embedding_keys_with_empty_values_count_as_not_set(
+    site: Site, text: str
+) -> None:
+    site.write(NO_EMBEDDING + text)
+    result = site.run("--show-firewall")
+    assert result.returncode == 0, result.stderr
+    assert _defines(result.stdout) == {"LAN_V4": LAN}
+
+
+#: One embedding value given and its partner absent or empty, with the problem it must report.
+ONLY_HOST = "EMBEDDING_HOST is set but EMBEDDING_PORT is not"
+ONLY_PORT = "EMBEDDING_PORT is set but EMBEDDING_HOST is not"
+HALF_SET = [
+    (f"EMBEDDING_HOST={HOST}\n", ONLY_HOST),
+    (f"EMBEDDING_PORT={PORT}\n", ONLY_PORT),
+    (f"EMBEDDING_HOST={HOST}\nEMBEDDING_PORT=\n", ONLY_HOST),
+    (f"EMBEDDING_HOST=\nEMBEDDING_PORT={PORT}\n", ONLY_PORT),
+]
+
+
+@pytest.mark.parametrize(("text", "message"), HALF_SET)
+def test_show_firewall_exactly_one_embedding_value_is_refused_and_says_both_or_neither(
+    site: Site, text: str, message: str
+) -> None:
+    site.write(NO_EMBEDDING + text)
+    result = site.run("--show-firewall")
+    assert result.returncode == 1
+    assert result.stdout == "", "half an egress rule is never rendered"
+    assert message in result.stderr
+    assert "set both, or neither" in result.stderr
+
+
+@pytest.mark.parametrize(("text", "message"), HALF_SET)
+def test_check_site_exactly_one_embedding_value_blocks_the_real_run_and_the_dry_run(
+    site: Site, text: str, message: str
+) -> None:
+    site.write(NO_EMBEDDING + text)
+    real = site.call("check_site")
+    assert real.returncode == 1
+    assert message in real.stderr
+    dry = site.call('DRY_RUN=true; check_site; printf "%s\\n" "${BLOCKERS[@]}"; echo "[$LAN_CIDR]"')
+    assert dry.returncode == 0, dry.stderr
+    assert "problem(s)" in dry.stdout, "the dry run lists it as a blocker"
+    assert "[]" in dry.stdout, "no half-valid value is left loaded"
+
+
+def test_show_firewall_an_invalid_embedding_value_with_no_partner_reports_both_problems(
+    site: Site,
+) -> None:
+    site.write(NO_EMBEDDING + "EMBEDDING_HOST=not-an-address\n")
+    stderr = site.run("--show-firewall").stderr
+    assert "EMBEDDING_HOST must be an IPv4 address" in stderr, "a typo is reported as a typo"
+    assert "EMBEDDING_HOST is set but EMBEDDING_PORT is not" in stderr
+
+
+def test_check_site_without_an_embedding_server_says_so_and_loads_no_embedding_values(
+    site: Site,
+) -> None:
+    site.write(NO_EMBEDDING)
+    result = site.call('check_site; echo "[$EMBEDDING_HOST][$EMBEDDING_PORT]"')
+    assert result.returncode == 0, result.stderr
+    assert f"LAN {LAN}, no embedding server" in result.stdout
+    assert "embedding server  port" not in result.stdout, "the line must not print empty values"
+    assert result.stdout.splitlines()[-1] == "[][]"
+
+
+def test_check_site_with_an_embedding_server_names_its_address_and_port(site: Site) -> None:
+    site.write(VALID)
+    result = site.call("check_site")
+    assert result.returncode == 0, result.stderr
+    assert f"embedding server {HOST} port {PORT}" in result.stdout
+
+
+def _nft_runner() -> list[str] | None:
+    """The argv prefix that runs `nft` able to check a ruleset here, or None if nothing does.
+
+    `nft -c` still talks to the kernel, which needs CAP_NET_ADMIN. Tried in order: a throwaway
+    user and network namespace (`unshare -Urn`, no privilege, nothing of the host's touched), then
+    passwordless `sudo -n` (GitHub's runners restrict unprivileged user namespaces but give the
+    runner user sudo; `-c` loads nothing, so this changes nothing on the host either). Each is
+    probed with an empty table before it is trusted.
+    """
+    nft = shutil.which("nft") or next(
+        (path for path in ("/usr/sbin/nft", "/sbin/nft") if Path(path).exists()), None
+    )
+    if nft is None:
+        return None
+    candidates = [
+        [tool, *flags, nft]
+        for tool, flags in (
+            (shutil.which("unshare"), ["-Urn"]),
+            (shutil.which("sudo"), ["-n"]),
+        )
+        if tool is not None
+    ]
+    for argv in candidates:
+        probe = subprocess.run(  # noqa: S603 - fixed argv, a stdin ruleset that is an empty table
+            [*argv, "-c", "-f", "/dev/stdin"],
+            input="table inet probe { }\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return argv
+    return None
+
+
+@pytest.fixture(scope="module")
+def nft_runner() -> list[str]:
+    """The argv prefix for a working `nft`; skips if there is none, but fails when `CI` is set.
+
+    A skip on a developer's machine is honest; a skip in CI would let a ruleset that nft rejects
+    pass the build, which is the one thing these tests exist to catch.
+    """
+    argv = _nft_runner()
+    if argv is None:
+        reason = "needs nft, and either an unprivileged user namespace or passwordless sudo"
+        if os.environ.get("CI"):
+            pytest.fail(f"CI must be able to run `nft -c`, and cannot: {reason}")
+        pytest.skip(reason)
+    return argv
+
+
+#: The users the ruleset names, as the numbers nft accepts, since none of them exist on a test
+#: machine and nft refuses a name it cannot resolve.
+_RULESET_USERS = {
+    "wikimirror-sync": "1002",
+    "wikimirror": "1001",
+    "qdrant": "1003",
+    "_apt": "42",
+    "root": "0",
+}
+
+
+def _nft_check(
+    runner: list[str], ruleset: str, tmp_path: Path
+) -> subprocess.CompletedProcess[str]:
+    """Run `nft -c` on a rendered ruleset, with its users written as the numbers nft accepts."""
+    numeric = re.sub(
+        r'"(wikimirror-sync|wikimirror|qdrant|_apt|root)"',
+        lambda match: _RULESET_USERS[match.group(1)],
+        ruleset,
+    )
+    path = tmp_path / "check.nft"
+    path.write_text(numeric, encoding="utf-8")
+    return subprocess.run(  # noqa: S603 - fixed argv, a scratch file
+        [*runner, "-c", "-f", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("settings", [VALID, NO_EMBEDDING], ids=["embedding", "no-embedding"])
+def test_rendered_ruleset_passes_nft_check_with_and_without_an_embedding_server(
+    site: Site, tmp_path: Path, nft_runner: list[str], settings: str
+) -> None:
+    site.write(settings)
+    rendered = site.run("--show-firewall").stdout
+    result = _nft_check(nft_runner, rendered, tmp_path)
+    assert result.returncode == 0, result.stderr
+
+
+def test_nft_check_rejects_the_embedding_rule_when_its_defines_are_missing(
+    site: Site, tmp_path: Path, nft_runner: list[str]
+) -> None:
+    # The failure the markers exist to prevent: a rule naming a variable nobody defined.
+    site.write(VALID)
+    rendered = site.run("--show-firewall").stdout
+    broken = "".join(
+        line for line in rendered.splitlines(keepends=True) if "define EMBEDDING_" not in line
+    )
+    result = _nft_check(nft_runner, broken, tmp_path)
+    assert result.returncode != 0
+    assert "EMBEDDING_V4" in result.stderr
+
+
+def _render(site: Site, template: Path, settings: str) -> subprocess.CompletedProcess[str]:
+    return site.call(f'{settings}render_firewall "{template}"')
+
+
+def test_render_firewall_with_only_one_embedding_value_returns_one_and_prints_nothing(
+    site: Site,
+) -> None:
+    template = site.app / "deploy" / "nftables" / TEMPLATE.name
+    result = _render(site, template, f"LAN_CIDR={LAN}; EMBEDDING_HOST={HOST}; ")
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "must be set together or not at all" in result.stderr
+
+
+def test_render_firewall_without_embedding_and_an_unclosed_marker_renders_nothing(
+    site: Site,
+) -> None:
+    template = site.app / "deploy" / "nftables" / TEMPLATE.name
+    text = template.read_text(encoding="utf-8")
+    head, _, tail = text.rpartition("        # <<< embedding-server\n")
+    template.write_text(head + tail, encoding="utf-8")
+    result = _render(site, template, f"LAN_CIDR={LAN}; ")
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "never closes it" in result.stderr
+
+
+def test_render_firewall_without_embedding_and_a_closing_marker_alone_renders_nothing(
+    site: Site,
+) -> None:
+    template = site.app / "deploy" / "nftables" / TEMPLATE.name
+    template.write_text(
+        template.read_text(encoding="utf-8") + "# <<< embedding-server\n", encoding="utf-8"
+    )
+    result = _render(site, template, f"LAN_CIDR={LAN}; ")
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "with no '# >>> embedding-server' before it" in result.stderr
+
+
+def test_render_firewall_without_embedding_and_a_rule_outside_the_markers_renders_nothing(
+    site: Site,
+) -> None:
+    template = site.app / "deploy" / "nftables" / TEMPLATE.name
+    template.write_text(
+        template.read_text(encoding="utf-8") + "ip daddr $EMBEDDING_V4 accept\n", encoding="utf-8"
+    )
+    result = _render(site, template, f"LAN_CIDR={LAN}; ")
+    assert result.returncode == 1
+    assert result.stdout == "", "an undefined variable would fail the whole ruleset load"
+    assert "outside its" in result.stderr
 
 
 # -- the first install, the unedited example, an edited file ----------------------------------
@@ -578,7 +912,14 @@ def test_check_site_edited_valid_file_passes_loads_the_values_and_is_left_alone(
 
 
 def test_check_site_the_example_with_one_value_changed_counts_as_edited(site: Site) -> None:
-    text = EXAMPLE.read_text(encoding="utf-8").replace("EMBEDDING_PORT=8080", "EMBEDDING_PORT=9090")
+    # The optional pair is commented out in the example; uncommenting it, with one value
+    # changed, is the edit an operator with an embedding server makes.
+    text = (
+        EXAMPLE.read_text(encoding="utf-8")
+        .replace("# LAN_CIDR=", "LAN_CIDR=")
+        .replace("# EMBEDDING_HOST=", "EMBEDDING_HOST=")
+        .replace("# EMBEDDING_PORT=8080", "EMBEDDING_PORT=9090")
+    )
     site.write(text)
     # The example's own LAN is 192.168.1.0/24, so the box (as the stub reports it) is on that LAN.
     result = site.call(
@@ -587,6 +928,31 @@ def test_check_site_the_example_with_one_value_changed_counts_as_edited(site: Si
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[-1] == "9090"
+
+
+def test_check_site_a_site_on_the_examples_own_lan_passes_once_it_uncomments_lan_cidr(
+    site: Site,
+) -> None:
+    # A box really on 192.168.1.0/24 with no embedding server: the shipped example needs one
+    # edit to be right, and that edit has to be possible (it used to need none and block anyway).
+    site.write(EXAMPLE.read_text(encoding="utf-8").replace("# LAN_CIDR=", "LAN_CIDR="))
+    result = site.call(
+        'check_site; echo "[$LAN_CIDR]"',
+        STUB_IP_LINES="2: eth0    inet 192.168.1.50/24 brd 192.168.1.255 scope global eth0",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "[192.168.1.0/24]"
+
+
+def test_check_site_unedited_example_says_to_remove_the_hash_and_write_a_network(
+    site: Site,
+) -> None:
+    shutil.copy(EXAMPLE, site.site_file)
+    result = site.call("check_site")
+    assert result.returncode == 1
+    assert "every setting in it is commented out" in result.stderr
+    assert "remove the leading '# ' from the LAN_CIDR line" in result.stderr
+    assert "192.168.1.0/24 shown is only an example" in result.stderr
 
 
 # -- the installer must not lock the operator out ---------------------------------------------
@@ -933,15 +1299,22 @@ _STUBS = {
 
 
 def _apply_firewall(
-    site: Site, *, loaded: bool = True, port: str = PORT, **env: str
+    site: Site, *, loaded: bool = True, port: str = PORT, embedding: bool = True, **env: str
 ) -> subprocess.CompletedProcess[str]:
-    """Run the real (not dry) firewall stage with the stubs in front of PATH."""
+    """Run the real (not dry) firewall stage with the stubs in front of PATH.
+
+    `embedding=False` loads a site with no embedding server (only LAN_CIDR is set).
+    """
     stubs = site.root / "stubs"
     stubs.mkdir(exist_ok=True)
     for name, body in _STUBS.items():
         (stubs / name).write_text(body, encoding="utf-8")
         (stubs / name).chmod(0o755)
-    settings = f"LAN_CIDR={LAN}; EMBEDDING_HOST={HOST}; EMBEDDING_PORT={port}; " if loaded else ""
+    settings = f"LAN_CIDR={LAN}; "
+    if embedding:
+        settings += f"EMBEDDING_HOST={HOST}; EMBEDDING_PORT={port}; "
+    if not loaded:
+        settings = ""
     return site.call(
         f"{settings}install_firewall", PATH=f"{stubs}:{os.environ['PATH']}", **env
     )
@@ -1121,6 +1494,47 @@ def test_install_firewall_a_changed_site_value_replaces_the_installed_file(site:
     assert result.returncode == 0, result.stderr
     assert _defines(site.installed.read_text(encoding="utf-8"))["EMBEDDING_PORT"] == "9090"
     assert "installed" in result.stdout
+
+
+def test_install_firewall_dry_run_without_an_embedding_server_says_there_is_no_rule_for_one(
+    site: Site,
+) -> None:
+    result = site.call(f"LAN_CIDR={LAN}; DRY_RUN=true; install_firewall")
+    assert result.returncode == 0, result.stderr
+    assert f"define LAN_V4 = {LAN}" in result.stdout
+    assert "EMBEDDING_V4" not in result.stdout
+    assert "no embedding server" in result.stdout
+    assert "would install the rendered ruleset" in result.stdout
+    assert not site.installed.exists()
+
+
+def test_install_firewall_without_an_embedding_server_installs_a_ruleset_with_no_rule_for_one(
+    site: Site,
+) -> None:
+    site.write(NO_EMBEDDING)
+    result = _apply_firewall(site, embedding=False)
+    assert result.returncode == 0, result.stderr
+    installed = site.installed.read_text(encoding="utf-8")
+    assert installed == site.run("--show-firewall").stdout
+    assert "EMBEDDING" not in installed
+    assert site.calls() == [
+        f"nft -c -f {site.nft_conf}",
+        f"nft -f {site.nft_conf}",
+        "systemctl enable --quiet nftables.service",
+    ]
+
+
+def test_install_firewall_a_site_that_drops_its_embedding_server_replaces_the_installed_file(
+    site: Site,
+) -> None:
+    site.write(VALID)
+    assert _apply_firewall(site).returncode == 0
+    assert "EMBEDDING_V4" in site.installed.read_text(encoding="utf-8")
+    site.write(NO_EMBEDDING)
+    result = _apply_firewall(site, embedding=False)
+    assert result.returncode == 0, result.stderr
+    assert "EMBEDDING" not in site.installed.read_text(encoding="utf-8")
+    assert not _backup(site).exists()
 
 
 def test_install_firewall_without_loaded_site_settings_builds_nothing_and_dies(site: Site) -> None:

@@ -59,8 +59,12 @@ free account and one secret.
 
 A separate LXC on a Proxmox host (hostname `wikipedia-mirror`) so that:
 
-- **Egress is confined.** It is the only machine that downloads from Wikimedia. Its firewall allows the
-  Enterprise endpoints and the embedding server, nothing else (section 6).
+- **Egress is confined.** It is the only machine that downloads from Wikimedia. Its firewall is default-deny, scoped
+  per Unix user (section 6): the build user may open HTTPS (tcp 443) to the internet but not to private or shared
+  address ranges, because the Enterprise API and
+  the S3 bucket its downloads redirect to cannot be named by address, and the one optional embedding server; root
+  gets what installs and updates need; the API user gets nothing. The template is
+  [`deploy/nftables/wiki-mirror.nft`](../deploy/nftables/wiki-mirror.nft).
 - **Memory is its own.** Its Qdrant holds tens of millions of points.
 - **It is disposable.** A rebuild, a bad snapshot or a runaway embed job touches no other service. Clients reach it
   over the LAN.
@@ -128,7 +132,8 @@ build-beside path, which remains the route for rare full rebuilds (section 12.7)
   key. The data is public Wikipedia, so a leaked key exposes nothing private to a LAN host; the key still limits
   who can use the service and tells the logs who asked.
 - **Per-site settings, not per-site code.** Three values differ between networks: the LAN (`LAN_CIDR`), the
-  embedding server's address (`EMBEDDING_HOST`) and its port (`EMBEDDING_PORT`). They live in
+  embedding server's address (`EMBEDDING_HOST`) and its port (`EMBEDDING_PORT`); the last two are optional (both or
+  neither) and only open one egress rule for the planned semantic index (W2), which nothing uses yet. They live in
   `/etc/wiki-mirror/site.env`, not in the repository, and the firewall file in the repository is a template with a
   placeholder for each. The values reach a ruleset that loads as root, so the installer treats the file as data
   (it is never sourced), accepts only a dotted-quad network or address with every octet 0-255 and a port of 1-65535,
@@ -169,7 +174,8 @@ W1 is useful without any embedding. W2 is the long one.
   quality).
 - **The bulk embed competes with other users of the embedding server.** Mitigated by background priority, a
   concurrency cap and a bulk window.
-- **Disk:** about 100 GB at peak during a monthly build (two stores side by side for a few hours).
+- **Disk:** a monthly build needs about 100 GB more than the serving stores at peak (two stores side by side for a
+  few hours). Plan on 250 GB of local disk ([SIZING.md](SIZING.md)).
 - **A half-updated index.** Mitigated by the per-passage text hash (section 12.6).
 
 ## 10. Choices made at the start (2026-10-16, D1)
@@ -246,7 +252,7 @@ estimate.
 4. **Semantic vectors:**
    - bge-m3, 1,024 dimensions. Re-examined 2026-10-19: newer open models (Qwen3-Embedding 0.6B, EmbeddingGemma)
      score higher on public benchmarks and would build in about the same time. The maintainer kept bge-m3, since it
-     serves the need and the priority is the wider system rather than a perfect Wikipedia lookup. A model change
+     serves the need and the priority is the work the mirror serves rather than a perfect Wikipedia lookup. A model change
      stays possible at any later full rebuild (section 12.7);
    - float16 originals on disk, binary quantization in RAM, and rescoring with oversampling (D1);
    - W2 checks binary against int8 through the golden set.
@@ -317,7 +323,11 @@ So the whole snapshot (30.0 billion characters) embeds in **about 42 hours as 41
 hours as about 15M merged ones**. Passage length moves the time by about a quarter, but storage and RAM by about
 2.7x: float16 originals of 85 GB against about 31 GB, and binary vectors of 5.3 GB against about 2 GB.
 
-**What the embedding server's maintainer confirmed (2026-10-18):**
+**What the maintainer of the embedding router used for these measurements confirmed (2026-10-18).** This
+is specific to that router, a front end the maintainer runs over four Ollama nodes (it has a priority header, a
+bounded queue and a usage ledger). It is not what the mirror requires: a plain Ollama server or any
+OpenAI-compatible embeddings endpoint is the expected general case, and the knee, queue depth and housekeeping
+below are that router's, not yours.
 - **The knee is 16, and it is structural.** Each node's bge-m3 runner takes one sequence at a time, and the server
   admits 4 per node. Raising the parallelism setting is server-wide and would multiply the chat models' KV cache
   on the 8 GB cards, so it stays.

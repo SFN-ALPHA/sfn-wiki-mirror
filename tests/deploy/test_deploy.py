@@ -6,14 +6,16 @@ that fails is retried a bounded number of times and then stops; the firewall ref
 not admit instead of dropping it, admits apt's real user, and names only users the installer
 checks for; the dependencies are pinned, complete against pyproject.toml, and installed from
 wheels; the nightly update timer is at 02:20 local time (no zone is written, so the container's
-own decides) and the installer enables it; the
+own decides) and the installer enables it only on request; the
 FORMAT file `update.sh` compares across commits equals the line the code builds, so it can never
 drift from the constants it names; the firewall file is a template whose only placeholders sit in
-its `define` lines and match the keys of `site.env.example`, and it holds no literal address of
-anyone's network. Whether nftables or systemd accepts the files is qualified on the box, by the
-installer (`nft -c` before it applies, `systemctl daemon-reload`). What `update.sh` does on each
-outcome is qualified by running it, in `test_update_script.py`; how the installer reads and
-renders the site file is in `test_install_site.py`.
+its `define` lines and match the keys of `site.env.example`, whose embedding-server lines are
+bracketed by the markers the installer removes when a site has none, and which holds no literal
+address of anyone's network. Whether nftables or systemd accepts the files is qualified on the
+box, by the installer (`nft -c` before it applies, `systemctl daemon-reload`). What `update.sh`
+does on each outcome is qualified by running it, in `test_update_script.py`; how the installer
+reads and renders the site file is in `test_install_site.py`; how it fetches the repository and
+whether it enables the update timer is in `test_install_repo_and_updates.py`.
 
 See docs/DESIGN.md sections 6 and 12 and docs/OPERATIONS.md.
 """
@@ -181,8 +183,65 @@ PRIVATE_ADDRESS = re.compile(
 )
 
 
+#: The private and shared blocks as the network ranges they are: not anyone's network, and
+#: exactly what the build user's tcp 443 rule excludes (below).
+PRIVATE_BLOCKS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")
+
+
 def test_the_firewall_template_holds_no_literal_lan_address() -> None:
-    assert not PRIVATE_ADDRESS.findall(NFT)
+    without_the_ranges = NFT
+    for block in PRIVATE_BLOCKS:
+        without_the_ranges = without_the_ranges.replace(block, "<range>")
+    assert not PRIVATE_ADDRESS.findall(without_the_ranges)
+
+
+def _build_user_443_rule() -> str:
+    rules = [
+        line
+        for line in _chain("output")
+        if 'skuid "wikimirror-sync"' in line and "tcp dport 443" in line
+    ]
+    assert len(rules) == 1, rules
+    return rules[0]
+
+
+def test_the_build_users_443_rule_excludes_every_private_and_shared_range() -> None:
+    # The parse job handles attacker-editable HTML: it may reach public hosts on 443 (Enterprise,
+    # S3) but not a host on the LAN or any other private network.
+    rule = _build_user_443_rule()
+    excluded = re.search(r"ip daddr != \{([^}]*)\}", rule)
+    assert excluded is not None, rule
+    assert set(re.findall(r"\d+\.\d+\.\d+\.\d+/\d+", excluded.group(1))) == set(PRIVATE_BLOCKS)
+    assert rule.startswith("meta nfproto ipv4 ")
+    assert rule.endswith("tcp dport 443 accept")
+
+
+def test_the_private_ranges_the_443_rule_excludes_are_the_ones_a_lan_can_be_in() -> None:
+    # LAN_V4 is not in the exclusion set because the installer only accepts a LAN inside these
+    # blocks; if that list ever grew, the rule would silently let the parse job reach the new one.
+    installer = (DEPLOY / "install.sh").read_text(encoding="utf-8")
+    declared = re.search(r"^PRIVATE_NETWORKS=\((.*?)\)", installer, re.M)
+    assert declared is not None, "the installer's PRIVATE_NETWORKS moved"
+    assert set(declared.group(1).split()) == set(PRIVATE_BLOCKS)
+
+
+def test_the_embedding_accept_comes_before_the_build_users_443_rule() -> None:
+    # The embedding server is on the LAN, which the 443 rule excludes, so it needs its own accept
+    # first; if the order flipped, an embedding server on port 443 would be refused.
+    output = _chain("output")
+    embedding = [i for i, line in enumerate(output) if "$EMBEDDING_V4" in line]
+    assert embedding == [output.index(_build_user_443_rule()) - 1]
+
+
+def test_root_and_apt_keep_80_and_443_to_anywhere_so_a_lan_mirror_still_works() -> None:
+    # Deliberate (see the template header): they parse nothing an attacker edits, and a site may
+    # run an apt or PyPI mirror, or a proxy, on its own LAN.
+    for user in ("root", "_apt"):
+        (rule,) = [
+            line for line in _chain("output") if f'skuid "{user}"' in line and "dport" in line
+            and "@github_git" not in line and "udp" not in line
+        ]
+        assert "daddr" not in rule, rule
 
 
 def test_the_firewall_template_substitutes_only_in_three_define_lines() -> None:
@@ -203,15 +262,58 @@ def test_the_firewall_template_substitutes_only_in_three_define_lines() -> None:
 
 
 def test_the_site_example_has_exactly_the_keys_the_template_substitutes() -> None:
-    keys = {
-        line.partition("=")[0]
-        for line in _uncommented((DEPLOY / "site.env.example").read_text(encoding="utf-8"))
-    }
-    assert keys == {placeholder.strip("@") for placeholder in PLACEHOLDER.findall(NFT)}
+    text = (DEPLOY / "site.env.example").read_text(encoding="utf-8")
+    # Nothing is assumed about a site: every setting ships commented out, in the `# KEY=value`
+    # shape an operator uncomments (a network that merely happens to equal the example's would
+    # otherwise be unfixable: the installer refuses an unedited example). Each is still a key the
+    # template knows.
+    assert not _uncommented(text)
+    shipped = set(re.findall(r"^# ([A-Z][A-Z_]*)=", text, re.M))
+    assert shipped == {"LAN_CIDR", "EMBEDDING_HOST", "EMBEDDING_PORT"}
+    assert shipped == {placeholder.strip("@") for placeholder in PLACEHOLDER.findall(NFT)}
+
+
+EMBEDDING_BEGIN = "# >>> embedding-server"
+EMBEDDING_END = "# <<< embedding-server"
+
+
+def _outside_and_inside_the_embedding_markers() -> tuple[list[str], list[str]]:
+    """The template's lines outside, and between, the markers the installer strips."""
+    outside: list[str] = []
+    inside: list[str] = []
+    open_block = False
+    for raw in NFT.splitlines():
+        line = raw.strip()
+        if line == EMBEDDING_BEGIN:
+            assert not open_block, "markers nest"
+            open_block = True
+        elif line == EMBEDDING_END:
+            assert open_block, "a closing marker with no opening one"
+            open_block = False
+        else:
+            (inside if open_block else outside).append(line)
+    assert not open_block, "an opening marker is never closed"
+    return outside, inside
+
+
+def test_the_embedding_defines_and_rule_are_the_only_lines_between_the_markers() -> None:
+    _, inside = _outside_and_inside_the_embedding_markers()
+    assert _uncommented("\n".join(inside)) == [
+        "define EMBEDDING_V4 = @EMBEDDING_HOST@",
+        "define EMBEDDING_PORT = @EMBEDDING_PORT@",
+        'meta skuid "wikimirror-sync" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept',
+    ]
+
+
+def test_nothing_outside_the_embedding_markers_names_the_embedding_values() -> None:
+    # nft rejects a rule that names an undefined variable; with no embedding server the installer
+    # removes the bracketed lines, so anything else that named them would break the whole ruleset.
+    outside, _ = _outside_and_inside_the_embedding_markers()
+    assert not [line for line in outside if "EMBEDDING_" in line]
 
 
 def test_the_embedding_server_rule_uses_the_site_defines_for_address_and_port() -> None:
-    rules = [line for line in _chain("output") if '"wikimirror-sync" ip daddr' in line]
+    rules = [line for line in _chain("output") if "$EMBEDDING_" in line]
     assert rules == [
         'meta skuid "wikimirror-sync" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept'
     ]
@@ -269,6 +371,13 @@ def test_the_direct_dependencies_of_the_install_are_all_pinned() -> None:
     assert names <= set(_pins()), sorted(names - set(_pins()))
 
 
+def test_no_pin_is_left_for_a_package_this_project_does_not_use() -> None:
+    # Pins that once belonged to a web-push dependency and a password hasher no longer in the
+    # tree; a constraint on a package pip does not install is inert and only misleads.
+    leftovers = {"pywebpush", "http-ece", "py-vapid", "argon2-cffi", "argon2-cffi-bindings"}
+    assert not leftovers & set(_pins())
+
+
 def test_each_pin_satisfies_the_floor_pyproject_declares() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     pins = _pins()
@@ -287,7 +396,8 @@ def test_the_scripts_install_dependencies_from_the_pins_and_from_wheels(script: 
     text = (DEPLOY / script).read_text(encoding="utf-8")
     assert "constraints.txt" in text
     assert "--only-binary=:all:" in text
-    assert "--no-binary=http-ece" in text, "the one pure-Python sdist-only dependency"
+    # No exception: every pinned dependency has a wheel, so nothing is ever built on the box.
+    assert "--no-binary" not in text
     pip_installs = [line for line in text.splitlines() if '/bin/pip" install' in line]
     # pip upgrades itself before the pins exist; every other install goes through the array.
     unpinned = [
@@ -309,8 +419,7 @@ UPDATE_SERVICE = "wiki-mirror-update.service"
 def test_update_timer_fires_at_0220_local_time_with_no_zone_written() -> None:
     timer = _unit(UPDATE_TIMER)["Timer"]
     # No zone on purpose: the container's own time zone decides when 02:20 is, so the file
-    # carries nobody's location (docs/OPERATIONS.md, "Time zone"). 02:20 is the main client's
-    # nightly 02:00 update + 20 min.
+    # carries nobody's location (docs/OPERATIONS.md, "Time zone"). 02:20 is a quiet hour.
     assert timer["OnCalendar"] == ["*-*-* 02:20:00"]
     assert timer["RandomizedDelaySec"] == ["300"]
     assert timer["Persistent"] == ["true"]
@@ -358,25 +467,30 @@ def test_update_service_can_write_everything_the_updater_writes() -> None:
         "/usr/local/bin",
         "/var/lib/wiki-mirror/state",
     ]
-    # The deploy key is in /root/.ssh: the fetch must be able to read it.
+    # A checkout cloned over SSH (a private fork) keeps its deploy key in /root/.ssh: the fetch
+    # must be able to read it.
     assert service["ProtectHome"] == ["read-only"]
 
 
-def test_every_shipped_unit_is_installed_and_the_timers_are_enabled_by_the_installer() -> None:
+def test_every_shipped_unit_is_installed_and_the_update_timer_is_opt_in() -> None:
     installer = (DEPLOY / "install.sh").read_text(encoding="utf-8")
     declared = re.search(r"^UNITS=\((.*?)\)", installer, re.S | re.M)
     assert declared is not None, "the installer's UNITS array moved"
     installed = set(declared.group(1).split())
     assert installed == {unit.name for unit in UNITS.glob("wiki-mirror*")}
-    enabled = re.search(r"run systemctl enable ((?:[^\n]*\\\n)*[^\n]*)", installer)
-    assert enabled is not None, "the installer's enable step moved"
-    assert UPDATE_TIMER in enabled.group(1)
-    assert "wiki-mirror-build.timer" in enabled.group(1)
-    started = re.search(
-        r"for unit in ((?:[^\n]*\\\n)*[^\n]*); do\n\s+run systemctl start", installer
-    )
-    assert started is not None, "the installer's start loop moved"
-    assert UPDATE_TIMER in started.group(1)
+    # What is always enabled and started: the services and the monthly build timer, not the update
+    # timer, which is added only on --auto-update or when it is already enabled
+    # (test_install_repo_and_updates.py runs both ways).
+    always = re.search(r"local to_enable=\((.*?)\)", installer)
+    assert always is not None, "the installer's enable list moved"
+    assert set(always.group(1).split()) == {
+        "wiki-mirror-qdrant.service",
+        "wiki-mirror.service",
+        "wiki-mirror-build.timer",
+    }
+    assert f"to_enable+=({UPDATE_TIMER})" in installer
+    assert 'run systemctl enable "${to_enable[@]}"' in installer
+    assert 'for unit in "${to_enable[@]}"; do' in installer
 
 
 def test_the_installers_closing_hint_names_the_full_path_of_the_cli() -> None:

@@ -7,7 +7,7 @@
 # re-downloading; the previous snapshot keeps serving until the new one is complete.
 #
 # Runs as `wikimirror-sync`, the only identity with internet egress (nftables: tcp 443 anywhere,
-# the embedding server named in site.env). It reads /etc/wiki-mirror/enterprise.env (0600 wikimirror-sync)
+# and, if site.env names one, the embedding server). It reads /etc/wiki-mirror/enterprise.env (0600 wikimirror-sync)
 # and writes the snapshot chunks to the NAS and the article store, build state and checkpoints
 # to local disk. It never holds the API key.
 #

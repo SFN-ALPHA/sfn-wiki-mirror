@@ -2,25 +2,34 @@
 #
 # Firewall for LXC `wiki-mirror` (the Wikipedia mirror). THIS FILE IS A TEMPLATE.
 #
-# The three values that differ between sites - the LAN, the embedding server and its port - are
-# not written here. install.sh reads them from /etc/wiki-mirror/site.env (deploy/site.env.example),
-# validates each against a strict IPv4/CIDR/port pattern, and substitutes them into the three
-# `define` lines at the top of the table, which are the only lines with a placeholder. It
-# installs the result as /etc/nftables.d/wiki-mirror.nft and refuses to apply anything that still
-# holds a placeholder. The rest of the file is the same everywhere. Do not load this file with
-# `nft -f` as it stands.
+# The values that differ between sites - the LAN and, optionally, an embedding server and its
+# port - are not written here. install.sh reads them from /etc/wiki-mirror/site.env
+# (deploy/site.env.example), validates each against a strict IPv4/CIDR/port pattern, and
+# substitutes them into the `define` lines at the top of the table, which are the only lines with
+# a placeholder. It installs the result as /etc/nftables.d/wiki-mirror.nft and refuses to apply
+# anything that still holds a placeholder. The rest of the file is the same everywhere. Do not
+# load this file with `nft -f` as it stands.
+#
+# **The embedding server is optional.** Its two `define` lines and its one egress rule sit between
+# a pair of marker comments ("embedding-server" with `>>>` to open and `<<<` to close). With a
+# server in site.env the markers stay, as comments, around the filled-in lines. Without one,
+# install.sh deletes everything between them, markers included, so the ruleset has neither the rule
+# nor the variables it would need (nft rejects a rule that names an undefined variable).
+# Anything that refers to the embedding server must stay between the markers.
 #
 # This is the only box that downloads from Wikimedia, so unlike a client box's locked-down
 # baseline it must reach the internet - but only as the
 # two identities that need to, and never as the API. Default-deny both directions:
 #
 #   INPUT   SSH and the API port (8300) from the LAN, loopback, replies, ICMP. Everything on
-#           8300 needs a bearer key (the main client's, and one per MCP agent), so the LAN is
+#           8300 needs a bearer key (the primary key, and one per MCP agent), so the LAN is
 #           the boundary, not the authorisation.
 #   OUTPUT  Per-user (`meta skuid`), because the destinations cannot be listed:
-#             wikimirror-sync  tcp 443 anywhere (Enterprise API + auth, and the rotating S3
-#                              addresses the chunk downloads redirect to), the embedding
-#                              server (W2 embeddings; its address and port are site.env's).
+#             wikimirror-sync  tcp 443 to any PUBLIC address (Enterprise API + auth, and the
+#                              rotating S3 addresses the chunk downloads redirect to; the
+#                              private and shared blocks, which hold the LAN, are excluded)
+#                              and, when site.env names one, the embedding server (the
+#                              planned semantic index).
 #             root             tcp 80/443 anywhere (PyPI, python.org, GitHub releases),
 #                              git-over-SSH to GitHub's published ranges (set github_git),
 #                              and the DHCP lease renewal to the LAN (this box is
@@ -44,9 +53,15 @@
 #         every such attempt wait out a 30 s connect timeout before falling back to IPv4.
 #
 # A compromised parse job (wikimirror-sync reads attacker-editable HTML) can still send data to
-# any host on 443. That is the accepted cost of S3's rotating addresses; what it cannot do is
-# reach the LAN (only the embedding server) or run as a user with the API key. Wikipedia text holds
+# any public host on 443. That is the accepted cost of S3's rotating addresses; what it cannot do
+# is open a connection to anything on the LAN (or any other private network) except the embedding
+# server, if there is one - beyond the DNS/NTP and ping to the LAN that every user is allowed - or
+# run as a user with the API key. Wikipedia text holds
 # nothing secret, and the Enterprise sign-in file is readable by wikimirror-sync alone.
+#
+# root and `_apt` keep tcp 80/443 to anywhere, private addresses included, on purpose: they never
+# parse attacker-editable content, and a site may legitimately reach an apt or PyPI mirror, or a
+# proxy, on its own LAN.
 #
 # **Lockout safety.** Established flows are accepted first, so the SSH session that applies
 # this file survives; new SSH is accepted from the LAN (LAN_CIDR in site.env) by a rule above
@@ -77,20 +92,27 @@ delete table inet wiki_mirror
 
 table inet wiki_mirror {
 
-    # The three site values (see the header): the only lines install.sh edits, each replaced by
-    # a literal it has validated. Everything below refers to them by name.
+    # The site values (see the header): the only lines install.sh edits, each replaced by a
+    # literal it has validated. Everything below refers to them by name.
     #
-    # LAN prefix the embedding server, the clients, the NAS and the Proxmox host live on.
+    # LAN prefix the clients, the NAS and the hypervisor live on.
     define LAN_V4 = @LAN_CIDR@
-    # The Ollama-compatible embedding server, for the W2 embedding job (docs/DESIGN.md section 5).
+
+    # >>> embedding-server
+    # The Ollama-compatible embedding server, for the planned semantic index (docs/DESIGN.md
+    # section 5). Present only when site.env names one (see the header); the egress rule that uses
+    # these is between the same markers in the output chain.
     define EMBEDDING_V4 = @EMBEDDING_HOST@
     define EMBEDDING_PORT = @EMBEDDING_PORT@
+    # <<< embedding-server
 
-    # GitHub's git-over-SSH endpoints, for `git fetch` as root (install.sh, update.sh).
+    # GitHub's git-over-SSH endpoints, for `git fetch` as root (update.sh) by a checkout cloned
+    # over SSH - a private fork; the default anonymous HTTPS checkout uses root's tcp 443 instead.
     # api.github.com/meta "git" (IPv4), 58 entries, re-checked
     # 2026-10-16. A retired address makes `wiki-mirror update` fail with "could not fetch from
-    # origin" - the intended tripwire. Root also holds tcp 443 anywhere, so the fallback is
-    # `ssh://git@ssh.github.com:443/...` in the checkout's origin URL (docs/OPERATIONS.md).
+    # origin" - the intended tripwire. Root also holds tcp 443 anywhere, so the temporary fallback
+    # is `ssh://git@ssh.github.com:443/...` in the checkout's origin URL; the installer accepts
+    # github.com only, so switch back before re-running it (docs/OPERATIONS.md).
     set github_git {
         type ipv4_addr
         flags interval
@@ -151,8 +173,8 @@ table inet wiki_mirror {
         # service rules so a typo below cannot take the operator's way in.
         ip saddr $LAN_V4 tcp dport 22 ct state new accept
 
-        # The API port, from the whole LAN rather than the main client alone: the service also serves
-        # an MCP endpoint (/mcp, added after W1) to several agents on the LAN, each with its
+        # The API port, from the whole LAN rather than the primary client alone: the service also
+        # serves an MCP endpoint (/mcp) to several agents on the LAN, each with its
         # own key. The firewall is not the access control here - every route requires a
         # bearer key, and the data is public Wikipedia text - so it only keeps the port off
         # anything outside the LAN.
@@ -187,13 +209,23 @@ table inet wiki_mirror {
         ip daddr $LAN_V4 udp dport { 53, 123 } accept
         ip daddr $LAN_V4 tcp dport 53 accept
 
-        # Ping to the LAN (embedding server, NAS, main client) for diagnosis; replies to it are established.
+        # Ping to the LAN (NAS, clients) for diagnosis; replies to it are established.
         ip daddr $LAN_V4 icmp type echo-request accept
 
-        # The download/parse/index identity. IPv4 only: Enterprise and S3 are reached over
-        # IPv4, and an unrouted ULA must not make the client try IPv6 first and stall.
-        meta nfproto ipv4 meta skuid "wikimirror-sync" tcp dport 443 accept
+        # The download/parse/index identity.
+        # >>> embedding-server
+        # Only when site.env names an embedding server (see the header): the one LAN host the
+        # build user may open a connection to. Before the 443 rule below, which would refuse it.
         meta skuid "wikimirror-sync" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept
+        # <<< embedding-server
+        # tcp 443 to anywhere EXCEPT private and shared address space: the Enterprise API and the
+        # S3 addresses it redirects to are public, while this identity parses attacker-editable
+        # HTML, so it must not be able to open a connection to a host on the LAN (or to any other
+        # private network). The four blocks are the only ones LAN_CIDR can lie in (install.sh
+        # refuses any other), so $LAN_V4 is inside them and needs no entry of its own.
+        # IPv4 only: Enterprise and S3 are reached over IPv4, and an unrouted ULA must not make
+        # the client try IPv6 first and stall.
+        meta nfproto ipv4 meta skuid "wikimirror-sync" ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } tcp dport 443 accept
 
         # Root: pip installs, source tarballs, git. HTTP as well as HTTPS for python.org and
         # GitHub's redirects.

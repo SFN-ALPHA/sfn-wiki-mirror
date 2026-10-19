@@ -251,8 +251,10 @@ The `type` field is required for a URL entry. Claude Code expands `${VAR}` in `u
 ### Claude Desktop
 
 Claude Desktop's config file (`claude_desktop_config.json`) launches local processes. This project's server needs
-a custom `Authorization` header, so the straightforward route is a stdio-to-HTTP bridge such as `mcp-remote`
-(Desktop's own remote-connector setup may not let you set that header; check your version). The bridge refuses
+a custom `Authorization` header and lives at a plain `http://` address on your LAN. Claude Desktop's built-in
+connectors are for public HTTPS servers and cannot reach a LAN `http://` URL (nor, as far as we know, set that
+header; check your version), so the bridge is a stdio-to-HTTP tool such as `mcp-remote`, which runs on the
+Desktop machine and talks to the mirror from there. It needs Node.js (`npx`) on that machine. The bridge refuses
 plain `http://` URLs unless told otherwise:
 
 ```json

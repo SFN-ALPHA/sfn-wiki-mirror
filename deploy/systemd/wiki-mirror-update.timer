@@ -1,9 +1,11 @@
-# Nightly trigger for wiki-mirror-update.service: the mirror follows main by itself.
+# Nightly trigger for wiki-mirror-update.service: with this timer enabled, the mirror follows main
+# by itself.
 #
-# Decided on 2026-10-17: this box updates itself nightly, around the time the main client
-# updates itself (02:00 local). 02:20 is twenty minutes after the client's run, so the two never
-# restart anything at the same moment, and inside the same overnight window when nobody is
-# searching.
+# **Opt-in.** The unit is always installed, but install.sh enables it only with --auto-update (or
+# when it is already enabled), because the update applies whatever is pushed to main, as root, with
+# nobody reviewing it first. Whether to trust that is the operator's decision.
+#
+# 02:20 is a quiet hour, when nobody is searching.
 #
 # **02:20 is LOCAL time: the container's own time zone decides when this runs.** No zone is
 # written in the OnCalendar line on purpose, so the file carries nobody's location. A new
@@ -20,16 +22,17 @@
 # last days) turns the run into a quiet "deferred", not a failed unit; a commit that changes the
 # on-disk format is "held" for a person. See update.sh and docs/OPERATIONS.md R.9 / R.10.
 #
-# Install: install.sh enables it. On a box installed before this unit existed (once):
+# Install: install.sh --auto-update enables it; without that flag it is installed and left off.
+# To turn it on later (once):
 #          systemctl enable --now wiki-mirror-update.timer
 #          systemctl list-timers wiki-mirror-update
-# To stop auto-updating: systemctl disable --now wiki-mirror-update.timer. `wiki-mirror
-# update` keeps working by hand.
+# To stop auto-updating: systemctl disable --now wiki-mirror-update.timer (re-running install.sh
+# without --auto-update leaves it as it is). `wiki-mirror update` keeps working by hand.
 #
 # See docs/DESIGN.md section 12 and docs/OPERATIONS.md.
 
 [Unit]
-Description=Nightly Wikipedia mirror update (02:20 local time, after the client's 02:00)
+Description=Nightly Wikipedia mirror update (02:20 local time)
 Documentation=file:///opt/wiki-mirror/docs/OPERATIONS.md
 
 [Timer]

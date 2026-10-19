@@ -63,7 +63,8 @@ choice to settle in the semantic build ([ROADMAP.md](ROADMAP.md)).
 - Local disk: 25 (articles) + 37 (keyword) + about 95 (semantic) = about **160 GB**. Add headroom: a monthly
   build holds two article stores side by side for a few hours (about 100 GB peak before the semantic index), and
   Qdrant's optimizer needs free space for segment rewrites. The build refuses to start below 20 GB free. **Plan on
-  250 GB or more.**
+  250 GB of local disk, plus about 300 GB of bulk storage for the snapshots.** This is the one disk figure the other
+  docs quote.
 - RAM for Qdrant: about 4-5 GB (keyword) + 5.3 GB (binary) + up to 5 GB (graph) = about 15 GB, which is why the
   cap rises from 12G to about 20G for the semantic build. A 32 GB host also runs the API (cap 1.5 GB) and a build
   (cap 5 GB), and the kernel needs page cache for the memory-mapped files.
@@ -155,7 +156,7 @@ These combine the figures above; they are estimates, not tested minimums.
 
 | Stage | What it needs |
 |---|---|
-| Serve the keyword index | About 8 GB RAM for Qdrant and the API (the first deployment ran on 8 GB until the first build), about 70 GB of fast local disk for the store and index, 6 cores |
+| Serve the keyword index | About 8 GB RAM for Qdrant and the API (the first deployment ran on 8 GB until the first build), about 70 GB of fast local disk for the store and index (250 GB once monthly builds need their headroom), 6 cores (the parse stage runs 5 workers by default) |
 | First keyword build | The above plus about 300 GB of bulk storage for snapshots, and free local disk for two stores; the first build's run, 2026-10-17 15:45Z to 2026-10-18 05:12Z, took about 13.5 hours on six cores (measured; download and parse timings were not recorded separately) |
 | Semantic build | About 160 GB of fast local disk, 32 GB RAM with Qdrant capped near 20G, and an embedding server with enough effective TFLOPS: about 45 hours at 29 |
 | Monthly refresh | About 45 minutes of download, 1-2 hours of parse and the embedding of changed passages (estimates for the update; the full build figures are measured) |
