@@ -1,0 +1,82 @@
+# Qdrant for the mirror - the Wikipedia mirror's passage index.
+#
+# A separate system user (`qdrant`) from the build user: the split is deliberate. The build job (wikimirror-sync) parses
+# attacker-editable HTML and holds internet egress; if it were also the owner of the Qdrant
+# files, a compromise of one parser would be a write to the index. Qdrant runs as `qdrant`,
+# is reached only over loopback HTTP, and has no egress at all (nftables drops it).
+#
+# Loopback only, configured in /etc/wiki-mirror/qdrant.yaml (host, ports, storage,
+# memory knobs - each justified there). Storage is on LOCAL SSD, never the NAS: Qdrant
+# memory-maps its segments and misbehaves on NFS (docs/DESIGN.md section 4).
+#
+# Memory: this box has 32 GB (8 GB until 2026-10-17) for Qdrant, the API (1.5 G cap) and a build
+# (5 G cap) together. MemoryMax is the hard stop that turns a runaway into a restart (Restart=on-failure) instead of
+# an OOM of the whole container. Qdrant's mmap pages are reclaimable page cache, and at
+# MemoryMax the kernel reclaims them first; only anonymous memory (about 1 GB while indexing)
+# can trigger the kill.
+#
+# No MemoryHigh, deliberately. It was 3G until 2026-10-17: page cache counts toward it, so
+# during the first full build Qdrant sat at the mark and the kernel throttled it 200,000 times.
+# memory.high throttling *sleeps* the allocating task, which stretched the optimizer's segment
+# rewrites while it held the segment locks; one upsert waited 144 s and the build died twice.
+# memory.max reclaims without that penalty.
+#
+# MemoryMax went from 4G to 6G first: with the throttle gone, Qdrant was OOM-killed at 4G at
+# 8.7M passages (2026-10-17 22:09), when concurrent segment merges (optimizer_cpu_budget: 3,
+# qdrant.yaml) each built an inverted index on the heap. It recovered every segment from its
+# WAL and the build resumed, so the failure is safe, but each one costs a restart.
+#
+# MemoryMax is 12G, not 6G: the first full build finished (41.6M passages, 2026-10-18) with
+# anonymous memory peaking at 5.1 GB during the last merges (one optimization at a time,
+# 400 MB segments) and 4.3 GB at rest. 12G covers that plus W2's in-RAM binary vectors (about
+# 4 GB at this passage count, docs/DESIGN.md section 12.5) and still leaves the 32 GB box room.
+#
+# Install: install.sh does it. By hand:
+#   cp wiki-mirror-qdrant.service /etc/systemd/system/ && systemctl daemon-reload
+#   systemctl enable --now wiki-mirror-qdrant
+#
+# See docs/DESIGN.md sections 4 and 6, docs/OPERATIONS.md.
+
+[Unit]
+Description=Qdrant (mirror service passage index)
+Documentation=file:///opt/wiki-mirror/docs/OPERATIONS.md
+After=network.target
+
+[Service]
+Type=exec
+User=qdrant
+Group=qdrant
+# Qdrant writes `.qdrant-initialized` into its working directory, so this must be writable.
+WorkingDirectory=/var/lib/wiki-mirror/qdrant
+ExecStart=/usr/local/bin/qdrant --config-path /etc/wiki-mirror/qdrant.yaml
+UMask=0077
+
+Restart=on-failure
+RestartSec=5s
+# Let it flush its WAL; a hard kill mid-write costs an index repair on the next start.
+TimeoutStopSec=120
+
+MemoryMax=12G
+# Memory-mapped segments: the default file limit is far too low for a corpus this size.
+LimitNOFILE=65536
+
+# Hardening. One writable path; no network beyond loopback listeners.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/wiki-mirror/qdrant
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

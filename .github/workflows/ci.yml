@@ -1,0 +1,62 @@
+# CI: lint, types and the fast tests, on every push and pull request to main.
+#
+# Hermetic on purpose: no GPU, no WAN access to the LAN, no secrets. The index tests run against
+# Qdrant's in-memory local mode and the tools' tests against a fake mirror, so nothing here needs
+# the live service. Anything that does is marked `online` or `gate` and never runs here (pytest's
+# default marker selection in pyproject.toml excludes battery, e2e, gate and online).
+#
+# Python 3.13 is the interpreter the mirror's container runs. The package supports 3.12 and later;
+# only the deployed version is tested here.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch makes an in-flight run obsolete.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  quality:
+    name: lint, types, tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # A project environment on the pinned interpreter, never the runner's own Python
+      # (`uv pip install --system` fails on runner images that mark it externally managed).
+      - name: Create the project environment
+        run: uv venv --python ${{ env.PYTHON_VERSION }} .venv
+
+      - name: Install project and dev dependencies
+        run: uv pip install -e ".[dev]"
+
+      # Every later step's `ruff`, `mypy` and `pytest` are the environment's.
+      - name: Put the environment on PATH
+        run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      # Lint includes the documentation standard (ruff `D`): a missing module, class or function
+      # docstring fails the build rather than a review.
+      - name: Lint
+        run: ruff check .
+
+      - name: Types
+        run: mypy src tools
+
+      - name: Tests
+        run: pytest -q

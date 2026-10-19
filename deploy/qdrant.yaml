@@ -1,0 +1,81 @@
+# Qdrant 1.12.4 settings for the mirror's LXC (6 vCPU, 8 GB RAM, local SSD).
+#
+# Installed by install.sh to /etc/wiki-mirror/qdrant.yaml and read by
+# wiki-mirror-qdrant.service (`--config-path`). Only keys that differ from Qdrant's
+# shipped defaults, or that this deployment's security depends on, are set; everything else is
+# the default (config/config.yaml at tag v1.12.4). Environment overrides (QDRANT__...) would
+# win over this file, and the unit sets none.
+#
+# Non-obvious constraints:
+#   * Loopback only. The API reaches Qdrant at http://127.0.0.1:6333 and the config validator
+#     in wiki_mirror refuses any other URL. An exposed Qdrant accepts writes from
+#     anyone who can reach it.
+#   * Storage is on local SSD. Qdrant memory-maps segments; NFS makes every search a network
+#     round trip and mmap on NFS misbehaves (docs/DESIGN.md section 4).
+#   * The memory settings below are for 8 GB shared with the API (1.5 G cap) and a build
+#     (5 G cap); they will be revisited in W2, when dense vectors arrive and the real
+#     working set is measured. Collection-level settings made by the index code override the
+#     node defaults here.
+#
+# See docs/DESIGN.md sections 4 and 6, docs/OPERATIONS.md.
+
+log_level: INFO
+
+storage:
+  storage_path: /var/lib/wiki-mirror/qdrant/storage
+  # Qdrant snapshots (not Wikipedia snapshots). Same filesystem as the storage so a
+  # collection snapshot is a cheap local write; nothing takes one automatically.
+  snapshots_path: /var/lib/wiki-mirror/qdrant/snapshots
+  temp_path: /var/lib/wiki-mirror/qdrant/tmp
+
+  # Payload (page id, revision, section, flags - never text) stays on disk. Already the
+  # default in 1.12; set explicitly because 13 million payloads in RAM is the difference
+  # between fitting and not, and a future default change must not undo it silently.
+  on_disk_payload: true
+
+  performance:
+    # Search threads: 2 of 6 cores. The default (0 = all cores) is for a box that serves
+    # queries alone; here a build runs on the same cores, and the API serves one client
+    # (the main client), so two concurrent searches are plenty.
+    max_search_threads: 2
+    # Total CPU the segment optimizers (HNSW builds, merges) may use: 3 of 6 cores. The
+    # default (0 = cores minus one) would let indexing starve the parse workers and push
+    # optimizer memory past the box's headroom during a bulk upsert.
+    optimizer_cpu_budget: 3
+
+  optimizers:
+    # Segments above this size are memory-mapped rather than held on the heap, so the
+    # page cache (reclaimable under MemoryHigh) carries them instead of anonymous memory
+    # (which is what gets OOM-killed). Set equal to indexing_threshold_kb's default, so a
+    # segment is memory-mapped from the moment it is large enough to be indexed. The
+    # default (null = automatic) leaves that decision to Qdrant's heuristics, which assume
+    # a box sized for the whole index.
+    memmap_threshold_kb: 20000
+
+  hnsw_index:
+    # Node-wide default: HNSW graphs on disk. The lexical (sparse) index W1 builds is
+    # separate and configured by the index code; this matters for W2's dense vectors, where
+    # an in-RAM graph over ~13 million points does not fit in 8 GB. Costs some search
+    # latency, which a client's tools tolerate (an agent already waits seconds on a
+    # web fetch).
+    on_disk: true
+
+  collection:
+    vectors:
+      # Original vectors on disk by default (W2 keeps quantized copies in RAM); same reason.
+      on_disk: true
+
+service:
+  # Loopback. The firewall also blocks 6333/6334 from the LAN, but a service that is not
+  # listening on the LAN needs no firewall to be safe (docs/DESIGN.md section 6).
+  host: 127.0.0.1
+  http_port: 6333
+  # gRPC stays on, on loopback: qdrant-client uses it for bulk upserts when asked, and it
+  # costs nothing here. Same host binding applies.
+  grpc_port: 6334
+  # Nothing in a browser talks to this Qdrant.
+  enable_cors: false
+
+# No usage reporting from a box whose egress is allowlisted by design (and the `qdrant`
+# user has none).
+telemetry_disabled: true

@@ -1,0 +1,166 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sfn-wiki-mirror"
+version = "0.1.0"
+description = "Wikipedia mirror - a local, searchable, regularly synced English Wikipedia (package wiki_mirror, CLI wiki-mirror)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "SFN" }]
+
+# Dependency policy: a dependency lands in the commit that first imports it. This is the import
+# surface of `wiki_mirror` (the service, the build and the CLI), including the
+# `wiki_mirror.text` package, which needs nothing outside the standard library.
+#
+# The box installs `.` held to deploy/constraints.txt (an exact-version constraints file: it
+# fixes versions and adds no packages, so pins for packages no longer required are inert). Keep the two in step: a change here that adds a package needs a pin there.
+dependencies = [
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+    "fastapi>=0.115",
+    # [standard] is what the service ran with on the box (uvloop, httptools, websockets); the
+    # pins in constraints.txt cover it.
+    "uvicorn[standard]>=0.32",
+    "qdrant-client>=1.12",
+    # The MCP server (src/wiki_mirror/mcp_server.py): the SDK speaks the protocol and
+    # the streamable-HTTP transport, and the service decides who may call what.
+    "mcp>=2.0",
+    # Parsoid HTML to text. A full snapshot is about 700 GB of HTML a month; the stdlib parser
+    # would take most of a day on six cores, where lexbor's C parser takes about an hour and still
+    # gives a DOM with CSS selectors for dropping navboxes and reference lists. MIT, manylinux wheels.
+    "selectolax>=0.3.21",
+    # Article text compression in the store (about 3x on prose). Python 3.14 has zstd in the
+    # standard library; the project floor is 3.12.
+    "zstandard>=0.23",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+    "mypy>=1.13",
+    "types-PyYAML>=6.0",
+    # tools/wiki_passage_eval.py and its tests. qdrant-client brings numpy into every install
+    # already; listed so the dependency of the tools is a stated one.
+    "numpy>=1.26",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wiki_mirror"]
+
+# ---------------------------------------------------------------------------
+# Test configuration - tiers: unit, contract, property, battery, e2e, gate.
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--import-mode=importlib",
+    # Default run is the fast tiers only: no GPU, no WAN, no live service.
+    "-m", "not battery and not e2e and not gate and not online",
+]
+filterwarnings = [
+    "error",
+    # qdrant-client points out that local mode does not honor payload indexes. We know:
+    # local mode is how the index tests get real Qdrant semantics without a server, and the
+    # indexes exist for the deployed instance where they do matter. Matched on the message
+    # because the warning is attributed to whichever caller triggered it.
+    "ignore:Payload indexes have no effect in the local Qdrant.*:UserWarning",
+]
+# Strict mode: an async test without an explicit marker is an error rather than a
+# silently skipped no-op, which is the failure mode that lets async tests rot.
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    # Tier markers - exactly one per test.
+    "unit: one function or class in isolation; no network, no GPU, no disk beyond tmp_path",
+    "contract: one component against a mock of a real dependency's published contract",
+    "property: invariants over generated inputs (Hypothesis)",
+    "battery: adversarial and fault-injection suites at scale",
+    "e2e: full stack, real services, scripted user journeys",
+    "gate: acceptance qualification against the live mirror",
+    # Capability marker - orthogonal to tier.
+    "online: requires reachable LAN infrastructure (the live mirror, an embedding server); never runs in CI",
+]
+
+# ---------------------------------------------------------------------------
+# Lint. target-version pins the language floor at the project's minimum (3.12)
+# even when the development machine runs a newer interpreter (the box runs 3.13).
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "tools"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "N",         # pep8-naming
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "A",         # builtin shadowing
+    "C4",        # comprehensions
+    "DTZ",       # timezone-aware datetimes - every timestamp is UTC-aware
+    "T20",       # no stray print()
+    "PT",        # pytest style
+    "RET",       # return simplification
+    "SIM",       # simplification
+    "TID",       # tidy imports
+    "ARG",       # unused arguments
+    "PTH",       # pathlib over os.path
+    "ERA",       # no commented-out code
+    "S",         # bandit security rules
+    "ANN",       # type annotations - typed contracts at every boundary
+    "D",         # pydocstyle - the documentation standard, enforced
+    "RUF",
+]
+ignore = [
+    "ANN401",    # explicit Any is occasionally the honest type
+    "S101",      # assert is allowed; tests are the primary user
+    "D105",      # magic-method docstrings are noise; the class docstring covers them
+    "D107",      # __init__ is documented by its class docstring
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+# Without this, `tests` and `tools` sort as third-party and get separated from the
+# packages they exercise, which makes every test file's import block misleading.
+known-first-party = ["wiki_mirror", "tests", "tools"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests keep D100 (every test file states what it qualifies) but drop D103:
+# under the naming rule the test name is already the specification.
+"tests/**" = ["ANN", "ARG", "S105", "S106", "D103"]
+"tools/**" = ["T20"]          # CLIs print; that is their job
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+# The package and the operator scripts. The tools import each other as a namespace package
+# (`from tools import wiki_common`), which is what the explicit bases below are for: src/
+# roots the package, the checkout roots tools/, and tools/wiki_golden.py is "tools.wiki_golden"
+# rather than both that and "wiki_golden".
+files = ["src", "tools"]
+explicit_package_bases = true
+mypy_path = "src"
+strict = true
+warn_unreachable = true
+enable_error_code = ["redundant-expr", "truthy-bool", "ignore-without-code"]

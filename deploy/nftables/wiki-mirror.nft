@@ -1,0 +1,229 @@
+#!/usr/sbin/nft -f
+#
+# Firewall for LXC `wiki-mirror` (the Wikipedia mirror). THIS FILE IS A TEMPLATE.
+#
+# The three values that differ between sites - the LAN, the embedding server and its port - are
+# not written here. install.sh reads them from /etc/wiki-mirror/site.env (deploy/site.env.example),
+# validates each against a strict IPv4/CIDR/port pattern, and substitutes them into the three
+# `define` lines at the top of the table, which are the only lines with a placeholder. It
+# installs the result as /etc/nftables.d/wiki-mirror.nft and refuses to apply anything that still
+# holds a placeholder. The rest of the file is the same everywhere. Do not load this file with
+# `nft -f` as it stands.
+#
+# This is the only box that downloads from Wikimedia, so unlike a client box's locked-down
+# baseline it must reach the internet - but only as the
+# two identities that need to, and never as the API. Default-deny both directions:
+#
+#   INPUT   SSH and the API port (8300) from the LAN, loopback, replies, ICMP. Everything on
+#           8300 needs a bearer key (the main client's, and one per MCP agent), so the LAN is
+#           the boundary, not the authorisation.
+#   OUTPUT  Per-user (`meta skuid`), because the destinations cannot be listed:
+#             wikimirror-sync  tcp 443 anywhere (Enterprise API + auth, and the rotating S3
+#                              addresses the chunk downloads redirect to), the embedding
+#                              server (W2 embeddings; its address and port are site.env's).
+#             root             tcp 80/443 anywhere (PyPI, python.org, GitHub releases),
+#                              git-over-SSH to GitHub's published ranges (set github_git),
+#                              and the DHCP lease renewal to the LAN (this box is
+#                              `eth0 inet dhcp`, and ifupdown's dhclient runs as root).
+#             _apt             tcp 80/443 anywhere. apt does not fetch as root: it drops to
+#                              its sandbox user `_apt` (uid 42) for every download, so
+#                              `apt-get update` as root was refused until this rule existed.
+#                              Debian's stock sources use plain-http mirrors
+#                              (signature-verified; the transport is not what is trusted),
+#                              hence 80 as well as 443.
+#             wikimirror       nothing. The API serves reads from local disk and Qdrant on
+#                              loopback; if it ever tries to open a connection that is a
+#                              compromise, so it is counted and refused.
+#             qdrant           nothing, for the same reason.
+#             everyone         DNS/NTP to the LAN resolver, and nothing else.
+#
+#         **Refused, not dropped.** A connection nothing admits gets a TCP reset (or an ICMP
+#         admin-prohibited for anything else) instead of silence, so a client fails at once.
+#         This matters on this box: it has only a ULA IPv6 address (no routed v6), and a
+#         resolver that answers an AAAA record makes a client try v6 first; a silent drop made
+#         every such attempt wait out a 30 s connect timeout before falling back to IPv4.
+#
+# A compromised parse job (wikimirror-sync reads attacker-editable HTML) can still send data to
+# any host on 443. That is the accepted cost of S3's rotating addresses; what it cannot do is
+# reach the LAN (only the embedding server) or run as a user with the API key. Wikipedia text holds
+# nothing secret, and the Enterprise sign-in file is readable by wikimirror-sync alone.
+#
+# **Lockout safety.** Established flows are accepted first, so the SSH session that applies
+# this file survives; new SSH is accepted from the LAN (LAN_CIDR in site.env) by a rule above
+# the final drop. A LAN_CIDR that does not contain your workstation therefore refuses every NEW
+# connection from it once applied; the installer checks only that the resolver is inside it.
+# If a mistake ever does lock the LAN out: from the Proxmox host, `pct enter <ctid>`, then
+# `nft flush ruleset`. The container console never depends on this ruleset.
+#
+# **Apply** with deploy/install.sh (renders this template with site.env, installs the result
+# into /etc/nftables.d, ensures the include in /etc/nftables.conf, runs `nft -c` on the whole
+# ruleset, then applies it; if the check fails it puts the previous file back, so the next boot
+# never loads a ruleset that failed. `install.sh --show-firewall` prints the rendered ruleset and
+# changes nothing). Never `cp` + `nft -f` by hand: this file is a template, and it names system users,
+# and nft refuses the whole file over one unknown name (install.sh creates them first).
+# **Verify** with `nft list counters` (what was refused) and `wiki-mirror status`.
+#
+# The file declares then deletes its own table before redefining it, so loading it twice -
+# by hand, by the installer, or at boot after /etc/nftables.conf's `flush ruleset` - never
+# duplicates a rule.
+#
+# IPv6: nothing but link-local neighbour discovery is allowed either way; no rule here
+# accepts a routed IPv6 address.
+#
+# See docs/DESIGN.md section 6 and docs/OPERATIONS.md.
+
+table inet wiki_mirror
+delete table inet wiki_mirror
+
+table inet wiki_mirror {
+
+    # The three site values (see the header): the only lines install.sh edits, each replaced by
+    # a literal it has validated. Everything below refers to them by name.
+    #
+    # LAN prefix the embedding server, the clients, the NAS and the Proxmox host live on.
+    define LAN_V4 = @LAN_CIDR@
+    # The Ollama-compatible embedding server, for the W2 embedding job (docs/DESIGN.md section 5).
+    define EMBEDDING_V4 = @EMBEDDING_HOST@
+    define EMBEDDING_PORT = @EMBEDDING_PORT@
+
+    # GitHub's git-over-SSH endpoints, for `git fetch` as root (install.sh, update.sh).
+    # api.github.com/meta "git" (IPv4), 58 entries, re-checked
+    # 2026-10-16. A retired address makes `wiki-mirror update` fail with "could not fetch from
+    # origin" - the intended tripwire. Root also holds tcp 443 anywhere, so the fallback is
+    # `ssh://git@ssh.github.com:443/...` in the checkout's origin URL (docs/OPERATIONS.md).
+    set github_git {
+        type ipv4_addr
+        flags interval
+        comment "api.github.com/meta git ranges, 2026-10-16 - root fetches only"
+        elements = {
+            192.30.252.0/22, 185.199.108.0/22, 140.82.112.0/20, 143.55.64.0/20,
+            4.208.26.193, 4.208.26.197, 4.208.26.198,
+            4.225.11.194, 4.225.11.199, 4.225.11.200,
+            4.228.31.144, 4.228.31.145, 4.228.31.150,
+            4.237.22.36, 4.237.22.38, 4.237.22.40,
+            4.249.131.163, 4.249.131.164,
+            20.26.156.213, 20.26.156.214, 20.26.156.215,
+            20.27.177.113, 20.27.177.118, 20.27.177.119,
+            20.29.134.19, 20.29.134.22, 20.29.134.23,
+            20.87.245.0, 20.87.245.2, 20.87.245.4,
+            20.175.192.146, 20.175.192.147,
+            20.199.39.227, 20.199.39.232,
+            20.200.245.244, 20.200.245.247, 20.200.245.248,
+            20.201.28.151, 20.201.28.152,
+            20.205.243.160, 20.205.243.161, 20.205.243.166,
+            20.207.73.81, 20.207.73.82, 20.207.73.83,
+            20.217.135.1, 20.217.135.4, 20.217.135.5,
+            20.233.83.145, 20.233.83.148, 20.233.83.149,
+            48.202.248.38, 48.202.248.40,
+            48.204.201.5, 48.204.201.6,
+            172.182.252.130, 172.182.252.133, 172.182.252.135
+        }
+    }
+
+    # What was refused, readable with `nft list counters` (and by `wiki-mirror status`). Named, so
+    # they survive being referenced from several rules and can be reset individually.
+    counter in_refused {
+        comment "Inbound connections no rule admitted (not SSH or 8300 from the LAN)"
+    }
+    counter in_invalid {
+        comment "Inbound packets conntrack calls invalid"
+    }
+    counter out_refused {
+        comment "Outbound connections no rule admitted - a new egress need or a compromise"
+    }
+    counter service_refused {
+        comment "wikimirror (API) or qdrant tried to open an outbound connection - always an event"
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        ct state invalid counter name "in_invalid" drop
+        ct state established,related accept
+        iifname "lo" accept
+
+        # Echo and unreachables for diagnosis; ICMPv6 is not optional (neighbour discovery,
+        # path MTU) and is only ever link-local on this box.
+        ip protocol icmp accept
+        meta l4proto ipv6-icmp accept
+
+        # SSH from the LAN. The first rule that admits anything new, deliberately above the
+        # service rules so a typo below cannot take the operator's way in.
+        ip saddr $LAN_V4 tcp dport 22 ct state new accept
+
+        # The API port, from the whole LAN rather than the main client alone: the service also serves
+        # an MCP endpoint (/mcp, added after W1) to several agents on the LAN, each with its
+        # own key. The firewall is not the access control here - every route requires a
+        # bearer key, and the data is public Wikipedia text - so it only keeps the port off
+        # anything outside the LAN.
+        ip saddr $LAN_V4 tcp dport 8300 ct state new accept
+
+        limit rate 10/minute burst 5 packets log prefix "wiki-mirror-input-drop: " level warn
+        counter name "in_refused" drop
+    }
+
+    chain output {
+        type filter hook output priority filter; policy drop;
+
+        # Replies to the SSH session and to clients' API calls ride on these.
+        ct state established,related accept
+        oifname "lo" accept
+
+        # The two services that must never dial out. Placed before every generic accept (DNS
+        # included) so no later rule can widen what they may do. Counted, then refused with a
+        # reset / admin-prohibited so the service sees the failure at once (header). Logged first
+        # (rate-limited, like the egress log below): the counter alone said 4 packets after the
+        # first build (2026-10-18) and nothing could say where they were going.
+        meta skuid { "wikimirror", "qdrant" } limit rate 10/minute burst 5 packets log prefix "wiki-mirror-service-refused: " level warn
+        meta skuid { "wikimirror", "qdrant" } meta l4proto tcp counter name "service_refused" reject with tcp reset
+        meta skuid { "wikimirror", "qdrant" } counter name "service_refused" reject with icmpx type admin-prohibited
+
+        # Neighbour discovery on the local link (no routed IPv6 is accepted anywhere).
+        ip6 daddr { fe80::/10, ff02::/16 } meta l4proto ipv6-icmp accept
+
+        # DNS and NTP to the LAN resolver only. Public resolvers are deliberately not
+        # permitted - DNS is a viable exfiltration channel. The resolver must be pinned on the
+        # Proxmox side (`pct set <ctid> --nameserver <resolver>`), or nothing resolves.
+        ip daddr $LAN_V4 udp dport { 53, 123 } accept
+        ip daddr $LAN_V4 tcp dport 53 accept
+
+        # Ping to the LAN (embedding server, NAS, main client) for diagnosis; replies to it are established.
+        ip daddr $LAN_V4 icmp type echo-request accept
+
+        # The download/parse/index identity. IPv4 only: Enterprise and S3 are reached over
+        # IPv4, and an unrouted ULA must not make the client try IPv6 first and stall.
+        meta nfproto ipv4 meta skuid "wikimirror-sync" tcp dport 443 accept
+        meta skuid "wikimirror-sync" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept
+
+        # Root: pip installs, source tarballs, git. HTTP as well as HTTPS for python.org and
+        # GitHub's redirects.
+        meta nfproto ipv4 meta skuid "root" tcp dport { 80, 443 } accept
+        meta skuid "root" ip daddr @github_git tcp dport 22 accept
+
+        # apt, which fetches as its sandbox user `_apt`, not as root (header). HTTP as well as
+        # HTTPS because Debian's stock sources are http://deb.debian.org (apt verifies the
+        # signatures; the transport is not what is trusted). Same shape as root's rule above.
+        meta nfproto ipv4 meta skuid "_apt" tcp dport { 80, 443 } accept
+
+        # DHCP lease renewal (RFC 2131): the client renews at half the lease by a unicast from
+        # its port 68 to the server's 67 and, only if that goes unanswered, rebinds by
+        # broadcast later. Both leave as root (ifupdown's dhclient), through the normal UDP
+        # path this chain filters. Confined to the LAN and the limited broadcast address.
+        meta skuid "root" udp sport 68 udp dport 67 ip daddr { $LAN_V4, 255.255.255.255 } accept
+
+        # Everything else is refused, counted and (rate-limited) logged. A refused egress
+        # attempt from this host is a security event or a missing rule, never noise. The
+        # refusal is a reset or an ICMP admin-prohibited rather than a silent drop, so that a
+        # v6 attempt, or any destination nobody listed, fails at once instead of waiting out a
+        # 30 s connect timeout.
+        limit rate 10/minute burst 5 packets log prefix "wiki-mirror-egress-refused: " level warn
+        meta l4proto tcp counter name "out_refused" reject with tcp reset
+        counter name "out_refused" reject with icmpx type admin-prohibited
+    }
+
+    # This box routes nothing; refusing it explicitly keeps that true if forwarding is ever
+    # switched on by accident.
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+}

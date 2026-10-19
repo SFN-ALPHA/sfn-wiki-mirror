@@ -1,0 +1,42 @@
+# Nightly trigger for wiki-mirror-update.service: the mirror follows main by itself.
+#
+# Decided on 2026-10-17: this box updates itself nightly, around the time the main client
+# updates itself (02:00 local). 02:20 is twenty minutes after the client's run, so the two never
+# restart anything at the same moment, and inside the same overnight window when nobody is
+# searching.
+#
+# **02:20 is LOCAL time: the container's own time zone decides when this runs.** No zone is
+# written in the OnCalendar line on purpose, so the file carries nobody's location. A new
+# container is usually on UTC, which is probably not the zone your clients live in: set it
+# once (`timedatectl set-timezone <Region/City>`; `timedatectl` shows the current one), and
+# check the next run with `systemctl list-timers wiki-mirror-update`. (The build timer next to
+# this one is in UTC deliberately: it follows Wikimedia's own UTC publishing schedule.)
+#
+# RandomizedDelaySec is small on purpose: one host, and a predictable time is worth more than
+# spreading load nobody else shares. Persistent=true runs a missed update at the next boot rather
+# than skipping a night and drifting.
+#
+# Most nights this finds nothing new ("current"). A build that is running (the semantic one can
+# last days) turns the run into a quiet "deferred", not a failed unit; a commit that changes the
+# on-disk format is "held" for a person. See update.sh and docs/OPERATIONS.md R.9 / R.10.
+#
+# Install: install.sh enables it. On a box installed before this unit existed (once):
+#          systemctl enable --now wiki-mirror-update.timer
+#          systemctl list-timers wiki-mirror-update
+# To stop auto-updating: systemctl disable --now wiki-mirror-update.timer. `wiki-mirror
+# update` keeps working by hand.
+#
+# See docs/DESIGN.md section 12 and docs/OPERATIONS.md.
+
+[Unit]
+Description=Nightly Wikipedia mirror update (02:20 local time, after the client's 02:00)
+Documentation=file:///opt/wiki-mirror/docs/OPERATIONS.md
+
+[Timer]
+OnCalendar=*-*-* 02:20:00
+RandomizedDelaySec=300
+Persistent=true
+Unit=wiki-mirror-update.service
+
+[Install]
+WantedBy=timers.target

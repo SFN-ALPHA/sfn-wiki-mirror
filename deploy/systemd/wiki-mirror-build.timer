@@ -1,0 +1,26 @@
+# Monthly trigger for wiki-mirror-build.service.
+#
+# The free Enterprise tier publishes a snapshot on the 1st of each month at 00:00 UTC and
+# recommends consuming it between 04:00 and 08:00 UTC, when the publish has settled and the
+# S3 side is quiet. The 2nd at 05:00 UTC lands inside that window with a day of margin for a
+# late publish, so the build finds the new snapshot instead of the old one.
+#
+# Persistent=true: a build missed because the container was down runs at the next boot rather
+# than waiting a month. RandomizedDelaySec spreads the start by up to an hour so it does not
+# land on an exact second with every other free-tier consumer.
+#
+# Not started by hand and not by install.sh at all for the first build: that is `wiki-mirror
+# build-now`, when the operator chooses (docs/OPERATIONS.md).
+#
+# See docs/DESIGN.md section 7 and docs/OPERATIONS.md.
+
+[Unit]
+Description=Monthly mirror build (Enterprise snapshot, consumed 04:00-08:00 UTC on the 2nd)
+
+[Timer]
+OnCalendar=*-*-02 05:00:00 UTC
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

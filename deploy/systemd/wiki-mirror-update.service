@@ -1,0 +1,57 @@
+# Mirror auto-update - pull, verify and switch, or leave the box as it was.
+#
+# Oneshot: it runs update.sh --unattended, decides, and exits; the timer beside it decides when.
+# Running it by hand is the same command:
+#
+#     systemctl start wiki-mirror-update
+#     journalctl -u wiki-mirror-update -n 50
+#
+# update.sh does the safety work: fast-forward only, a format guard that holds a commit that
+# changes the stored data's format, the pinned reinstall, a health check and a rollback. Its
+# outcome is also written to state/update.json, which /v1/wiki/health and `wiki-mirror status` show.
+#
+# **Root, not a service account.** The checkout is root-owned on purpose (no service account
+# may change the code it runs), so root fetches it, over the read-only deploy key in /root/.ssh. Hardening is therefore
+# narrower than the build unit's: it keeps the filesystem read-only except for the places the
+# updater writes (the checkout and its venv, the unit files, the wiki-mirror link, the data directory's
+# state), and reads /root for the deploy key (ProtectHome=read-only, so pip's cache is off).
+#
+# **No OnFailure= alert.** There is no alerting unit on this box. A failed or rolled-back update is exit 1, so this unit shows `failed`
+# in `systemctl --failed`, in `wiki-mirror status` (last update) and on /v1/wiki/health. A deferral
+# (a build running) and a hold (a format change) exit 0 deliberately: they need no retry.
+#
+# Install: install.sh does it. See docs/DESIGN.md section 12 and docs/OPERATIONS.md
+# "The nightly update" (R.9 and R.10).
+
+[Unit]
+Description=Wikipedia mirror update from GitHub
+Documentation=file:///opt/wiki-mirror/docs/OPERATIONS.md
+# The fetch needs the network, and the update restarts the API, so it deliberately does not run
+# before it.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/wiki-mirror
+ExecStart=/opt/wiki-mirror/deploy/update.sh --unattended
+# A failed update has already rolled itself back; the non-zero exit is how the operator finds
+# out, not a reason to retry into the same failure.
+Restart=no
+# pip plus the 60 s health wait, with room for a slow PyPI.
+TimeoutStartSec=1800
+# Nothing to cache for: the cache directory is under the read-only /root.
+Environment=PIP_NO_CACHE_DIR=1
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# The checkout and venv, the installed units, the wiki-mirror symlink, and the state directory (the
+# build lock and update.json). Qdrant's and the articles' directories are not written.
+ReadWritePaths=/opt/wiki-mirror /etc/systemd/system /usr/local/bin /var/lib/wiki-mirror/state

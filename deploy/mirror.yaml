@@ -1,0 +1,35 @@
+# Settings for the mirror service, on the mirror's LXC.
+#
+# Installed by install.sh to /etc/wiki-mirror/mirror.yaml and read by every
+# `python -m wiki_mirror` entry point (src/wiki_mirror/config.py). Every
+# field has a code default that already fits this box (paths, port 8300, loopback Qdrant,
+# 6 cores), so nothing is overridden: the file exists so there is one documented place to
+# change a setting, and so a typo fails loudly at start (unknown keys are rejected).
+#
+# **Never put a secret here.** The bearer key is WIKI_MIRROR_API_KEY in mirror.env;
+# the loader refuses an `api_key` key in this file. The Wikimedia Enterprise sign-in is
+# enterprise.env, readable by the build user alone.
+#
+# To change a setting: uncomment it, `systemctl restart wiki-mirror`, and for a
+# build setting it applies from the next build. install.sh never overwrites an edited copy
+# (`install.sh --adopt-config` replaces it with this template, keeping a dated backup).
+#
+# Defaults shown are the code's; the commented reasons are the box's.
+#
+# See docs/DESIGN.md section 4 and 6, docs/OPERATIONS.md.
+
+# snapshot_identifier: enwiki_namespace_0   # English Wikipedia, articles only
+# snapshot_dir: /mnt/wikipedia/snapshots    # NAS bind mount; large, re-downloadable
+# data_dir: /var/lib/wiki-mirror   # local SSD: article store, state, checkpoints
+# enterprise_env_file: /etc/wiki-mirror/enterprise.env
+# qdrant_url: http://127.0.0.1:6333         # must be loopback http
+# listen_host: 0.0.0.0                      # nftables admits only the LAN on the port; a key is needed
+# listen_port: 8300
+# download_concurrency: 4                   # chunks in flight (240-370 MB each)
+# monthly_chunk_budget: 1200                # free tier allows 1,500; a full pull is 435
+# parse_workers: 5                          # of 6 cores; Qdrant and the API share the sixth
+# lexical_dimensions: 16777216              # 2**24, see config.py before changing
+# max_read_chars: 12000                     # a client's tool replies should stay under 12K
+# retain_snapshots: 2                       # serving + previous, on the NAS
+# min_free_disk_gb: 20                      # a build will not create a store or collection below this free; 0 = off
+# clients_file: /etc/wiki-mirror/clients.json   # other agents' key hashes: wiki-mirror key add|list|revoke

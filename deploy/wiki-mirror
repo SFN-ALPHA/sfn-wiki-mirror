@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+#
+# `wiki-mirror` - the operator command for the mirror's container (the Wikipedia mirror).
+#
+# Installed by install.sh as a symlink at /usr/local/bin/wiki-mirror into the checkout, so a change
+# here is live the moment `wiki-mirror update` pulls it. A single file with a case statement rather
+# than one file per verb: five verbs do not earn a dispatcher.
+#
+# Usage:
+#   wiki-mirror status                  the mirror's health, the units, the next scheduled build
+#   wiki-mirror build-now               start a build now (hours; follow it with `wiki-mirror logs build`)
+#   wiki-mirror logs [api|build|qdrant] follow a unit's journal (default: api)
+#   wiki-mirror update [--accept-format-change]
+#                                 fast-forward the checkout, reinstall, restart the API; the
+#                                 flag allows a commit that changes the built data's format
+#   wiki-mirror search "<query>"        a quick local search through the real API
+#   wiki-mirror key add <name>          issue an API key to another agent (shown once, only its hash kept)
+#   wiki-mirror key list                the agents that have a key (names only)
+#   wiki-mirror key revoke <name>       withdraw an agent's key (takes effect in seconds, no restart)
+#
+# Not on PATH in the shell `pct enter <ctid>` gives (it lacks /usr/local/bin): run `exec bash -l`
+# first, or call /usr/local/bin/wiki-mirror. Over SSH it is found as usual.
+#
+# Needs root: the API key lives in a root-only file. The key is read into a curl config on a
+# pipe and is never echoed, never put on a command line and never written anywhere. `key add`
+# is the one command that prints a key, once, on stdout.
+#
+# See docs/OPERATIONS.md and deploy/README.md.
+
+set -euo pipefail
+
+# Resolved through the /usr/local/bin symlink to <checkout>/deploy/wiki-mirror, so the checkout
+# is two levels up: deploy/ and then the checkout itself. (tests/deploy/test_cli.py runs it that way.)
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+APP_DIR="${APP_DIR:-$(dirname "$(dirname "$SELF")")}"
+CONF_DIR="${CONF_DIR:-/etc/wiki-mirror}"
+MIRROR_ENV="$CONF_DIR/mirror.env"
+VENV="$APP_DIR/.venv"
+API_URL="${WIKI_MIRROR_API_URL:-http://127.0.0.1:8300}"
+
+API_UNIT=wiki-mirror.service
+QDRANT_UNIT=wiki-mirror-qdrant.service
+BUILD_UNIT=wiki-mirror-build.service
+BUILD_TIMER=wiki-mirror-build.timer
+UPDATE_TIMER=wiki-mirror-update.timer
+
+if [[ -t 1 ]]; then
+    BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'
+    YELLOW=$'\033[33m'; RESET=$'\033[0m'
+else
+    BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; RESET=""
+fi
+
+head2() { printf '\n%s%s%s\n' "$BOLD" "$*" "$RESET"; }
+good()  { printf '  %s+%s %s\n' "$GREEN" "$RESET" "$*"; }
+bad()   { printf '  %s!%s %s\n' "$RED" "$RESET" "$*"; }
+warn()  { printf '  %s!%s %s\n' "$YELLOW" "$RESET" "$*"; }
+dim()   { printf '  %s%s%s\n' "$DIM" "$*" "$RESET"; }
+die()   { printf '%serror:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+
+# `id -u` rather than $EUID, as update.sh does: the variable is read-only in bash, so a test
+# cannot stand in for root, while a stub `id` on PATH can.
+require_root() {
+    [[ "$(id -u)" -eq 0 ]] || die "'$1' needs root - try: sudo wiki-mirror $1"
+}
+
+# GET or POST to the API. The key goes to curl as a config file on a pipe (`-K <(...)`), so
+# it never appears in `ps` or in this script's output. $1 is the path; any further arguments
+# go to curl (e.g. a JSON body).
+api_call() {
+    local path="$1" key
+    shift
+    key="$(sed -n 's/^WIKI_MIRROR_API_KEY=//p' "$MIRROR_ENV" 2>/dev/null | head -1)"
+    [[ -n "$key" ]] || die "no WIKI_MIRROR_API_KEY in $MIRROR_ENV (run install.sh)"
+    curl -fsS --max-time 30 -K <(printf 'header = "Authorization: Bearer %s"\n' "$key") \
+        "$@" "$API_URL$path"
+}
+
+py() { "$VENV/bin/python" -I "$@"; }
+
+cmd_status() {
+    require_root status
+    local health="" state
+
+    head2 "Services"
+    for unit in "$QDRANT_UNIT" "$API_UNIT"; do
+        state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+        if [[ "$state" == active ]]; then
+            good "$(printf '%-40s %s' "$unit" "$state")"
+        else
+            bad "$(printf '%-40s %s' "$unit" "${state:-unknown}")"
+        fi
+    done
+    # The build is a oneshot: "inactive" between runs is normal, and what matters is whether
+    # the last run worked. After a failure the unit waits out RestartSec in "auto-restart" and
+    # tries again (a few times, then gives up: Result start-limit-hit).
+    state="$(systemctl is-active "$BUILD_UNIT" 2>/dev/null || true)"
+    local result substate
+    result="$(systemctl show "$BUILD_UNIT" -p Result --value 2>/dev/null || true)"
+    substate="$(systemctl show "$BUILD_UNIT" -p SubState --value 2>/dev/null || true)"
+    if [[ "$substate" == auto-restart ]]; then
+        bad "$(printf '%-40s last run FAILED (%s); retrying soon - wiki-mirror logs build' "$BUILD_UNIT" "${result:-unknown}")"
+    elif [[ "$state" == active || "$state" == activating ]]; then
+        warn "$(printf '%-40s RUNNING (wiki-mirror logs build)' "$BUILD_UNIT")"
+    elif [[ -z "$result" || "$result" == success ]]; then
+        good "$(printf '%-40s idle, last run ok' "$BUILD_UNIT")"
+    else
+        bad "$(printf '%-40s last run FAILED (%s) - wiki-mirror logs build' "$BUILD_UNIT" "$result")"
+    fi
+
+    head2 "Mirror"
+    if health="$(api_call /v1/wiki/health 2>/dev/null)"; then
+        printf '%s' "$health" | py -c '
+import json, sys
+
+data = json.load(sys.stdin)
+build = data.get("build") or {}
+rows = [
+    ("status", data.get("status")),
+    ("snapshot", data.get("snapshot")),
+    ("applied snapshot", data.get("applied_snapshot")),
+    ("articles", data.get("articles")),
+    ("passages", data.get("passages")),
+    ("collection", data.get("collection")),
+    ("build phase", build.get("phase")),
+    ("chunks", "%s downloaded / %s parsed of %s" % (
+        build.get("chunks_downloaded"), build.get("chunks_parsed"), build.get("chunks_total"))),
+    ("passages indexed", build.get("passages_indexed")),
+    ("updated", build.get("updated_at")),
+    ("error", build.get("error") or None),
+]
+last = data.get("update")
+if isinstance(last, dict):
+    # The last run of update.sh: when, which commits, the outcome, and why.
+    rows.append(("last update", "%s  %s  (%s -> %s, %s)" % (
+        last.get("at"), last.get("outcome"), last.get("from"), last.get("to") or "-",
+        "unattended" if last.get("unattended") else "by hand")))
+    rows.append(("update detail", last.get("detail") or None))
+for label, value in rows:
+    if value is not None:
+        print("  %-18s %s" % (label, value))
+'
+    else
+        bad "the API did not answer at $API_URL/v1/wiki/health"
+        dim "wiki-mirror logs api"
+    fi
+
+    head2 "Schedule"
+    if [[ "$(systemctl is-enabled "$BUILD_TIMER" 2>/dev/null || true)" == enabled ]]; then
+        good "$(printf '%-40s next %s' "$BUILD_TIMER" "$(systemctl show "$BUILD_TIMER" -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)")"
+    else
+        warn "$BUILD_TIMER is not enabled - no monthly build will run"
+    fi
+    if [[ "$(systemctl is-enabled "$UPDATE_TIMER" 2>/dev/null || true)" == enabled ]]; then
+        good "$(printf '%-40s next %s' "$UPDATE_TIMER" "$(systemctl show "$UPDATE_TIMER" -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)")"
+    else
+        warn "$UPDATE_TIMER is not enabled - the box will not update itself (systemctl enable --now $UPDATE_TIMER)"
+    fi
+
+    head2 "Version"
+    dim "$(git -C "$APP_DIR" log --oneline -1 2>/dev/null || echo unknown)"
+
+    head2 "Firewall (refused so far; service_refused should stay 0)"
+    local counters
+    counters="$(nft list counters 2>/dev/null \
+        | awk '/counter / {name = $2} /packets/ {printf "  %-16s %s packets\n", name, $2}' || true)"
+    if [[ -n "$counters" ]]; then
+        printf '%s\n' "$counters"
+    else
+        warn "the wiki_mirror table is not loaded - run install.sh to apply the firewall"
+    fi
+    printf '\n'
+    [[ -n "$health" ]]
+}
+
+cmd_build_now() {
+    require_root build-now
+    # A oneshot is "activating" while its process runs, which `is-active --quiet` does not
+    # count as active; "auto-restart" is the wait between retries after a failure, and starting
+    # then simply cuts the wait short.
+    if [[ "$(systemctl is-active "$BUILD_UNIT" 2>/dev/null || true)" =~ ^(active|activating)$ \
+          && "$(systemctl show "$BUILD_UNIT" -p SubState --value 2>/dev/null || true)" != auto-restart ]]; then
+        die "a build is already running - follow it with: wiki-mirror logs build"
+    fi
+    # After the retries have run out the unit sits failed with Result start-limit-hit and
+    # refuses to start; a person asking for a build is the reset the limit is waiting for.
+    systemctl reset-failed "$BUILD_UNIT" 2>/dev/null || true
+    # --no-block: a build takes hours, and the shell should come back.
+    systemctl start --no-block "$BUILD_UNIT"
+    printf 'Build started. It is checkpointed: a stop or reboot resumes where it left off.\n'
+    printf '  follow:  wiki-mirror logs build\n'
+    printf '  state:   wiki-mirror status\n'
+    printf '  stop:    systemctl stop %s\n' "$BUILD_UNIT"
+}
+
+cmd_logs() {
+    local unit
+    case "${1:-api}" in
+        api)    unit="$API_UNIT" ;;
+        build)  unit="$BUILD_UNIT" ;;
+        qdrant) unit="$QDRANT_UNIT" ;;
+        *) die "unknown log '$1' (api|build|qdrant)" ;;
+    esac
+    shift || true
+    # A finished oneshot has nothing to follow: show its recent history instead of waiting
+    # forever on a unit that will not run again until next month.
+    if [[ "$unit" == "$BUILD_UNIT" ]] \
+       && ! [[ "$(systemctl is-active "$unit" 2>/dev/null || true)" =~ ^(active|activating)$ ]]; then
+        exec journalctl -u "$unit" -n 100 --no-pager "$@"
+    fi
+    exec journalctl -u "$unit" -f -n 60 "$@"
+}
+
+cmd_update() {
+    require_root update
+    exec "$APP_DIR/deploy/update.sh" "$@"
+}
+
+cmd_search() {
+    require_root search
+    [[ $# -ge 1 && -n "$1" ]] || die 'usage: wiki-mirror search "<query>" [limit]'
+    local limit="${2:-5}"
+    # The body is built by Python so quotes in the query cannot break the JSON.
+    py -c 'import json, sys; print(json.dumps({"query": sys.argv[1], "limit": int(sys.argv[2])}))' "$1" "$limit" \
+        | api_call /v1/wiki/search -H 'Content-Type: application/json' --data-binary @- \
+        | py -c '
+import json, sys
+
+reply = json.load(sys.stdin)
+print("snapshot %s, mode %s, %d result(s)" % (reply.get("snapshot"), reply.get("mode"), len(reply.get("results", []))))
+for hit in reply.get("results", []):
+    print()
+    print("%s  [%s]  score %.2f" % (hit["title"], hit.get("section") or "-", hit.get("score", 0)))
+    print("  %s" % hit["url"])
+    print("  %s" % (hit.get("snippet") or "")[:200])
+'
+}
+
+# The clients file (hashes of the other agents' keys) belongs to the Python module, which
+# validates names, writes atomically and keeps the file readable by the API user. This verb only
+# hands over: as root, with the venv's interpreter, and the same settings file the service reads.
+cmd_key() {
+    require_root key
+    case "${1:-}" in
+        add|revoke) [[ $# -eq 2 && -n "$2" ]] || die "usage: wiki-mirror key $1 <name>" ;;
+        list)       [[ $# -eq 1 ]] || die "usage: wiki-mirror key list" ;;
+        *) die "unknown key command '${1:-}' (add <name>|list|revoke <name>)" ;;
+    esac
+    exec "$VENV/bin/python" -I -m wiki_mirror --config "$CONF_DIR/mirror.yaml" key "$@"
+}
+
+case "${1:-status}" in
+    status)    shift || true; cmd_status "$@" ;;
+    build-now) shift; cmd_build_now "$@" ;;
+    logs)      shift; cmd_logs "$@" ;;
+    update)    shift; cmd_update "$@" ;;
+    search)    shift; cmd_search "$@" ;;
+    key)       shift; cmd_key "$@" ;;
+    -h|--help|help)
+        sed -n '/^# Usage:/,/^#$/p' "$SELF" | sed 's/^# \{0,1\}//'
+        ;;
+    *) die "unknown command '$1' (status|build-now|logs|update|search|key)" ;;
+esac

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Agent credentials and local state. Never committed: .agent/ holds the standing SSH key
+# and its env file for the mirror's container.
+.agent/
+
+# Local secrets and editor state
+.env
+.env.*
+.idea/
+.vscode/

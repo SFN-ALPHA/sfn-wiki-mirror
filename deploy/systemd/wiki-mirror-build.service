@@ -1,0 +1,90 @@
+# One mirror build: download the newest Enterprise snapshot, parse it, index it, switch to it.
+#
+# Started monthly by wiki-mirror-build.timer, or by hand with `wiki-mirror build-now`.
+# Never started by the installer: the operator decides when the first (many-hour) build runs.
+# `python -m wiki_mirror build` is checkpointed per chunk and per stage, so a stop,
+# a reboot or a failure resumes from the last checkpoint on the next start rather than
+# re-downloading; the previous snapshot keeps serving until the new one is complete.
+#
+# Runs as `wikimirror-sync`, the only identity with internet egress (nftables: tcp 443 anywhere,
+# the embedding server named in site.env). It reads /etc/wiki-mirror/enterprise.env (0600 wikimirror-sync)
+# and writes the snapshot chunks to the NAS and the article store, build state and checkpoints
+# to local disk. It never holds the API key.
+#
+# **No start timeout.** A first build is many hours (download about an hour, parse and index
+# longer, and W2's embedding is days), so any finite TimeoutStartSec is a guess that ends in a
+# kill at the worst moment. The bound is the stage budgets and the monthly chunk budget inside
+# the program; `wiki-mirror status` shows where it is.
+#
+# Low priority on purpose: Nice and idle I/O so a build never makes search slow, and a 5 G
+# memory cap (the box has 8 GB shared with Qdrant and the API).
+#
+# **A failed build is retried, a few times, and then it stops.** Restart=on-failure waits an
+# hour (RestartSec) and runs it again - the build resumes from its checkpoints, so a retry costs
+# only what had not been done - for the first run plus five retries within a day
+# (StartLimitBurst / StartLimitIntervalSec). After that the unit stays failed and `wiki-mirror status`
+# says so, rather than hammering Wikimedia Enterprise (a monthly chunk budget) or the NAS all
+# night. The failure is also on /v1/wiki/health: the build records `failed` and why. Exit 2 (a
+# configuration error) is never retried; `wiki-mirror build-now` clears a spent limit and starts again.
+#
+# `-I` (isolated mode) for the same reason as the API unit, and it reaches the workers: the
+# parse and index stages spawn worker processes, and multiprocessing starts each one with the
+# parent's interpreter flags (so `-I` again) and replaces its sys.path with the parent's (so no
+# working-directory entry either). Checked on CPython 3.13's sources and on a 3.14 run.
+#
+# AssertPathIsMountPoint, not a Condition: a Condition silently skips the job when the NAS is
+# not mounted, and a monthly job that skips without a word is how a mirror goes stale for
+# months. An Assert fails the unit and says why.
+#
+# Install: install.sh does it. See docs/DESIGN.md sections 5 and 7 and
+# docs/OPERATIONS.md.
+
+[Unit]
+Description=Wikipedia mirror build (download, parse, index the Wikipedia snapshot)
+Documentation=file:///opt/wiki-mirror/docs/OPERATIONS.md
+After=network-online.target wiki-mirror-qdrant.service
+Wants=network-online.target
+Requires=wiki-mirror-qdrant.service
+AssertPathIsMountPoint=/mnt/wikipedia
+# The retry budget: six starts (the first and five retries) inside a day, then the unit stays
+# failed (Result=start-limit-hit) until `wiki-mirror build-now`, which resets it. With RestartSec=1h
+# that is the first run and retries at +1h .. +5h.
+StartLimitIntervalSec=1d
+StartLimitBurst=6
+
+[Service]
+Type=oneshot
+User=wikimirror-sync
+Group=wikimirror
+WorkingDirectory=/var/lib/wiki-mirror
+ExecStart=/opt/wiki-mirror/.venv/bin/python -I -m wiki_mirror build
+# Group-readable output (the API user is in group wikimirror), nothing for anyone else.
+UMask=0027
+
+Restart=on-failure
+RestartSec=1h
+# Exit 2 is "my configuration is wrong"; an hour later it still is.
+RestartPreventExitStatus=2
+
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=5G
+
+# Hardening. Two writable places: local data and the snapshot directory on the NAS.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/wiki-mirror /mnt/wikipedia/snapshots
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
