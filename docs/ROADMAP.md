@@ -235,16 +235,18 @@ with hybrid on.
    `systemd/wiki-mirror-qdrant.service`; the box has 32 GB). The keyword index rests at 4.3 GB; binary
    vectors plus the HNSW graph add about 10 to 11 GB. Also check `vm.max_map_count` on the Proxmox host
    (`sysctl -w vm.max_map_count=1048576`). The API (1.5 GB) and a build (5 GB) must still fit beside it.
-4. **The indexer.** A build stage after `index`, or a mode of it, that makes one pass over the article store in
-   page-id order:
+4. **The indexer.** **Built 2026-10-19** as the `embed` stage ([D7](DECISIONS.md#d7); how to run it, and how it
+   resumes and verifies its checkpoint: [OPERATIONS.md](OPERATIONS.md)), except the health route's progress, which is
+   a log line each minute instead. As planned: a build stage after `index`, or a mode of it, that makes one pass over
+   the article store in page-id order:
    * cut each article with the same chunker, and embed through the embedding server's `/api/embed`;
    * **16 requests in flight** (the knee measured on the maintainer's embedding router; tune it to your server),
      **8 texts per request**, and a background-priority header where the server has one (`X-Priority: 3` on that
      router);
    * retry a 503 honouring `Retry-After`, and retry a timeout;
    * upsert into the new collection with HNSW indexing off during the load and switched on at the end;
-   * checkpoint the last page id fully embedded, so a resume repeats at most one batch; write it into an index
-     state file like the keyword collection's;
+   * checkpoint the last page id fully embedded, so a resume repeats only the windows in flight, and verify it
+     against Qdrant on resume; write it into an index state file like the keyword collection's;
    * show progress and an ETA on `/v1/wiki/health`;
    * stay within the existing rules: one build at a time (the build lock), the disk-floor check before creating
      a collection, and no secrets in logs.

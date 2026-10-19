@@ -44,10 +44,15 @@ Non-obvious constraints:
   background, one segment at a time, and that outlives this stage; it is logged, not waited for.
   Vectors are float16 on disk with binary quantization held in RAM (the box serves the quantized
   copy and rescoring reads the disk), which is what lets 85 GB of vectors search from a 32 GB host.
-* **Resuming is checked, not assumed.** The state file records the chunker, model, dimensions and
-  text form; any difference from the running configuration refuses the resume (mixing two models'
-  vectors in one collection ruins it silently). A collection with no usable state is never deleted
-  automatically: two days of vectors are not discarded on a guess.
+* **Resuming is checked, not assumed, twice.** The state file records the chunker, model,
+  dimensions and text form; any difference from the running configuration refuses the resume
+  (mixing two models' vectors in one collection ruins it silently). Then the contents are checked
+  against Qdrant: the passages at or below `last_page_id` are counted and must equal the state's
+  count. A power loss can cost Qdrant the tail of its write-ahead log while the state file
+  survives, and resuming on trust would skip the lost windows for good; on a mismatch the
+  checkpoint steps back to just before the highest article still present (`_verified_checkpoint`)
+  and a warning says so. A collection with no usable state is never deleted automatically: two
+  days of vectors are not discarded on a guess.
 * **Segments are capped** (`_MAX_SEGMENT_KB`) and optimized one at a time, for the reasons in
   `index.py`; the numbers here are the dense collection's own.
 * **Local state, no build state.** Progress lives in `state/index_semantic_<born>.json`, written
@@ -169,6 +174,10 @@ _RETRY_AFTER_MAX_SECONDS: Final = 300.0
 #: Per-request timeout, seconds. A batch of eight passages takes about a second on an idle
 #: server and many seconds when its queue is full.
 _REQUEST_TIMEOUT_SECONDS: Final = 120.0
+
+#: Server-side limit, seconds, for the resume check's exact count (`_count_points`). Qdrant's
+#: default is 60 s; the count took 26 s on the 41M-point lexical collection, too close.
+_COUNT_TIMEOUT_SECONDS: Final = 600
 
 #: Statuses that mean "not now": rate limit, server error, bad gateway, unavailable, gateway
 #: timeout. 500 is included because Ollama answers it while a model runner restarts or reloads;
@@ -668,8 +677,16 @@ def _begin(
         raise EmbedError(msg)
     if state is not None and exists:
         _refuse_unless_same_vectors(state, fresh, name, state_path)
-        logger.info("embed %s: resuming after page id %d", name, state.last_page_id)
-        return state
+        if state.complete:
+            # A finished run never rescans: nothing will be embedded, so nothing needs checking.
+            return state
+        checked = _verified_checkpoint(client, name, state)
+        if checked != state:
+            # Before any embedding, so a crash right after this still resumes from the true
+            # position rather than from the lost one.
+            _write_state(state_path, checked)
+        logger.info("embed %s: resuming after page id %d", name, checked.last_page_id)
+        return checked
     if state is not None:
         # Deleted by hand: the checkpoint no longer describes anything, so the run starts over.
         logger.warning("embed %s: the collection is gone; starting it over", name)
@@ -712,6 +729,130 @@ def _refuse_unless_same_vectors(
             f"vectors would not mix; to start over delete the collection and {state_path.name}"
         )
         raise EmbedError(msg)
+
+
+def _verified_checkpoint(client: QdrantClient, name: str, state: _EmbedState) -> _EmbedState:
+    """Return `state` if Qdrant holds what its checkpoint claims, else a state stepped back.
+
+    The checkpoint is written only after Qdrant confirmed the upsert, but a power loss or host
+    crash can lose the tail of Qdrant's write-ahead log while the state file survives; resuming
+    would then skip the lost windows silently, and search would never find those articles. So the
+    number of passages at or below `last_page_id` is counted and compared with `state.passages`.
+
+    On a mismatch (fewer points, or more) the checkpoint moves to just before the highest page id
+    that is present at or below it. Qdrant's log loses a suffix, and windows are upserted in
+    page-id order, so everything below that article is intact; the article itself may have been
+    cut off mid-way, so it is embedded again (its point ids are deterministic, so what survived is
+    simply overwritten). Points beyond the checkpoint are not a mismatch: they are the windows
+    that were upserted before a crash and not yet recorded, and the run repeats them harmlessly.
+
+    Cost: one exact filtered count at resume, about half a minute on 41 million points; it runs
+    only on resume, never for a new or a finished run. The step-back (a mismatch only) adds one
+    ordered scroll (instant on the live server) and one more count.
+
+    Args:
+        client: A Qdrant client for the loopback server.
+        name: The semantic collection, which exists.
+        state: The state read from disk, not complete.
+
+    Returns:
+        `state` itself when the count matches; otherwise a copy with `last_page_id`, `articles`
+        and `passages` corrected. The caller writes it to disk.
+    """
+    held = _count_points(client, name, state.last_page_id)
+    if held == state.passages:
+        logger.info(
+            "embed %s: checkpoint verified, %d passages at or below page id %d",
+            name,
+            held,
+            state.last_page_id,
+        )
+        return state
+    highest = _highest_page_id(client, name, state.last_page_id)
+    if highest is None:
+        # Nothing at or below the checkpoint survived: start the collection's content over.
+        # over_stride and empty only describe windows that were committed, and none is.
+        corrected = replace(state, last_page_id=-1, articles=0, passages=0, over_stride=0, empty=0)
+    else:
+        # Article `highest` is re-embedded, as it may be partial. Page ids need not be dense:
+        # the checkpoint is a bound ("at or below"), not the id of an article.
+        before = highest - 1
+        passages = _count_points(client, name, before)
+        corrected = replace(
+            state,
+            last_page_id=before,
+            # In proportion to the passages kept: the article count feeds only the ETA, and an
+            # exact one would filter on `chunk`, which has no payload index; measured on the live
+            # 41M-point lexical collection (2026-10-19) that count hit Qdrant's 60 s server-side
+            # timeout, which would fail every resume after a loss.
+            articles=round(state.articles * passages / state.passages) if state.passages else 0,
+            passages=passages,
+        )
+        # over_stride and empty are left as they were: they cannot be recounted without cutting
+        # the articles again, and the windows now repeated will add theirs a second time. They
+        # feed only the closing warning, never the checkpoint.
+    logger.warning(
+        "embed %s: the checkpoint at page id %d (%d passages) does not match Qdrant, which holds "
+        "%d passages at or below it; resuming after page id %d (%d passages)",
+        name,
+        state.last_page_id,
+        state.passages,
+        held,
+        corrected.last_page_id,
+        corrected.passages,
+    )
+    return corrected
+
+
+def _count_points(client: QdrantClient, name: str, last_page_id: int) -> int:
+    """Exact number of points whose `page_id` is at or below `last_page_id`.
+
+    It uses the `page_id` payload index. Measured on the live 41M-point lexical collection
+    (2026-10-19), the same count took 26 s; Qdrant's own server-side limit is 60 s, so the count
+    asks for `_COUNT_TIMEOUT_SECONDS` explicitly rather than fail a resume on a busy box.
+
+    Args:
+        client: A Qdrant client.
+        name: The collection.
+        last_page_id: The inclusive bound.
+    """
+    return client.count(
+        collection_name=name,
+        count_filter=models.Filter(
+            must=[models.FieldCondition(key="page_id", range=models.Range(lte=last_page_id))]
+        ),
+        exact=True,
+        timeout=_COUNT_TIMEOUT_SECONDS,
+    ).count
+
+
+def _highest_page_id(client: QdrantClient, name: str, last_page_id: int) -> int | None:
+    """The highest `page_id` held at or below `last_page_id`, or None if there is no such point.
+
+    One ordered scroll (`order_by` on the integer payload index `_create_collection` makes, which
+    Qdrant has supported since 1.8; production runs 1.12): descending, one point, payload limited
+    to `page_id`. `start_from` begins the walk at the checkpoint rather than at the highest
+    page id of the tail beyond it, and the filter keeps the bound exact. A binary search with
+    exact counts was the alternative; it would cost some 25 counts over 41 million points where
+    this reads one index entry.
+    """
+    points, _ = client.scroll(
+        collection_name=name,
+        scroll_filter=models.Filter(
+            must=[
+                models.FieldCondition(key="page_id", range=models.Range(lte=last_page_id)),
+            ]
+        ),
+        order_by=models.OrderBy(
+            key="page_id", direction=models.Direction.DESC, start_from=last_page_id
+        ),
+        limit=1,
+        with_payload=["page_id"],
+        with_vectors=False,
+    )
+    if not points or points[0].payload is None:
+        return None
+    return int(points[0].payload["page_id"])
 
 
 def _create_collection(client: QdrantClient, name: str, dimensions: int) -> None:

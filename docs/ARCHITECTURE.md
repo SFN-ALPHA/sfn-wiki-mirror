@@ -39,10 +39,11 @@ flowchart LR
 | Parse | `parse.py`, `build.run_parse` | Turns each chunk's Parsoid HTML into plain text with section headings, infobox key-value blocks and category lists; drops reference lists, navigation boxes and "See also" link farms. Workers are spawned processes, one chunk each, streaming to a zstd spool; the parent is the single SQLite writer. |
 | Article store | `store.py`, `records.py` | One SQLite file per snapshot, `articles/<identifier>_<yyyymmdd>.db`. Compressed text, title and redirect-alias indexes, a per-article `text_hash`. Highest revision wins on duplicates. A finished store is immutable and opened read-only. |
 | Keyword index | `index.py`, `passages.py` | Cuts every article into passages with the vendored chunker and encodes each with the vendored hashed-BM25 sparse encoder, then upserts them into Qdrant. Checkpointed; ends by pointing the alias at the new collection. |
+| Semantic index (embedding run) | `embed.py` | Cuts the same passages as the keyword index, asks an Ollama-compatible embedding server for a vector each, and upserts them into `wikipedia_semantic_<born>` in windows of 64 articles with a checkpoint (`state/index_semantic_<born>.json`). Resumable, and a resume verifies the checkpoint against Qdrant. Started by hand (`wiki-mirror embed-now`) as `wiki-mirror-embed.service`; no query reads the result yet. |
 | Serving | `serving.py` | Holds the (collection, store) pair currently served, follows the alias and the index state, and hands requests a lease so a swap never closes a store under a reader. |
 | Search | `search.py` | Query encoding, article folding, exact-title priority, snippets cut from the store, windowed article reads. |
 | API and MCP door | `api.py`, `mcp_server.py`, `keys.py` | FastAPI app with a pure-ASGI guard in front: authentication, request ids, JSON errors. `/mcp` is the MCP SDK's Streamable HTTP endpoint behind the same guard. |
-| CLI | `__main__.py`, `deploy/wiki-mirror` | `python -m wiki_mirror <download|parse|index|build|serve|status|key>`; `wiki-mirror` is the operator wrapper. |
+| CLI | `__main__.py`, `deploy/wiki-mirror` | `python -m wiki_mirror <download|parse|index|build|embed|serve|status|key>`; `wiki-mirror` is the operator wrapper. |
 | Update path | `deploy/update.sh`, `update_record.py` | Self-update from `main` (nightly, if the operator opted in) with a format guard and rollback; writes `state/update.json`. |
 
 DESIGN.md sections: the article store and index in [§5](DESIGN.md#5-the-design), the Enterprise snapshot in
@@ -65,6 +66,27 @@ command too, for resuming a failed one by hand.
 * **Cleanup.** After the alias swap, article stores and index states older than the serving snapshot and the one
   kept as the way back are deleted, and so are Qdrant's superseded collections.
 
+### The embedding run
+
+`python -m wiki_mirror embed`, run as `wiki-mirror-embed.service` (user `wikimirror-sync`, started by `wiki-mirror
+embed-now`, never enabled and with no timer, so a reboot does not restart it). It reads the store the live keyword
+collection serves, writes `wikipedia_semantic_<born>` and `state/index_semantic_<born>.json`, and at the end switches
+HNSW on and moves the alias `wikipedia_semantic`. It is not part of `build`.
+
+* **Same lock, same discipline.** It holds `state/build.lock`, so a build or the nightly update waits. It never
+  writes `build.json`, so a failing embedding run does not turn health `degraded`.
+* **The checkpoint rule.** Windows are upserted in page-id order; `last_page_id` moves only after Qdrant confirms the
+  upsert, and the state file is written atomically. Every article at or below it is fully in Qdrant.
+* **A resume is checked twice:** the recorded chunker, model, dimensions and text form against the running ones, and
+  the number of points at or below the checkpoint against the state's count. A mismatch (a lost write-ahead log tail
+  after a power loss) steps the checkpoint back and rewrites the state before embedding resumes.
+* **No state, no deletion.** A collection without a usable state file is refused, never deleted. A state file
+  without its collection starts over.
+* **Not built:** catching up after a monthly rebuild by embedding only changed articles (W3), and hybrid search.
+
+The operator's view is in [OPERATIONS.md](OPERATIONS.md#the-semantic-index-w2-the-first-embedding-run); the design in
+[DESIGN.md §12.5](DESIGN.md#125-first-semantic-build-w2).
+
 ## Data layout
 
 Paths are inside the container. The defaults are in `config.py` and can be changed in `mirror.yaml`.
@@ -74,7 +96,7 @@ Paths are inside the container. The defaults are in `config.py` and can be chang
 | `/mnt/wikipedia/snapshots/<identifier>_<yyyymmdd>/` | Downloaded Enterprise chunks (`.tar.gz`, about 151 GB), `.etag` sidecars, `snapshot.json`. Two kept (`retain_snapshots`). | Bulk storage mounted at `/mnt/wikipedia` (NFS from a NAS, bind-mounted by the Proxmox host, or a bind-mounted local directory) | No: re-downloadable |
 | `/var/lib/wiki-mirror/articles/<identifier>_<yyyymmdd>.db` | The article store, 25 GB for the 2026-10-01 snapshot | Local (NVMe) | No: rebuildable from the snapshot |
 | `/var/lib/wiki-mirror/qdrant/` | Qdrant storage (37 GB for the keyword index) | Local | No: rebuildable |
-| `/var/lib/wiki-mirror/state/` | `build.json`, `build.lock`, `index_lexical_<born>.json` (index state and checkpoint), `enterprise_budget.json`, `update.json` | Local | Should be: losing an index state file takes search down until it is restored (DESIGN.md §12.8) |
+| `/var/lib/wiki-mirror/state/` | `build.json`, `build.lock`, `index_lexical_<born>.json` (index state and checkpoint), `index_semantic_<born>.json` (the embedding run's state and checkpoint), `enterprise_budget.json`, `update.json` | Local | Should be: losing an index state file takes search down until it is restored (DESIGN.md §12.8) |
 | `/var/lib/wiki-mirror/tmp/` | The parse spool | Local | No |
 | `/etc/wiki-mirror/` | `mirror.yaml`, `mirror.env` (the primary key), `enterprise.env` (Enterprise sign-in), `clients.json` (key hashes), `qdrant.yaml` | Local | Config only; never in git |
 | `/opt/wiki-mirror/` | The git checkout and its venv, root-owned | Local | No |
@@ -94,8 +116,8 @@ holds the snapshot description, the schema version (2) and `parser_version`. The
 ## The index: two collections, shared point ids
 
 The keyword index is a Qdrant collection `wikipedia_lexical_<born>`, where `<born>` is the date of the snapshot
-it was first built from, behind the alias `wikipedia_lexical`. The semantic index (W2, not built yet) will be a
-second collection, `wikipedia_semantic_<born>`, behind `wikipedia_semantic`. Reasons for two collections
+it was first built from, behind the alias `wikipedia_lexical`. The semantic index (W2; the embedding run is built,
+search does not use it yet) is a second collection, `wikipedia_semantic_<born>`, behind `wikipedia_semantic`. Reasons for two collections
 rather than one with both vectors are in [DESIGN.md §12.2](DESIGN.md#122-the-four-decisions-in-this-plan).
 
 * **Point id** = `page_id * 10000 + chunk`, the same in both collections (`records.passage_point_id`). Re-running
@@ -104,14 +126,20 @@ rather than one with both vectors are in [DESIGN.md §12.2](DESIGN.md#122-the-fo
   serves the text, which keeps the index tens of GB smaller. A snippet is made by re-cutting the stored article
   with the same chunker and taking chunk `n`, so the index and the store must describe the same text.
 * **Vectors.** The keyword collection has one sparse vector, `lexical`, 2^24 hashed dimensions, with Qdrant's IDF
-  modifier. The semantic collection will hold bge-m3 vectors (1,024 dimensions, cosine), float16 on disk with
-  binary quantization in RAM and rescoring ([D1](DECISIONS.md#d1), [D5](DECISIONS.md#d5)).
+  modifier. The semantic collection holds bge-m3 vectors (1,024 dimensions, cosine), float16 on disk with
+  binary quantization in RAM and rescoring ([D1](DECISIONS.md#d1), [D5](DECISIONS.md#d5)). Its `born` is the tag of
+  the store it was embedded from, and its on-disk integer payload index on `page_id` serves both the resume check and
+  W3's per-article selection.
 * **Segments are capped** at 400,000 KB with one optimization at a time, so a merge fits in memory and a rewrite
   never needs a third of the disk free. Both came from OOM kills during the first build (DESIGN.md §12.8).
 * **The index state file** `state/index_lexical_<born>.json` records the build checkpoint, the chunker
   fingerprint (`v1:512/50`) and `applied_snapshot`: the snapshot whose store the passages were cut from. Serving
   pairs the collection with that snapshot's store. Today `applied_snapshot` equals `<born>`; the planned monthly
   in-place update (W3, [ROADMAP.md](ROADMAP.md)) will move it without moving the alias.
+* **The semantic state file** `state/index_semantic_<born>.json` records the embedding run's checkpoint
+  (`last_page_id`, with the article and passage counts), what the vectors are made of (chunker fingerprint, model,
+  dimensions, text form), whether the run is `complete`, and `applied_snapshot` once it is. A resume refuses to go on
+  if the settings differ, and checks the passage count against Qdrant.
 
 ### Serving follows the data
 
@@ -169,7 +197,7 @@ Details and the reasoning are in [DESIGN.md §6](DESIGN.md#6-security).
 * **Egress is per Unix user, not per address.** Enterprise downloads redirect (307) to presigned S3 URLs whose
   addresses rotate, so an address allowlist cannot work. nftables (`deploy/nftables/`) lets only
   `wikimirror-sync` open HTTPS to the internet, plus, when set, the optional embedding server (its address and port come from
-  `/etc/wiki-mirror/site.env`) for the planned semantic index's embedding job (W2). `wikimirror` (the
+  `/etc/wiki-mirror/site.env`) for the semantic index's embedding job (W2). `wikimirror` (the
   API) and `qdrant` get nothing: a flaw in the code that parses and serves untrusted text cannot phone out.
   `root` gets 80/443 and git-over-SSH to GitHub for installs and updates, `_apt` gets 80/443 over IPv4 for
   package fetches, and DNS goes to the LAN resolver only. Refused egress is rejected (fails at once, counted in

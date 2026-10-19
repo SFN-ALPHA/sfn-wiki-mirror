@@ -298,12 +298,51 @@ Each stage resumes after a crash. The first run measured the rates and sizes in 
      timeout;
    - upsert into `wikipedia_semantic_<born>` with HNSW indexing off during the load and switched on at the end
      (Qdrant's bulk-load pattern);
-   - checkpoint the last page id fully embedded, so a resume repeats at most one batch;
-   - show progress and the ETA on health.
+   - checkpoint the last page id fully embedded, so a resume repeats at most the windows in flight;
+   - show progress and the ETA in the log (built); not on health, which the embed stage deliberately never
+     touches.
 3. **Lend RAM if the graph build is disk-bound:** give the container more memory for the build only
    (`pct set <ctid> -memory <MB>` takes effect live on an LXC), then hand it back.
 4. **Switch hybrid on** when the semantic collection covers every page in `applied_snapshot` and the golden set
    passes (at least 90% in the top 5). Until then, keyword search answers alone.
+
+**What is built** (`src/wiki_mirror/embed.py`; the operator's view is in [OPERATIONS.md](OPERATIONS.md#the-semantic-index-w2-the-first-embedding-run)).
+Step 2 is built, with the HNSW switch at the end. Step 3 is an operator action, not code, and step 4 (hybrid
+search) is not built: no query reads the semantic collection yet.
+- **Windows.** Articles go through in page-id order in windows of 64 (about 400 passages). The requests of up to four
+  windows are in flight together, `embedding_concurrency` at a time across them, so replies arrive in any order; a
+  window is upserted only when it and every window before it is fully embedded.
+- **The checkpoint.** `last_page_id` in `state/index_semantic_<born>.json` is the last page id of the last upserted
+  window, written atomically after Qdrant confirms the upsert (the client's default `wait=True`). So every article
+  at or below it is fully in Qdrant. Points beyond it, from a crash between an upsert and the write, are harmless:
+  point ids are deterministic (`records.passage_point_id`), so they are written again.
+- **Verification on resume.** The settings check (chunker, model, dimensions, text form) is not enough, because the
+  state file can outlive part of what it describes: a power loss or host crash can lose the tail of Qdrant's
+  write-ahead log, which is the points with the highest page ids, and a resume on trust would skip those windows for
+  good. So a resume counts the points with `page_id` at or below the checkpoint (one exact filtered count on the
+  `page_id` index, measured at 26 s on the 41M-point lexical collection, so it asks Qdrant for a 600 s limit instead
+  of its 60 s default) and compares it with the state's passage count. On a mismatch it finds the highest page id
+  present at or below the checkpoint with one ordered scroll (`order_by` descending on the integer payload index,
+  limit 1; instant on Qdrant 1.12.4), sets the checkpoint to just before it (that article may be partial), recounts
+  the passages, writes the state and goes on. The article count, which only feeds the ETA, is scaled in proportion:
+  an exact one filters on the unindexed `chunk` field and hit Qdrant's 60 s timeout at full scale. A binary search
+  over exact counts would also find the step-back point; the ordered scroll is one index read instead of some 25
+  counts. A finished run is not scanned.
+- **Retries.** 429, 500, 502, 503 and 504, timeouts and connection errors are retried per request with exponential
+  backoff (1 s, doubling to 60 s), honouring `Retry-After` up to 5 minutes, for 15 minutes in all; then the run
+  fails and the systemd unit starts it again 15 minutes later (six starts a day), and it resumes. Any other status
+  fails at once with a fixed message. One vector per input is required: a short reply, a wrong-sized vector or a
+  non-number stops the run rather than put a vector on the wrong point.
+- **The text form.** A passage is embedded as its title, section heading and body (`Chunk.indexed_text`), the
+  form the passage-length evaluation measured (dense hit@5 0.953), recorded as `TEXT_FORM` in the state. A question
+  is embedded as plain text. Changing the form is a new `TEXT_FORM`, and so a new collection.
+- **The collection.** Float16 vectors on disk with binary quantization held in RAM, HNSW off (`m=0`) during the load
+  and on (`m=16`, `ef_construct=100`) at the end, segments capped at about 1 GB, one optimization at a time. The
+  finish switches HNSW on, then moves the alias `wikipedia_semantic` (both idempotent, so a run that died between
+  them repeats them), and records the run complete.
+- **What it will not do.** It does not delete a collection that has no usable state, and it does not resume with
+  other settings. It does not catch up after a monthly rebuild: embed after a new snapshot builds a whole new
+  collection (about 85 GB, about two days), because embedding only the changed articles is not built (W3).
 
 **Embedding rate, measured 2026-10-16** (bge-m3 through the embedding server at background priority, about
 2,000-character passages, whichever nodes were awake): 14.5 passages/s with one request in flight, 49.5/s with 8,
@@ -344,8 +383,9 @@ below are that router's, not yours.
   pause longer than 5 minutes unloads bge-m3 and lets small GPUs sleep, so a resume waits a minute or two; deploy
   any server fix before the run starts, because it restarts the server.
 
-If a new monthly snapshot arrives mid-build, the build lock holds the monthly update until the semantic build is
-done. The update then applies that month's diff to both collections; it is the same operation either way.
+If a new monthly snapshot arrives mid-build, the build lock holds the monthly job until the semantic build is
+done (built). Once W3 exists the update will apply that month's diff to both collections, the same operation either
+way; until then a monthly rebuild leaves the semantic collection on the older snapshot.
 
 ### 12.6 The monthly update (W3)
 

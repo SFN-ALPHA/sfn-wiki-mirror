@@ -331,7 +331,7 @@ $ curl -s -o /dev/null -w '%{http_code}\n' http://<mirror-host>:8300/v1/wiki/hea
 |---|---|
 | `wiki-mirror status` | Services, the mirror's health, the build unit, both timers, the checkout's commit, the firewall counters. Exits non-zero if the API does not answer. |
 | `wiki-mirror build-now` | Starts the build unit in the background and returns. Resets the retry limit. Refuses if a build is running. |
-| `wiki-mirror embed-now` | Starts the semantic index's embedding run ([below](#the-semantic-index-w2-the-first-embedding-run)) in the background and returns. Resets the retry limit. Refuses if a run is going. |
+| `wiki-mirror embed-now` | Starts the semantic index's embedding run ([below](#the-semantic-index-w2-the-first-embedding-run)), or resumes an interrupted one, in the background and returns. Resets the retry limit. Refuses if a run is going. |
 | `wiki-mirror logs [api\|build\|embed\|qdrant]` | Follows a unit's journal (default `api`). For an idle build or embed unit it prints the last 100 lines instead. |
 | `wiki-mirror update [--accept-format-change]` | The update ([below](#the-nightly-update)). |
 | `wiki-mirror search "<query>" [limit]` | A real query through the real API, default 5 results. |
@@ -421,7 +421,8 @@ for the 1st.
 The keyword index answers search alone until the semantic index exists. `wiki-mirror embed-now` embeds every passage
 through an Ollama-compatible embedding server into a second Qdrant collection, `wikipedia_semantic_<born>`. It takes
 about two days for the 41.6M passages. Nothing reads the new collection yet (hybrid search is later work), so the
-API and the keyword index are untouched while it runs.
+API and the keyword index are untouched while it runs. It needs a finished keyword build first (it embeds the store
+that build serves), and the run stops with "there is no lexical collection to embed from" if there is none.
 
 Before the first run:
 
@@ -456,20 +457,73 @@ Then:
 # wiki-mirror logs embed         # follow it: a progress line each minute (articles, passages/s, time left)
 ```
 
-* **It resumes on its own after a failure.** The unit waits 15 minutes and starts again, six starts in a day, and
-  each resume repeats only the windows that were in flight (`state/index_semantic_<born>.json` holds the
-  checkpoint). After that it stays failed until `wiki-mirror embed-now`. A server that refuses the key (401, 403) or
-  does not know the model (404) fails at once and says which; a busy or unreachable one is retried for 15 minutes
-  per request first.
+What it reads and writes:
+
+* **It reads** the article store that the live keyword collection serves, and cuts the same passages the keyword
+  build cut.
+* **It writes** the collection `wikipedia_semantic_<born>` and its state file `state/index_semantic_<born>.json`
+  (`<born>` is the date tag of that store's snapshot). When every passage is in, it switches HNSW on and moves the
+  alias `wikipedia_semantic` to the collection. Qdrant then builds the graphs in the background, one segment at a
+  time, which takes longer than the run. Watch `curl -s localhost:6333/collections/wikipedia_semantic` until its
+  `status` is `green`. Search does not use the collection yet.
 * **It holds the build lock for the whole run**, so the monthly build waits (exits 1, "a build is already running")
   until the embedding is done, and `wiki-mirror update` defers the same way.
-* **It finishes by switching HNSW on and pointing the alias `wikipedia_semantic` at the collection.** Qdrant then
-  builds the graphs in the background, one segment at a time, which takes longer than the run. Watch
-  `curl -s localhost:6333/collections/wikipedia_semantic` until its `status` is `green`.
-* **It refuses to mix vectors.** If the chunker, model, dimensions or text form recorded in the state differ from
-  the running configuration, it stops and says so; delete the collection and the state file to start over. A
-  collection with no usable state is never deleted for you.
 * **A failure does not turn health `degraded`:** the embed stage never writes the build state.
+
+### Interruptions and resuming
+
+The run is built to be stopped. Articles are embedded in page-id order, in windows of 64. A window is upserted into
+Qdrant, and only when Qdrant has confirmed it is the checkpoint (`last_page_id` in the state file) moved past it. The
+state file is written atomically (a temporary file, then a rename), so a crash never leaves a torn one. So the rule
+is: **every article at or below `last_page_id` is fully in Qdrant.** Points beyond it may exist, when a crash fell
+between an upsert and the state write; they are harmless, because a passage's point id is fixed by its article and
+passage number, and the resume writes them again.
+
+A resume checks two things before it embeds anything:
+
+1. **The settings.** The state records the chunker, model, dimensions and text form. If any differs from the running
+   configuration the run stops and says which (mixing two models' vectors in one collection ruins it silently).
+2. **The contents.** It asks Qdrant for the exact number of points with a page id at or below the checkpoint and
+   compares it with the passage count in the state. If they match, the log says `checkpoint verified` and the run
+   goes on. If they do not, Qdrant has lost some of what the checkpoint promised, which is what a power loss or a
+   host crash can do to the tail of its write-ahead log while the state file survives. The log then warns
+   (`the checkpoint at page id N ... does not match Qdrant`), the checkpoint steps back to just before the highest
+   article still there, the counts are taken again, the corrected state is written, and the run embeds from that
+   point. The highest surviving article is embedded again in full because it may be only partly written. Qdrant loses
+   a tail, not the middle, so nothing below that article is missing. With no points left at all the run starts
+   over from the first article. The check is one exact count over the points at or below the checkpoint, about half a
+   minute on 41 million points (so a resume is quiet for that long before its first line); it runs only on a resume,
+   never for a new run or a finished one. A
+   finished run (`complete` in the state) is left alone and rescans nothing.
+
+The state file and the collection must come as a pair. A collection with no usable state is refused and never
+deleted for you: two days of vectors are not discarded on a guess. A state file whose collection is gone starts the
+run over, with a warning. The closing step, HNSW on and the alias, is idempotent, so a run that died in it repeats it.
+
+What happens when something goes wrong:
+
+| Event | What happens |
+|---|---|
+| Crash, server error, Qdrant restart | The unit waits 15 minutes and starts again, which resumes. Up to six starts in a day (the first and five retries); after that the unit stays `failed` until `wiki-mirror embed-now`. |
+| Embedding server slow or down | Each request is retried for up to 15 minutes (backoff, and `Retry-After` is honoured), then the run fails and the unit's retry takes over. |
+| A refusal (400, 401, 403, 404) or a reply of the wrong shape | The run stops at once with a fixed message that says what to check, never the key or any text. Fewer vectors than texts, a wrong-sized vector or a non-number are all refused; nothing is padded. Fix the cause, then `wiki-mirror embed-now`. |
+| `systemctl stop wiki-mirror-embed` | The process is stopped where it is and the unit does not retry (a stop is not a failure). Windows in flight are repeated. `wiki-mirror embed-now` resumes. |
+| Reboot of the box or container | It does **not** restart by itself: the unit is not enabled and has no timer. Run `wiki-mirror embed-now`. |
+| Power loss | The resume verification catches a lost tail and steps back (above). |
+| Deploying new code mid-run | The updater defers while the build lock is held. Stop the unit (`systemctl stop wiki-mirror-embed`), run `wiki-mirror update`, then `wiki-mirror embed-now`. If the new code cuts passages differently or changes the text form, the resume is refused (below). |
+
+An interruption costs at most the windows that were in flight, a couple of minutes of work, plus, after a power
+loss, whatever Qdrant lost. To start over on purpose, delete the collection (`curl -X DELETE
+http://127.0.0.1:6333/collections/wikipedia_semantic_<born>`) and its state file together.
+
+### What is not built yet
+
+* **No catch-up after a monthly rebuild.** Running `embed` after the keyword index was rebuilt from a newer snapshot
+  starts a new full collection, `wikipedia_semantic_<new born>`: about 85 GB and about two days. Embedding only
+  the articles whose text changed is not built (it is the semantic half of the in-place update, W3, in
+  [ROADMAP.md](ROADMAP.md)). Until then, run `embed-now` only when you want that cost, and delete the superseded
+  semantic collection and its state file by hand when you no longer need it.
+* **No hybrid search.** The collection is built and the alias points at it, but no query reads it.
 
 ## The monthly build
 
@@ -606,6 +660,11 @@ connection into a hang for the whole connect timeout. Input stays a drop.
 | The installer stops at "resolv.conf names a resolver outside the LAN" | A public resolver in `/etc/resolv.conf` (Proxmox or the DHCP lease put it there), or `LAN_CIDR` does not contain the real resolver | Pin the LAN resolver as the message says, or correct `LAN_CIDR`. |
 | `wiki-mirror status` says `degraded` with an `error` row "<stage>: ... (see the build log)", and the build unit "last run FAILED" | A stage raised. The unit retries hourly, five times in a day, then stays failed | `wiki-mirror logs build` has the traceback. Fix the cause, then `wiki-mirror build-now` (clears the retry limit, resumes from the checkpoints). Exit 2 in the log is a configuration error and is not retried. |
 | `wiki-mirror: build: a build is already running` (exit 1) | `state/build.lock` is held: a build, a hand-run stage, or the update | `wiki-mirror status` / `wiki-mirror logs build`. Nothing was changed. The lock goes with the process, so no stale lock survives a crash or reboot. |
+| `systemctl status wiki-mirror-embed` says `failed`, or the unit is waiting to restart | The embedding run stopped: the embedding server was down or slow for over 15 minutes, refused the key (401, 403) or the model (404), or answered the wrong shape; or Qdrant failed. The unit retries 15 minutes later | `wiki-mirror logs embed` names the cause (never the key). A refusal does not fix itself: correct `embedding_url`, `embedding_model` or `/etc/wiki-mirror/embedding.env`, then `wiki-mirror embed-now`, which resumes from the checkpoint ([Interruptions and resuming](#interruptions-and-resuming)). Exit 2 is a configuration error (no `embedding_url`) and is not retried. |
+| The embed unit shows `start-limit-hit` (`Result=start-limit-hit`) | Six starts failed within a day; the unit stays down rather than hammer a dead server | Fix the cause (previous row), then `wiki-mirror embed-now`: it clears the limit and resumes. Nothing is lost. |
+| Embed stops "wikipedia_semantic_... exists but has no usable state" | The collection is there but `state/index_semantic_<born>.json` is missing, unreadable or another snapshot's. The run will not delete two days of vectors on a guess | Restore the state file from a backup of `/var/lib/wiki-mirror/state/` if you have one. Otherwise start over: `curl -X DELETE http://127.0.0.1:6333/collections/wikipedia_semantic_<born>`, then `wiki-mirror embed-now`. |
+| Embed stops "was started with different settings (chunker / model / dimensions / text form ...)" | The embedding settings or the code changed since the collection was started, so new vectors would not mix with the old | Put the setting back (`embedding_model`, `embedding_dimensions` in `mirror.yaml`) and `wiki-mirror embed-now`, or accept the cost of starting over: delete the collection and its state file, as in the previous row. |
+| Embed logs "the checkpoint at page id N ... does not match Qdrant" | Qdrant holds fewer (or more) points than the state recorded, usually after a power loss or host crash | Nothing: the run steps its checkpoint back and re-embeds from there. See [Interruptions and resuming](#interruptions-and-resuming). Repeated every restart means Qdrant keeps losing data; check the disk and `wiki-mirror logs qdrant`. |
 | Build fails "not enough free disk to create ..." | Less than `min_free_disk_gb` (20) free when it went to create a store or collection | `df -h /`; free space (see "no space" below) or lower the floor in `mirror.yaml` if you judge it too high; `wiki-mirror build-now`. |
 | Parse fails "(N corrupt files deleted; download again)" | A snapshot chunk was truncated or corrupt (an interrupted download, an NFS fault) | Nothing to repair: the build deleted the bad file and its `.etag`. `wiki-mirror build-now` downloads those chunks again (they count against the monthly budget). Repeats on the same chunk point at the NAS. |
 | Parse fails "holds a different snapshot" or "is already built ... from a different chunk list" | The store of that date is finished, and Enterprise now lists different chunks for it | The build will not mix two versions. Delete that date's store (`/var/lib/wiki-mirror/articles/<identifier>_<date>.db`) only if it is not the serving or the previous one, then `wiki-mirror build-now`. |

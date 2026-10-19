@@ -109,14 +109,15 @@ ZIM sizes are from [Kiwix's download index](https://download.kiwix.org/zim/wikip
 ## Status (2026-10-19)
 
 Phase names used in these docs: **W2** is the semantic index and hybrid search; **W3** is the in-place monthly
-update. Both are defined in [docs/DESIGN.md §7](docs/DESIGN.md#7-phases); neither is built yet.
+update. Both are defined in [docs/DESIGN.md §7](docs/DESIGN.md#7-phases). The embedding run of W2 is built; hybrid
+search and W3 are not.
 
 | | |
 |---|---|
 | Snapshot served | 2026-10-01 (`enwiki_namespace_0`, English Wikipedia articles only) |
 | Articles | 7,245,149 |
 | Passages in the keyword index | 41,590,915 |
-| Search mode | Keyword (BM25-style sparse vectors in Qdrant); semantic bge-m3 and hybrid fusion next (W2) |
+| Search mode | Keyword (BM25-style sparse vectors in Qdrant). The embedding run for the semantic index (bge-m3) is built and resumable; hybrid search over it is next (W2) |
 | Latency | About 27 ms per search with the index cached, 241 ms (p50) on first touch; article reads 1-2 ms (measured over the API, 2026-10-18) |
 | Disk and memory | Article store 25 GB; keyword index 37 GB on disk and 4-5 GB of RAM; semantic index about 95 GB and 10 GB of RAM (estimate) |
 | Embedding the corpus | About 45 hours at 29 effective TFLOPS (estimate from measured rates) |
@@ -141,7 +142,7 @@ planned, including article annotations (links, references, infoboxes, tables) an
 * **A free Wikimedia Enterprise account** at <https://enterprise.wikimedia.com/>; its free tier includes the Snapshot
   API this mirror downloads from ([docs/OPERATIONS.md](docs/OPERATIONS.md#3-the-enterprise-account-and-sign-in)).
 * **For the semantic index (W2, optional today):** an Ollama-compatible embedding server with a GPU on the same
-  network.
+  network, and the 32 GB of RAM above ([the embedding run](#the-semantic-index-embedding-run)).
 * **Time:** about 30 minutes to install, about 151 GB to download, about 14 hours for the first build (measured:
   2026-10-17 to 10-18).
 
@@ -154,6 +155,25 @@ The installer clones this repository over anonymous HTTPS; no deploy key is need
 `install.sh --auto-update` turns it on, and it means your box runs whatever lands on `main` as root; without it, update
 by hand with `wiki-mirror update`. Install, operation, the update, memory and disk guidance, uninstalling and failure
 recovery: [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+### The semantic index (embedding run)
+
+`wiki-mirror embed-now` (as root) embeds every passage through your embedding server into a second Qdrant collection,
+`wikipedia_semantic_<born>`, and `wiki-mirror logs embed` follows it with a progress line each minute: articles,
+passages, passages per second and the time left. It takes about two days. It needs a finished keyword build,
+`embedding_url` in `mirror.yaml`, the embedding pair in `site.env` so the firewall admits the server, and a 32 GB box
+with Qdrant restarted under its 20G cap. Search does not use the collection yet.
+
+The run is built to be interrupted. It works through the articles in order, in windows of 64, and moves a checkpoint
+only after Qdrant has confirmed a window. After a crash, a server error, a stop or a reboot, `embed-now` resumes: it
+checks the settings, then checks the checkpoint against what Qdrant holds, steps back if a power loss cost Qdrant
+its latest writes, and repeats at most the windows that were in flight. A failed run is retried by systemd every 15
+minutes, six starts a day. A reboot does not restart it by itself. The run holds the build lock, so the monthly build
+and the nightly update wait for it. After a monthly rebuild, a new run starts a full new collection (about 85 GB, about
+two days); an update that embeds only changed articles is not built.
+
+The steps, the table of what each interruption does, and the failure modes:
+[docs/OPERATIONS.md](docs/OPERATIONS.md#the-semantic-index-w2-the-first-embedding-run).
 
 ## Development
 

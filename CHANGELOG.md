@@ -10,6 +10,8 @@ All notable changes are listed here, newest first. The format follows
 - The semantic index's embedding run (W2, [D7](docs/DECISIONS.md#d7)): `wiki-mirror embed-now` embeds every
   passage into `wikipedia_semantic_<born>` through an Ollama-compatible server, resumably. Search does not use it
   yet.
+- A resumed embedding run now checks its checkpoint against Qdrant: if a power loss cost Qdrant the tail of its
+  write-ahead log, the checkpoint steps back and the lost windows are embedded again instead of skipped.
 
 ### Changed
 

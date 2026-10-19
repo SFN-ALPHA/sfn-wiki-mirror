@@ -6,7 +6,8 @@ visible. The embedding client is qualified through `httpx.MockTransport` with an
 and clock, so no test waits or opens a socket. Failure paths named here: a reply with fewer
 vectors than inputs, a wrong-sized or non-finite vector, a busy server (503 with `Retry-After`),
 a refused key (401, never retried), a server that stays down past the retry budget, a crash
-between windows, a resume with different settings, a collection without a state, and a key that
+between windows, a resume with different settings, a collection without a state, a checkpoint
+that Qdrant does not bear out (a lost tail, a half-written article, nothing left) and a key that
 must never reach a log line or an exception.
 
 The shared guarantees are checked against the lexical build itself: the same point ids and the
@@ -763,6 +764,213 @@ def test_run_embed_an_embedder_that_returns_the_wrong_count_stops_the_run(
     with pytest.raises(EmbedError, match="vectors for"):
         _run(_config(tmp_path), client, FakeSource(_articles()), Short())
     assert _points(client, _COLLECTION) == []
+
+
+# -- verifying the checkpoint against Qdrant ---------------------------------------------------
+
+_WINDOWS_OF_ONE = {"window_articles": 1, "windows_queued": 2}
+
+
+def _crashed_run(tmp_path: Path, articles: list[Article]) -> tuple[QdrantClient, MirrorConfig, int]:
+    """Run until the embedder fails, one article to a window; return the checkpoint it left."""
+    client = memory_client()
+    config = _config(tmp_path, embedding_concurrency=1)
+    with pytest.raises(EmbedError, match="went away"):
+        _run(config, client, FakeSource(articles), _FailsAt(5), **_WINDOWS_OF_ONE)
+    checkpoint = _state(tmp_path)["last_page_id"]
+    assert 3 <= checkpoint < len(articles)
+    return client, config, checkpoint
+
+
+def _drop_points(client: QdrantClient, condition: models.FieldCondition) -> None:
+    """Delete the points matching `condition`, as a lost write-ahead log tail would."""
+    client.delete(
+        _COLLECTION,
+        points_selector=models.FilterSelector(filter=models.Filter(must=[condition])),
+    )
+
+
+def _after(page_id: int) -> models.FieldCondition:
+    """Matches the points of articles with a page id above `page_id`."""
+    return models.FieldCondition(key="page_id", range=models.Range(gt=page_id))
+
+
+def _resume_state(tmp_path: Path) -> Any:
+    """The state a resume would read from disk."""
+    return embed._read_state(_state_file(tmp_path), "20261001")
+
+
+def _assert_equals_uninterrupted(
+    tmp_path: Path, client: QdrantClient, articles: list[Article]
+) -> None:
+    """The collection and counts equal those of a run that was never interrupted."""
+    whole = memory_client()
+    _run(_config(tmp_path / "whole"), whole, FakeSource(articles), _Embedder(), **_WINDOWS_OF_ONE)
+    got, want = _points(client, _COLLECTION), _points(whole, _COLLECTION)
+    assert [(p.id, p.payload) for p in got] == [(p.id, p.payload) for p in want]
+    # Approximately: the in-memory client renormalizes a point that is upserted a second time,
+    # which moves a stored component by about 1e-8; the same vector, not the same bits.
+    for have, expected_point in zip(got, want, strict=True):
+        assert have.vector == pytest.approx(expected_point.vector, abs=1e-6)
+    state, expected = _state(tmp_path), _state(tmp_path / "whole")
+    for key in ("last_page_id", "articles", "passages", "complete"):
+        assert state[key] == expected[key]
+
+
+def test_verified_checkpoint_matching_count_keeps_the_checkpoint(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    articles = _articles()
+    client, config, checkpoint = _crashed_run(tmp_path, articles)
+    resumed = _Embedder()
+    with caplog.at_level(logging.INFO, logger="wiki_mirror.embed"):
+        _run(config, client, FakeSource(articles), resumed, **_WINDOWS_OF_ONE)
+    assert "checkpoint verified" in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert sorted(resumed.texts) == sorted(
+        _expected_texts([a for a in articles if a.page_id > checkpoint])
+    )
+    _assert_equals_uninterrupted(tmp_path, client, articles)
+
+
+def test_verified_checkpoint_tail_loss_steps_back_and_the_run_equals_an_uninterrupted_one(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    articles = _articles()
+    client, config, checkpoint = _crashed_run(tmp_path, articles)
+    survivor = checkpoint - 2
+    _drop_points(client, _after(survivor))
+    with caplog.at_level(logging.INFO, logger="wiki_mirror.embed"):
+        checked = embed._verified_checkpoint(client, _COLLECTION, _resume_state(tmp_path))
+    # One article to a window and two passages to an article: the counts follow the page ids.
+    assert (checked.last_page_id, checked.articles, checked.passages) == (
+        survivor - 1,
+        survivor - 1,
+        2 * (survivor - 1),
+    )
+    warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert f"page id {checkpoint}" in warning
+    assert f"page id {survivor - 1}" in warning
+    assert f"({2 * checkpoint} passages)" in warning
+    assert f"holds {2 * survivor} passages" in warning
+
+    resumed = _Embedder()
+    _run(config, client, FakeSource(articles), resumed, **_WINDOWS_OF_ONE)
+    assert sorted(resumed.texts) == sorted(
+        _expected_texts([a for a in articles if a.page_id > survivor - 1])
+    )
+    _assert_equals_uninterrupted(tmp_path, client, articles)
+
+
+def test_verified_checkpoint_step_back_is_written_before_embedding_resumes(
+    tmp_path: Path,
+) -> None:
+    articles = _articles()
+    client, config, checkpoint = _crashed_run(tmp_path, articles)
+    _drop_points(client, _after(checkpoint - 2))
+    seen: list[int] = []
+
+    class Crashing(_Embedder):
+        async def embed(self, texts: list[str]) -> list[list[float]]:
+            seen.append(_state(tmp_path)["last_page_id"])
+            msg = "the embedding server went away"
+            raise EmbedError(msg)
+
+    with pytest.raises(EmbedError, match="went away"):
+        _run(config, client, FakeSource(articles), Crashing(), **_WINDOWS_OF_ONE)
+    assert seen[0] == checkpoint - 3
+
+
+def test_verified_checkpoint_a_partly_written_last_article_is_embedded_again_whole(
+    tmp_path: Path,
+) -> None:
+    articles = _articles()
+    client, config, checkpoint = _crashed_run(tmp_path, articles)
+    # The last article's second passage never reached the disk; its first did.
+    client.delete(_COLLECTION, points_selector=[passage_point_id(checkpoint, 1)])
+    resumed = _Embedder()
+    _run(config, client, FakeSource(articles), resumed, **_WINDOWS_OF_ONE)
+    assert sorted(resumed.texts) == sorted(
+        _expected_texts([a for a in articles if a.page_id >= checkpoint])
+    )
+    _assert_equals_uninterrupted(tmp_path, client, articles)
+
+
+def test_verified_checkpoint_no_surviving_points_restarts_from_the_beginning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    articles = _articles()
+    client, config, _ = _crashed_run(tmp_path, articles)
+    _drop_points(client, _after(-1))
+    resumed = _Embedder()
+    with caplog.at_level(logging.WARNING, logger="wiki_mirror.embed"):
+        _run(config, client, FakeSource(articles), resumed, **_WINDOWS_OF_ONE)
+    assert "does not match Qdrant" in caplog.text
+    assert sorted(resumed.texts) == sorted(_expected_texts(articles))
+    _assert_equals_uninterrupted(tmp_path, client, articles)
+
+
+def test_verified_checkpoint_points_beyond_the_checkpoint_do_not_step_it_back(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    articles = _articles()
+    client, config, checkpoint = _crashed_run(tmp_path, articles)
+    # A crash between an upsert and its state write: the next window is in Qdrant, unrecorded.
+    ahead = articles[checkpoint]
+    assert ahead.page_id == checkpoint + 1
+    client.upsert(
+        _COLLECTION,
+        points=[
+            models.PointStruct(
+                id=passage_point_id(ahead.page_id, chunk.index),
+                vector=_vector_for(passage_embedding_text(ahead, chunk)),
+                payload=index.passage_payload(ahead, chunk),
+            )
+            for chunk in indexable_chunks(ahead)[0]
+        ],
+    )
+    state = _resume_state(tmp_path)
+    with caplog.at_level(logging.INFO, logger="wiki_mirror.embed"):
+        assert embed._verified_checkpoint(client, _COLLECTION, state) is state
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    _run(config, client, FakeSource(articles), _Embedder(), **_WINDOWS_OF_ONE)
+    _assert_equals_uninterrupted(tmp_path, client, articles)
+
+
+def test_verified_checkpoint_more_points_than_the_state_counts_also_steps_back(
+    tmp_path: Path,
+) -> None:
+    articles = _articles()
+    client, _, checkpoint = _crashed_run(tmp_path, articles)
+    client.upsert(
+        _COLLECTION,
+        points=[
+            models.PointStruct(
+                id=passage_point_id(checkpoint - 1, 9),
+                vector=[1.0, 0, 0, 0],
+                payload={"page_id": checkpoint - 1, "chunk": 9},
+            )
+        ],
+    )
+    checked = embed._verified_checkpoint(client, _COLLECTION, _resume_state(tmp_path))
+    # The highest article present is the checkpoint's own, which is re-embedded to be safe.
+    assert checked.last_page_id == checkpoint - 1
+
+
+def test_verified_checkpoint_a_complete_state_does_no_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = memory_client()
+    config = _config(tmp_path)
+    first = _run(config, client, FakeSource(_articles(3)), _Embedder())
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        msg = "a finished run must not look at the points"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(client, "count", refuse)
+    monkeypatch.setattr(client, "scroll", refuse)
+    assert _run(config, client, FakeSource(_articles(3)), _Embedder()) == first
 
 
 # -- the finish -------------------------------------------------------------------------------
