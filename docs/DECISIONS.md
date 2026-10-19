@@ -168,3 +168,25 @@ workstation other than the one running it, nor check an IPv6 client or a console
 private blocks (a routed public allocation used internally, say) is refused with no override, because a mistake
 there is silent and costly; and the box's existing ruleset is replaced only when the installer is run,
 never by an update.
+
+<a id="d7"></a>
+## D7 - 2026-10-19 - The embedding run: its own stage, unit and key file
+
+**Decision.** The first semantic build is a separate `embed` stage (`src/wiki_mirror/embed.py`), started by hand
+with `wiki-mirror embed-now` through its own unit, `wiki-mirror-embed.service`, with no timer. The embedding
+server is set in `mirror.yaml` (`embedding_url`, `embedding_model`, `embedding_concurrency`, `embedding_batch`,
+`embedding_headers`); its key, if it needs one, is `EMBEDDING_API_KEY` in `/etc/wiki-mirror/embedding.env` (0600,
+`wikimirror-sync`), loaded only by that unit and never a setting. Qdrant's memory cap rises to 20G. Decided by the
+maintainer, who wanted the run started the same day.
+
+**Reasoning.** The embed reads the store the live lexical collection serves, so it never touches the download or
+parse and does not need the NAS. Each passage is embedded as its title, heading and text, the form the evaluation
+measured (D5), and that form, the model and the chunker are recorded in the state, so a resume refuses to mix
+vectors made differently. The run holds the build lock, commits windows of 64 articles in order and checkpoints
+after each, so a failure repeats only the windows still in flight and the unit's retry resumes it. A server that
+answers fewer vectors than texts stops the run rather than putting a vector on the wrong point. A failing run
+leaves the build state alone, because the index being served is fine. **Deferred:** the health route's progress
+(the journal has a line a minute), hybrid search and fusion weights, and the catch-up after a monthly rebuild,
+which embeds only articles whose `text_hash` changed; until that lands, `embed` after a rebuild starts a new full
+collection. **Accepted:** the HNSW graphs go in RAM, so the box needs 32 GB; the 1 GB segment cap is not measured
+at this scale yet.

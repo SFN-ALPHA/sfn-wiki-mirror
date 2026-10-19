@@ -132,6 +132,69 @@ def test_cli_help_needs_no_root_and_prints_the_usage_block(installed: Installed)
     assert "wiki-mirror key add <name>" in result.stdout
 
 
+def _systemd_stubs(installed: Installed, *, active: str = "inactive") -> Path:
+    """Stub `systemctl` (recording its calls) and `journalctl`; return the call log's path."""
+    stubs = installed.root / "stubs"
+    log = stubs / "calls.log"
+    _executable(
+        stubs / "systemctl",
+        '#!/bin/sh\necho "systemctl $*" >> "$(dirname "$0")/calls.log"\n'
+        f'case "$1" in is-active) echo {active} ;; show) echo ;; esac\n',
+    )
+    _executable(stubs / "journalctl", '#!/bin/sh\necho "journalctl $*"\n')
+    return log
+
+
+def test_cli_embed_now_resets_the_start_limit_and_starts_the_embed_unit(
+    installed: Installed,
+) -> None:
+    log = _systemd_stubs(installed)
+    result = installed.run("embed-now")
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text(encoding="utf-8").splitlines()
+    assert calls[-2:] == [
+        "systemctl reset-failed wiki-mirror-embed.service",
+        "systemctl start --no-block wiki-mirror-embed.service",
+    ]
+    assert "wiki-mirror logs embed" in result.stdout
+
+
+def test_cli_embed_now_while_a_run_is_going_refuses_and_starts_nothing(
+    installed: Installed,
+) -> None:
+    log = _systemd_stubs(installed, active="active")
+    result = installed.run("embed-now")
+    assert result.returncode == 1
+    assert "already going" in result.stderr
+    assert "start" not in log.read_text(encoding="utf-8")
+
+
+def test_cli_embed_now_needs_root(installed: Installed) -> None:
+    result = installed.run("embed-now", uid="1000")
+    assert result.returncode == 1
+    assert "needs root" in result.stderr
+
+
+def test_cli_logs_embed_shows_the_embed_units_journal(installed: Installed) -> None:
+    _systemd_stubs(installed)
+    result = installed.run("logs", "embed")
+    assert result.returncode == 0, result.stderr
+    # An idle oneshot has nothing to follow: its recent history, like the build unit's.
+    assert result.stdout.strip() == "journalctl -u wiki-mirror-embed.service -n 100 --no-pager"
+
+
+def test_cli_an_unknown_command_names_embed_now_among_the_commands(installed: Installed) -> None:
+    result = installed.run("frobnicate")
+    assert result.returncode == 1
+    assert "embed-now" in result.stderr
+
+
+def test_cli_help_lists_embed_now(installed: Installed) -> None:
+    result = installed.run("--help", uid="1000")
+    assert "wiki-mirror embed-now" in result.stdout
+    assert "embed" in result.stdout
+
+
 def test_cli_app_dir_override_still_wins_over_the_location_it_was_found_at(
     installed: Installed, tmp_path: Path
 ) -> None:

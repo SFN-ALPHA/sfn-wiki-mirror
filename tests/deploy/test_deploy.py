@@ -35,7 +35,9 @@ from wiki_mirror import index, store
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "deploy"
 UNITS = DEPLOY / "systemd"
-BOTH_UNITS = ["wiki-mirror.service", "wiki-mirror-build.service"]
+EMBED_UNIT = "wiki-mirror-embed.service"
+#: Every unit that runs the program (not Qdrant, not the updater).
+BOTH_UNITS = ["wiki-mirror.service", "wiki-mirror-build.service", EMBED_UNIT]
 
 pytestmark = pytest.mark.unit
 
@@ -104,6 +106,51 @@ def test_a_failed_build_is_retried_every_hour_for_a_bounded_number_of_starts() -
 def test_the_build_has_no_start_timeout_and_the_api_restarts_on_failure() -> None:
     assert _unit("wiki-mirror-build.service")["Service"]["TimeoutStartSec"] == ["infinity"]
     assert _unit("wiki-mirror.service")["Service"]["Restart"] == ["on-failure"]
+
+
+# -- the embedding run (W2) -------------------------------------------------------------------
+
+
+def test_the_embed_unit_runs_the_embed_stage_as_the_sync_user() -> None:
+    service = _unit(EMBED_UNIT)["Service"]
+    assert service["ExecStart"] == ["/opt/wiki-mirror/.venv/bin/python -I -m wiki_mirror embed"]
+    assert service["User"] == ["wikimirror-sync"]
+
+
+def test_a_failed_embed_run_is_retried_every_15_minutes_a_bounded_number_of_starts() -> None:
+    unit = _unit(EMBED_UNIT)
+    assert unit["Service"]["Restart"] == ["on-failure"]
+    assert unit["Service"]["RestartSec"] == ["15min"]
+    assert unit["Unit"]["StartLimitIntervalSec"] == ["1d"]
+    assert 2 <= int(unit["Unit"]["StartLimitBurst"][0]) <= 10
+    assert unit["Service"]["TimeoutStartSec"] == ["infinity"]
+
+
+def test_the_embed_unit_does_not_need_the_nas_and_writes_only_local_data() -> None:
+    unit = _unit(EMBED_UNIT)
+    assert "AssertPathIsMountPoint" not in unit["Unit"]
+    assert unit["Service"]["ReadWritePaths"] == ["/var/lib/wiki-mirror"]
+    assert unit["Unit"]["Requires"] == ["wiki-mirror-qdrant.service"]
+
+
+def test_the_embed_unit_loads_the_key_from_an_optional_file_and_never_names_it() -> None:
+    service = _unit(EMBED_UNIT)["Service"]
+    # The leading `-`: a server without authentication needs no file.
+    assert service["EnvironmentFile"] == ["-/etc/wiki-mirror/embedding.env"]
+    assert "EMBEDDING_API_KEY=" not in (UNITS / EMBED_UNIT).read_text(encoding="utf-8")
+
+
+def test_the_embed_unit_has_no_timer_and_the_installer_does_not_enable_it() -> None:
+    assert not (UNITS / "wiki-mirror-embed.timer").exists()
+    installer = (DEPLOY / "install.sh").read_text(encoding="utf-8")
+    enabled = re.search(r"local to_enable=\((.*?)\)", installer)
+    assert enabled is not None
+    assert EMBED_UNIT not in enabled.group(1)
+    assert EMBED_UNIT in installer
+
+
+def test_qdrant_is_capped_at_20g_for_the_semantic_index() -> None:
+    assert _unit("wiki-mirror-qdrant.service")["Service"]["MemoryMax"] == ["20G"]
 
 
 # -- the firewall -----------------------------------------------------------------------------

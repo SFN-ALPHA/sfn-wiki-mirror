@@ -1,0 +1,87 @@
+# The semantic index (W2): embed every passage into the wikipedia_semantic collection.
+#
+# Started by hand with `wiki-mirror embed-now`, once a build has finished and the embedding
+# server is set up (docs/OPERATIONS.md, "The semantic index"). Never started by the installer and
+# no timer: the first run is about two days of the embedding server's time, and the operator
+# decides when it may have it.
+# `python -m wiki_mirror embed` is checkpointed after every window of 64 articles, so a stop,
+# a reboot or a failure resumes from the last checkpoint on the next start. The lexical index
+# keeps serving throughout; nothing reads the semantic collection yet.
+#
+# Runs as `wikimirror-sync`, the identity that may reach the embedding server (nftables: the
+# server named in site.env). It reads the lexical collection's article store and writes only
+# local state; it does NOT read the NAS, so there is no AssertPathIsMountPoint. The server's
+# key, if it wants one, is EMBEDDING_API_KEY in /etc/wiki-mirror/embedding.env (0600
+# wikimirror-sync; the `-` makes the file optional for a server without authentication). It is
+# never in a setting, a log line or the state file.
+#
+# **No start timeout**, as for the build: two days is the plan, and the bounds are inside the
+# program (a request is retried for 15 minutes and then fails the run).
+#
+# **A failed run is retried, then it stops.** Restart=on-failure waits 15 minutes (RestartSec)
+# and runs it again - it resumes, so a retry costs only the windows that were in flight - for the
+# first run plus five retries within a day (StartLimitBurst / StartLimitIntervalSec). After that
+# the unit stays failed rather than hammering a server that is down all night;
+# `wiki-mirror embed-now` clears a spent limit and starts again. Exit 2 (a configuration error,
+# such as no embedding_url) is never retried.
+#
+# It holds the build lock for as long as it runs, so the monthly build waits (and exits 1) until
+# it is done: one build-like job at a time.
+#
+# Low priority on purpose: Nice and idle I/O, and a 2 G memory cap (a few windows of vectors as
+# Python floats are tens of MB; the rest is headroom).
+#
+# `-I` (isolated mode) for the same reason as the API unit.
+#
+# Install: install.sh copies it (and does not enable it). See docs/DESIGN.md section 12 and
+# docs/OPERATIONS.md.
+
+[Unit]
+Description=Wikipedia mirror semantic index (embed every passage)
+Documentation=file:///opt/wiki-mirror/docs/OPERATIONS.md
+After=network-online.target wiki-mirror-qdrant.service
+Wants=network-online.target
+Requires=wiki-mirror-qdrant.service
+# Six starts (the first and five retries) inside a day, then the unit stays failed
+# (Result=start-limit-hit) until `wiki-mirror embed-now`, which resets it.
+StartLimitIntervalSec=1d
+StartLimitBurst=6
+
+[Service]
+Type=oneshot
+User=wikimirror-sync
+Group=wikimirror
+WorkingDirectory=/var/lib/wiki-mirror
+EnvironmentFile=-/etc/wiki-mirror/embedding.env
+ExecStart=/opt/wiki-mirror/.venv/bin/python -I -m wiki_mirror embed
+# Group-readable output (the API user is in group wikimirror), nothing for anyone else.
+UMask=0027
+
+Restart=on-failure
+RestartSec=15min
+# Exit 2 is "my configuration is wrong"; fifteen minutes later it still is.
+RestartPreventExitStatus=2
+
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=2G
+
+# Hardening. One writable place: local data. It talks to Qdrant on loopback and to the
+# embedding server on the LAN.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/wiki-mirror
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

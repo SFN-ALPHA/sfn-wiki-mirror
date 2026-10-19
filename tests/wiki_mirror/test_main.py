@@ -47,6 +47,7 @@ from wiki_mirror.build import (
     read_build_state,
     write_build_state,
 )
+from wiki_mirror.embed import EmbedError
 from wiki_mirror.keys import hash_key
 from wiki_mirror.records import SnapshotMeta
 from wiki_mirror.serving import ServedSnapshot
@@ -695,6 +696,95 @@ def test_the_build_lock_is_released_after_a_failed_stage(
     _run(["--config", str(_settings(tmp_path)), "build"])
     with build_lock(tmp_path / "data"):
         pass
+
+
+_EMBED_URL = "embedding_url: http://100.64.0.9:8080\n"
+
+
+def test_embed_without_an_embedding_url_exits_2_and_says_which_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called: list[str] = []
+    monkeypatch.setattr(cli, "_embed", lambda config: called.append("embed"))
+    code, _, err = _run(["--config", str(_settings(tmp_path)), "embed"])
+    assert code == 2
+    assert "embedding_url" in err
+    assert called == []
+
+
+def test_embed_runs_under_the_build_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    held: list[bool] = []
+
+    def probe(*_args: object, **_kwargs: object) -> int:
+        try:
+            with build_lock(tmp_path / "data"):
+                held.append(False)
+        except BuildLockedError:
+            held.append(True)
+        return 0
+
+    monkeypatch.setattr(cli, "_embed", probe)
+    code, _, _ = _run(["--config", str(_settings(tmp_path, _EMBED_URL)), "embed"])
+    assert code == 0
+    assert held == [True]
+
+
+def test_a_second_embed_while_a_build_runs_exits_1_and_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called: list[str] = []
+    monkeypatch.setattr(cli, "_embed", lambda config: called.append("embed"))
+    with build_lock(tmp_path / "data"):
+        code, _, err = _run(["--config", str(_settings(tmp_path, _EMBED_URL)), "embed"])
+    assert code == 1
+    assert "a build is already running" in err
+    assert called == []
+
+
+def test_a_failing_embed_exits_1_and_leaves_the_build_state_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failing(config: object) -> int:
+        raise EmbedError("the embedding server went away")
+
+    monkeypatch.setattr(cli, "_embed", failing)
+    write_build_state(tmp_path / "data", BuildState(phase="serving"))
+    before = _state(tmp_path)
+    code, _, err = _run(["--config", str(_settings(tmp_path, _EMBED_URL)), "embed"])
+    assert code == 1
+    assert "went away" in err
+    # A failing embedding run says nothing about the index being served: health must not turn
+    # `degraded` because of it.
+    assert _state(tmp_path) == before
+
+
+def test_embed_stage_wires_the_store_the_bulk_timeout_and_the_environment_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+    closed: list[str] = []
+
+    class _Closeable:
+        def close(self) -> None:
+            closed.append("closed")
+
+    def client(**kwargs: Any) -> _Closeable:
+        seen.update(kwargs)
+        return _Closeable()
+
+    async def run(config: object, store: object, qdrant: object, embedder: Any) -> int:
+        seen["key"] = embedder._api_key
+        return 7
+
+    monkeypatch.setattr(cli, "QdrantClient", client)
+    monkeypatch.setattr(cli, "open_source_store", lambda config, qdrant: _Closeable())
+    monkeypatch.setattr(cli, "run_embed", run)
+    monkeypatch.setenv("EMBEDDING_API_KEY", "sentinel-key")
+    config = make_config(tmp_path, embedding_url="http://100.64.0.9:8080")
+    assert cli._embed(config) == 7
+    assert seen["timeout"] >= 60
+    assert seen["key"] == "sentinel-key"
+    assert closed == ["closed", "closed"]  # the store and the Qdrant client
 
 
 def test_status_runs_while_a_build_holds_the_lock(

@@ -80,9 +80,9 @@ A separate LXC on a Proxmox host (hostname `wikipedia-mirror`) so that:
 
 - Qdrant must not run on NFS: it memory-maps its files, and a network filesystem makes every search a network round
   trip. SQLite's locking misbehaves on NFS too. The NAS holds only the large, rarely read snapshots.
-- **Memory.** The container started with 8 GB and has 32 GB since 2026-10-17. Qdrant is capped at 12G (the first
-  keyword build peaked at 5.1 GB of anonymous memory and rests at 4.3 GB); the semantic index needs the cap raised
-  to about 20G (section 12.5). Decision D1 chose binary quantization (about 2 GB per 13M vectors) with
+- **Memory.** The container started with 8 GB and has 32 GB since 2026-10-17. Qdrant is capped at 20G since D7 (the first
+  keyword build peaked at 5.1 GB of anonymous memory and rests at 4.3 GB, under the earlier 12G cap; the semantic
+  index's binary vectors and HNSW graphs add about 10-11 GB, section 12.5). Decision D1 chose binary quantization (about 2 GB per 13M vectors) with
   full-precision rescoring from disk, so the searchable vectors stay small in RAM.
 
 ## 5. The design
@@ -224,7 +224,7 @@ estimate.
 
   One copy of everything fits on the NVMe pool (206 GB free after the first build); two full copies of both indexes
   side by side do not, which is why monthly updates change the collections in place.
-- **RAM.** Qdrant is capped at 12G today. Only the binary vectors stay resident; the rest is memory-mapped.
+- **RAM.** Qdrant is capped at 20G (D7). Only the binary vectors stay resident; the rest is memory-mapped.
 - **The free tier.** It gives one full snapshot a month and no change feed. Downloading the whole 151 GB takes about
   45 minutes (435 chunks at about 6 s each), so the download is not worth optimising. Working out what changed is
   our job.

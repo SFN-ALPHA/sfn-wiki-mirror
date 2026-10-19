@@ -26,10 +26,17 @@
 # qdrant.yaml) each built an inverted index on the heap. It recovered every segment from its
 # WAL and the build resumed, so the failure is safe, but each one costs a restart.
 #
-# MemoryMax is 12G, not 6G: the first full build finished (41.6M passages, 2026-10-18) with
+# MemoryMax went to 12G, not 6G: the first full build finished (41.6M passages, 2026-10-18) with
 # anonymous memory peaking at 5.1 GB during the last merges (one optimization at a time,
-# 400 MB segments) and 4.3 GB at rest. 12G covers that plus W2's in-RAM binary vectors (about
-# 4 GB at this passage count, docs/DESIGN.md section 12.5) and still leaves the 32 GB box room.
+# 400 MB segments) and 4.3 GB at rest.
+#
+# MemoryMax is 20G for the semantic index (W2, docs/DESIGN.md section 12.5): its binary-quantized
+# vectors are held in RAM (about 5.3 GB at 41.6M passages) and the HNSW graphs built after the
+# load sit in RAM too, on top of the lexical index's 4.3 GB at rest. The box needs 32 GB of RAM
+# for this: the cap, the API (1.5 G cap) and a build or embed run (5 G or 2 G caps) must all fit,
+# with page cache left over for the memory-mapped segments. An operator with less RAM can keep
+# the HNSW graphs on disk instead (`on_disk` in the collection's HNSW config), at the price of
+# slower dense search; there is no setting for it.
 #
 # Install: install.sh does it. By hand:
 #   cp wiki-mirror-qdrant.service /etc/systemd/system/ && systemctl daemon-reload
@@ -56,7 +63,7 @@ RestartSec=5s
 # Let it flush its WAL; a hard kill mid-write costs an index repair on the next start.
 TimeoutStopSec=120
 
-MemoryMax=12G
+MemoryMax=20G
 # Memory-mapped segments: the default file limit is far too low for a corpus this size.
 LimitNOFILE=65536
 

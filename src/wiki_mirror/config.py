@@ -5,8 +5,11 @@ Read by every entry point in `wiki_mirror.__main__`. Paths and knobs live in
 the one secret the service itself holds, the primary bearer key, comes from the
 environment (`WIKI_MIRROR_API_KEY`, set by systemd from `/etc/wiki-mirror/mirror.env`,
 0600). The Wikimedia Enterprise sign-in is a separate file read only by the download stage
-(`enterprise_env_file`), so the API process never holds it. Like every configuration in this
-repository it is validated at start and an invalid one is a hard failure.
+(`enterprise_env_file`), so the API process never holds it. The embedding server's key
+(`EMBEDDING_API_KEY`) is likewise read from the environment, by the embed stage alone, from a
+file only its unit loads; the settings hold the server's URL and shape but never the key. Like
+every configuration in this repository it is validated at start and an invalid one is a hard
+failure.
 
 Non-obvious constraints:
 
@@ -27,6 +30,7 @@ See docs/DESIGN.md sections 4 and 6.
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Final
@@ -51,6 +55,12 @@ DEFAULT_CONFIG_PATH: Final = Path("/etc/wiki-mirror/mirror.yaml")
 
 #: Shortest API key accepted: long enough that it was generated, not typed.
 _MIN_API_KEY_CHARS: Final = 32
+
+#: What an HTTP header name may be (RFC 9110 section 5.6.2, a "token").
+_HEADER_NAME: Final = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+#: Headers that carry credentials, lowercase; refused in `embedding_headers`.
+_CREDENTIAL_HEADERS: Final = frozenset({"authorization", "proxy-authorization"})
 
 
 class MirrorConfigError(ValueError):
@@ -106,6 +116,25 @@ class MirrorConfig(BaseModel):
     #: the key>"}`, root:wikimirror 0640, managed with `wiki-mirror key add|list|revoke`. Hashes
     #: only, so the API user can read it. Absent means no extra clients; see `keys.py`.
     clients_file: Path = Path("/etc/wiki-mirror/clients.json")
+    #: Base URL of an Ollama-compatible embedding server (`POST <url>/api/embed`), e.g.
+    #: `http://192.168.1.60:8080`. Unset means the `embed` stage is off. Any host, unlike Qdrant:
+    #: the server is another machine on the LAN. Its key is `EMBEDDING_API_KEY` in the
+    #: environment of the embed unit, never a setting (see `wiki_mirror.embed`).
+    embedding_url: str | None = None
+    #: The embedding model the server is asked for. Recorded in the semantic index's state, so a
+    #: collection is never continued with another model's vectors.
+    embedding_model: str = "bge-m3"
+    #: Length of the model's vectors; a reply of any other length stops the run. bge-m3 is 1024.
+    embedding_dimensions: int = Field(default=1024, ge=1, le=8192)
+    #: Embedding requests in flight at once. 16 is the measured knee of the reference server
+    #: (docs/DESIGN.md section 12.5): more only queues them there.
+    embedding_concurrency: int = Field(default=16, ge=1, le=64)
+    #: Texts per embedding request. 8 with 16 in flight is the same measured knee.
+    embedding_batch: int = Field(default=8, ge=1, le=64)
+    #: Extra request headers for the embedding server, e.g. `{"X-Priority": "3"}`, a background
+    #: priority some routers honour so a bulk run yields to interactive callers. `Authorization`
+    #: is refused: the key comes from the environment and is placed there by the client.
+    embedding_headers: dict[str, str] = Field(default_factory=dict)
     #: The primary bearer key. Required by `serve`; the build stages never need it.
     api_key: SecretStr | None = None
 
@@ -130,6 +159,54 @@ class MirrorConfig(BaseModel):
             msg = "must be http:// to a loopback address (127.0.0.1, ::1 or localhost)"
             raise ValueError(msg)
         return value.rstrip("/")
+
+    @field_validator("embedding_url")
+    @classmethod
+    def _embedding_url_is_a_plain_origin(cls, value: str | None) -> str | None:
+        """Refuse an embedding URL that is not http(s) to a host, or that carries more than that.
+
+        Userinfo is refused because credentials in a URL end up in logs and tracebacks; a query
+        or fragment because the client appends `/api/embed` and would corrupt it. The message
+        never repeats the value.
+        """
+        if value is None:
+            return None
+        try:
+            parts = urlsplit(value)
+            host = parts.hostname
+            _ = parts.port  # raises ValueError on a malformed port
+        except ValueError as exc:
+            msg = "is not a URL"
+            raise ValueError(msg) from exc
+        if parts.scheme not in {"http", "https"} or not host:
+            msg = "must be an http:// or https:// URL with a host"
+            raise ValueError(msg)
+        if "@" in parts.netloc:
+            msg = "must not carry a user name or password"
+            raise ValueError(msg)
+        if parts.query or parts.fragment or "?" in value or "#" in value:
+            msg = "must not carry a query or a fragment"
+            raise ValueError(msg)
+        return value.rstrip("/")
+
+    @field_validator("embedding_headers")
+    @classmethod
+    def _embedding_headers_are_safe(cls, value: dict[str, str]) -> dict[str, str]:
+        """Refuse credentials, a name that is not an HTTP token, and control characters in a value.
+
+        The messages never repeat a value (a header value can be a secret).
+        """
+        for name, text in value.items():
+            if not _HEADER_NAME.fullmatch(name):
+                msg = "header names must be HTTP tokens (letters, digits and !#$%&'*+-.^_`|~)"
+                raise ValueError(msg)
+            if name.casefold() in _CREDENTIAL_HEADERS:
+                msg = "must not set credentials; the key is EMBEDDING_API_KEY in the environment"
+                raise ValueError(msg)
+            if any(ord(char) < 0x20 or ord(char) == 0x7F for char in text):
+                msg = "header values must not hold control characters"
+                raise ValueError(msg)
+        return value
 
     @field_validator("api_key")
     @classmethod

@@ -5,6 +5,16 @@ All notable changes are listed here, newest first. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The semantic index's embedding run (W2, [D7](docs/DECISIONS.md#d7)): `wiki-mirror embed-now` embeds every
+  passage into `wikipedia_semantic_<born>` through an Ollama-compatible server, resumably. Search does not use it
+  yet.
+
+### Changed
+
+- Qdrant's memory cap is 20G (the semantic index needs a 32 GB box).
+
 ## [0.1.0] - 2026-10-19
 
 Initial public release.

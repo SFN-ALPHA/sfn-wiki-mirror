@@ -332,7 +332,7 @@ What limits concurrency, from the code and configuration:
   proceed at once. There is no tuning knob for this in the service's settings.
 - **Qdrant.** Every search is one loopback query to Qdrant, configured with `max_search_threads: 2` on a 6-vCPU box
   that also runs the API. A first-touch search is disk-bound until the relevant segments are in the page cache; a
-  cached one is CPU-bound. Qdrant is capped at 12G of memory.
+  cached one is CPU-bound. Qdrant is capped at 20G of memory.
 - **Article reads** touch SQLite only (read-only) and are cheap.
 - **A build competes for the same box.** The build runs at low priority (`Nice=10`, idle I/O) so it does not
   make search slow in practice, but do not run heavy searches during a semantic bulk build.

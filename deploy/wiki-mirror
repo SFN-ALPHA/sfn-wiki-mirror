@@ -9,7 +9,10 @@
 # Usage:
 #   wiki-mirror status                  the mirror's health, the units, the next scheduled build
 #   wiki-mirror build-now               start a build now (hours; follow it with `wiki-mirror logs build`)
-#   wiki-mirror logs [api|build|qdrant] follow a unit's journal (default: api)
+#   wiki-mirror embed-now               start the semantic index's embedding run (about two days; follow it
+#                                 with `wiki-mirror logs embed`; resumes where it stopped)
+#   wiki-mirror logs [api|build|embed|qdrant]
+#                                 follow a unit's journal (default: api)
 #   wiki-mirror update [--accept-format-change]
 #                                 fast-forward the checkout, reinstall, restart the API; the
 #                                 flag allows a commit that changes the built data's format
@@ -42,6 +45,7 @@ API_UNIT=wiki-mirror.service
 QDRANT_UNIT=wiki-mirror-qdrant.service
 BUILD_UNIT=wiki-mirror-build.service
 BUILD_TIMER=wiki-mirror-build.timer
+EMBED_UNIT=wiki-mirror-embed.service
 UPDATE_TIMER=wiki-mirror-update.timer
 
 if [[ -t 1 ]]; then
@@ -195,18 +199,35 @@ cmd_build_now() {
     printf '  stop:    systemctl stop %s\n' "$BUILD_UNIT"
 }
 
+# Starts the embedding run of the semantic index (W2). Like build-now: it resets a spent start
+# limit, and starting while the unit waits out RestartSec simply cuts the wait short.
+cmd_embed_now() {
+    require_root embed-now
+    if [[ "$(systemctl is-active "$EMBED_UNIT" 2>/dev/null || true)" =~ ^(active|activating)$ \
+          && "$(systemctl show "$EMBED_UNIT" -p SubState --value 2>/dev/null || true)" != auto-restart ]]; then
+        die "an embedding run is already going - follow it with: wiki-mirror logs embed"
+    fi
+    systemctl reset-failed "$EMBED_UNIT" 2>/dev/null || true
+    # --no-block: the run takes days, and the shell should come back.
+    systemctl start --no-block "$EMBED_UNIT"
+    printf 'Embedding run started. It is checkpointed: a stop, a failure or a reboot resumes where it left off.\n'
+    printf '  follow:  wiki-mirror logs embed\n'
+    printf '  stop:    systemctl stop %s\n' "$EMBED_UNIT"
+}
+
 cmd_logs() {
     local unit
     case "${1:-api}" in
         api)    unit="$API_UNIT" ;;
         build)  unit="$BUILD_UNIT" ;;
+        embed)  unit="$EMBED_UNIT" ;;
         qdrant) unit="$QDRANT_UNIT" ;;
-        *) die "unknown log '$1' (api|build|qdrant)" ;;
+        *) die "unknown log '$1' (api|build|embed|qdrant)" ;;
     esac
     shift || true
     # A finished oneshot has nothing to follow: show its recent history instead of waiting
     # forever on a unit that will not run again until next month.
-    if [[ "$unit" == "$BUILD_UNIT" ]] \
+    if [[ "$unit" == "$BUILD_UNIT" || "$unit" == "$EMBED_UNIT" ]] \
        && ! [[ "$(systemctl is-active "$unit" 2>/dev/null || true)" =~ ^(active|activating)$ ]]; then
         exec journalctl -u "$unit" -n 100 --no-pager "$@"
     fi
@@ -254,12 +275,13 @@ cmd_key() {
 case "${1:-status}" in
     status)    shift || true; cmd_status "$@" ;;
     build-now) shift; cmd_build_now "$@" ;;
-    logs)      shift; cmd_logs "$@" ;;
+    embed-now) shift; cmd_embed_now "$@" ;;
+    logs)    shift; cmd_logs "$@" ;;
     update)    shift; cmd_update "$@" ;;
     search)    shift; cmd_search "$@" ;;
     key)       shift; cmd_key "$@" ;;
     -h|--help|help)
         sed -n '/^# Usage:/,/^#$/p' "$SELF" | sed 's/^# \{0,1\}//'
         ;;
-    *) die "unknown command '$1' (status|build-now|logs|update|search|key)" ;;
+    *) die "unknown command '$1' (status|build-now|embed-now|logs|update|search|key)" ;;
 esac

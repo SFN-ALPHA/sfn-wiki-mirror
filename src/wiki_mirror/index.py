@@ -22,7 +22,8 @@ Non-obvious constraints:
   vector, `lexical`, with `Modifier.IDF` (Qdrant computes inverse document frequency from the
   points it holds, so the idf is never stored in the vectors). W2's dense vectors go in their own
   collection, `wikipedia_semantic_<born>`, sharing point ids and payload (docs/DESIGN.md section
-  12.2), so nothing here changes when it arrives.
+  12.2), so nothing here changes when it arrives. `indexable_chunks` and `passage_payload` are
+  what the two builds share: the cut and the payload.
 * **A collection is named for its birth, and its index state says what it holds.** The name
   never changes, but the monthly update (W3) rewrites the collection's points in place, so the
   snapshot it reflects drifts away from `<born>`. The truth is `applied_snapshot` in the
@@ -106,7 +107,7 @@ from wiki_mirror.records import (
     SnapshotMeta,
     passage_point_id,
 )
-from wiki_mirror.text.sanitize import chunk_text
+from wiki_mirror.text.sanitize import Chunk, chunk_text
 from wiki_mirror.text.sparse import SparseEncoder
 
 __all__ = [
@@ -121,7 +122,9 @@ __all__ = [
     "chunker_fingerprint",
     "collection_name",
     "index_state_file",
+    "indexable_chunks",
     "indexed_chunker",
+    "passage_payload",
     "run_index",
 ]
 
@@ -679,10 +682,9 @@ def _encode_batch(dimensions: int, batch: tuple[Article, ...]) -> _BatchResult:
     points: list[_Point] = []
     over_stride = empty = 0
     for article in batch:
-        for chunk in chunk_text(article.text, CHUNK_CONFIG):
-            if chunk.index >= PASSAGE_STRIDE:
-                over_stride += 1
-                continue
+        chunks, dropped = indexable_chunks(article)
+        over_stride += dropped
+        for chunk in chunks:
             weights = encoder.encode_document(chunk.indexed_text(article.title))
             if not weights:
                 empty += 1
@@ -692,17 +694,54 @@ def _encode_batch(dimensions: int, batch: tuple[Article, ...]) -> _BatchResult:
                     point_id=passage_point_id(article.page_id, chunk.index),
                     indices=list(weights.keys()),
                     values=list(weights.values()),
-                    payload={
-                        "page_id": article.page_id,
-                        "revision_id": article.revision_id,
-                        "chunk": chunk.index,
-                        "section": chunk.section_path,
-                        "disambiguation": article.is_disambiguation,
-                        "text_hash": article.text_hash,
-                    },
+                    payload=passage_payload(article, chunk),
                 )
             )
     return _BatchResult(batch[-1].page_id, points, over_stride, empty)
+
+
+def indexable_chunks(article: Article) -> tuple[list[Chunk], int]:
+    """The passages of an article that get a point, and how many were dropped for the stride.
+
+    The one definition of "the passages of an article" shared by the lexical build and the
+    semantic one (`wiki_mirror.embed`), so the two collections hold the same point ids: the
+    chunker's cut (`CHUNK_CONFIG`) minus the chunks whose number does not fit
+    `records.PASSAGE_STRIDE`, which a point id cannot encode.
+
+    Args:
+        article: The article, as the store holds it.
+
+    Returns:
+        The chunks in document order, and the number dropped for not fitting the stride.
+    """
+    kept: list[Chunk] = []
+    over_stride = 0
+    for chunk in chunk_text(article.text, CHUNK_CONFIG):
+        if chunk.index >= PASSAGE_STRIDE:
+            over_stride += 1
+            continue
+        kept.append(chunk)
+    return kept, over_stride
+
+
+def passage_payload(article: Article, chunk: Chunk) -> dict[str, Any]:
+    """The payload of one passage's point: the six fields, never any text (module docstring).
+
+    Shared with the semantic collection (`wiki_mirror.embed`), whose points must carry exactly
+    the lexical collection's payload for the same passage.
+
+    Args:
+        article: The article the chunk was cut from.
+        chunk: One of `indexable_chunks(article)`.
+    """
+    return {
+        "page_id": article.page_id,
+        "revision_id": article.revision_id,
+        "chunk": chunk.index,
+        "section": chunk.section_path,
+        "disambiguation": article.is_disambiguation,
+        "text_hash": article.text_hash,
+    }
 
 
 def aliased_collection(client: QdrantClient) -> str | None:

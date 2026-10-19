@@ -13,7 +13,7 @@
 | Nightly self-update | `update.sh` with deferral, format guard, rollback ([D4](DECISIONS.md#d4)) | Built 2026-10-17; opt-in for an installation (`--auto-update`), on for the maintainer's |
 | **Annotations** | What the parser drops today, kept beside the text: links, images, references, infobox fields, tables, math, quality signals and more; article reads return them | **Planned 2026-10-19**, [below](#article-annotations-and-the-reader); must be on the box before the 2026-11-02 build |
 | **Reader** | A thin web page on the LAN: search, results, article text with clickable links | **Planned 2026-10-19**, [below](#article-annotations-and-the-reader) |
-| **W2** | Semantic index, hybrid search, query-focused snippet | **Next.** Cut decided 2026-10-19 ([D5](DECISIONS.md#d5)); not started |
+| **W2** | Semantic index, hybrid search, query-focused snippet | **In progress.** Cut decided 2026-10-19 ([D5](DECISIONS.md#d5)); the embedding run is built ([D7](DECISIONS.md#d7)); hybrid search, the fusion-weight check, the focused snippet and the post-rebuild catch-up remain |
 | **W3** | Monthly in-place updates | Designed ([DESIGN.md §12.6](DESIGN.md#126-the-monthly-update-w3)); not started |
 
 Until W3 lands the monthly timer runs a full build beside the live collection and swaps the alias, which should work

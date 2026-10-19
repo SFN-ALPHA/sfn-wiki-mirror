@@ -1404,6 +1404,7 @@ install_config() {
 
 UNITS=(wiki-mirror-qdrant.service wiki-mirror.service
        wiki-mirror-build.service wiki-mirror-build.timer
+       wiki-mirror-embed.service
        wiki-mirror-update.service wiki-mirror-update.timer)
 
 install_units() {
@@ -1427,9 +1428,9 @@ install_units() {
         skip "units"
     fi
 
-    # Qdrant, the API and the monthly build timer, always. NOT the build or update services: they
-    # are started by their timers (or by the operator: `wiki-mirror build-now`, `wiki-mirror
-    # update`), never by this installer.
+    # Qdrant, the API and the monthly build timer, always. NOT the build, embed or update
+    # services: they are started by their timers (or by the operator: `wiki-mirror build-now`,
+    # `wiki-mirror embed-now`, `wiki-mirror update`), never by this installer.
     #
     # The nightly update timer is opt-in. Its unit is always installed (above), but it is enabled
     # only on --auto-update, or when it is already enabled: update.sh pulls the repository's main

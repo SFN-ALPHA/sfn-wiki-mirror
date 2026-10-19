@@ -3,18 +3,23 @@
 The one entry point on the mirror's container. The monthly job runs `build` (download, parse, index)
 as the `wikimirror-sync` user, which has internet but never serves; the systemd unit runs `serve` as
 `wikimirror`, which serves but has no internet. `download`, `parse` and `index` run one stage by
-hand, for resuming a stage that failed, `status` shows where a build stands, and `key` manages
-the API keys of the other agents (reached as `wiki-mirror key add|list|revoke`).
+hand, for resuming a stage that failed, `embed` (W2) embeds every passage into the semantic
+collection, run by `wiki-mirror-embed.service` once a build has finished, `status` shows where a
+build stands, and `key` manages the API keys of the other agents (reached as
+`wiki-mirror key add|list|revoke`).
 
 Non-obvious constraints:
 
 * **Exit codes.** 0 success, 1 a stage failed (the log has the cause), 2 the configuration or
-  the command line is wrong. systemd treats 2 as "do not retry": an unfixable start.
-* **One build at a time, and a failure always shows.** `download`, `parse`, `index` and `build`
-  hold `build.build_lock` while they run; a second one exits 1 with "a build is already running"
-  and touches nothing. Any exception a stage raises ends with `phase="failed"` and a short,
-  secret-free error in the build state (`_record_failure`), so `/v1/wiki/health` and `status`
-  say so even when the failure came before the stage's own bookkeeping began.
+  the command line is wrong. systemd treats 2 as "do not retry": an unfixable start. `embed`
+  without `embedding_url` is such a case.
+* **One build at a time, and a failure always shows.** `download`, `parse`, `index`, `build` and
+  `embed` hold `build.build_lock` while they run; a second one exits 1 with "a build is already
+  running" and touches nothing. Any exception a stage raises ends with `phase="failed"` and a
+  short, secret-free error in the build state (`_record_failure`), so `/v1/wiki/health` and
+  `status` say so even when the failure came before the stage's own bookkeeping began. `embed` is
+  the exception: it never touches the build state, because a failing embedding run says nothing
+  about the index being served.
 * **`serve` refuses to start without `WIKI_MIRROR_API_KEY`**, with a malformed clients file
   (exit 2), and without a reachable Qdrant (it exits 1 so systemd retries once Qdrant is up,
   rather than serving "not ready" forever). It does *not* need a snapshot: it serves whatever
@@ -36,6 +41,7 @@ See docs/DESIGN.md sections 4, 6 and 12.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import dataclasses
 import json
 import logging
@@ -67,6 +73,7 @@ from wiki_mirror.config import (
     MirrorConfigError,
     load_mirror_config,
 )
+from wiki_mirror.embed import EmbeddingClient, open_source_store, run_embed
 from wiki_mirror.enterprise import EnterpriseClient
 from wiki_mirror.index import aliased_collection, applied_snapshot, run_index
 from wiki_mirror.keys import (
@@ -104,6 +111,7 @@ _COMMANDS = {
     "parse": "turn the downloaded chunks into the article store",
     "index": "load the article store's passages into Qdrant and swap the alias",
     "build": "download, parse and index: the monthly job",
+    "embed": "embed every passage into the semantic collection (W2); resumable",
     "serve": "run the HTTP API",
     "status": "show where the build stands and what is being served",
 }
@@ -167,11 +175,15 @@ def main(
         return _serve(config, err)
     if args.command == "key":
         return _key(config, args, out, err, euid)
+    if args.command == "embed" and config.embedding_url is None:
+        err.write("wiki-mirror: embed needs embedding_url in mirror.yaml\n")
+        return 2
     stages: dict[str, Callable[[MirrorConfig], object]] = {
         "download": _download,
         "parse": _parse,
         "index": _index,
         "build": _build,
+        "embed": _embed,
     }
     before: BuildState | None = None
     try:
@@ -187,7 +199,10 @@ def main(
         # The command line is the boundary: whatever a stage raises becomes an exit code and a
         # logged traceback, so systemd records a failed unit instead of a Python crash.
         logger.exception("%s failed", args.command)
-        _record_failure(config, args.command, exc, before)
+        if args.command != "embed":
+            # Not the embed stage: it does not touch the build state, and a failing embedding run
+            # must not turn `/v1/wiki/health` to `degraded` while the served index is fine.
+            _record_failure(config, args.command, exc, before)
         err.write(f"wiki-mirror: {args.command} failed: {type(exc).__name__}: {exc}\n")
         return 1
     return 0
@@ -266,6 +281,33 @@ def _index(config: MirrorConfig, store_file: Path | None = None) -> int:
     finally:
         client.close()
         store.close()
+
+
+def _embed(config: MirrorConfig) -> int:
+    """Embed the passages of the store the live lexical collection serves; return the count.
+
+    The embedding key is read from the process environment here (`EMBEDDING_API_KEY`), not from
+    the settings.
+
+    Raises:
+        EmbedError: `embedding_url` is unset, there is no lexical collection to embed from, or
+            the embedding run itself failed (see `embed.run_embed`).
+    """
+    client = QdrantClient(url=config.qdrant_url, timeout=_INDEX_QDRANT_TIMEOUT_SECONDS)
+    try:
+        store = open_source_store(config, client)
+        try:
+            return asyncio.run(_embed_async(config, store, client))
+        finally:
+            store.close()
+    finally:
+        client.close()
+
+
+async def _embed_async(config: MirrorConfig, store: ArticleStore, client: QdrantClient) -> int:
+    """Run the embed stage with an embedding client that is opened and closed on one event loop."""
+    async with EmbeddingClient.from_config(config, os.environ) as embedder:
+        return await run_embed(config, store, client, embedder)
 
 
 def _build(config: MirrorConfig) -> None:

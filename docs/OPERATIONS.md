@@ -40,9 +40,10 @@ Memory, with the box at 32 GB:
 
 | Process | Cap | Notes |
 |---|---|---|
-| Qdrant | `MemoryMax=12G` | The first full keyword build peaked at 5.1 GB of anonymous memory during segment merges and rests at 4.3 GB. The cap leaves room for the planned semantic index's (W2) binary vectors, which needs it near 20G ([ROADMAP.md](ROADMAP.md)). |
+| Qdrant | `MemoryMax=20G` | The first full keyword build peaked at 5.1 GB of anonymous memory during segment merges and rests at 4.3 GB. The semantic index (W2) adds about 5.3 GB of binary vectors and the HNSW graphs in RAM, so the cap is 20G and the container needs 32 GB ([the first embedding run](#the-semantic-index-w2-the-first-embedding-run)). |
 | API | `MemoryMax=1500M` | |
 | Build | `MemoryMax=5G` | `Nice=10`, idle I/O priority: a build never makes search slow. |
+| Embed | `MemoryMax=2G` | Same priorities; holds only a few windows of vectors. |
 
 `systemctl status` shows a `Memory:` line that includes reclaimable page cache. To judge Qdrant, read anonymous
 memory instead:
@@ -330,12 +331,13 @@ $ curl -s -o /dev/null -w '%{http_code}\n' http://<mirror-host>:8300/v1/wiki/hea
 |---|---|
 | `wiki-mirror status` | Services, the mirror's health, the build unit, both timers, the checkout's commit, the firewall counters. Exits non-zero if the API does not answer. |
 | `wiki-mirror build-now` | Starts the build unit in the background and returns. Resets the retry limit. Refuses if a build is running. |
-| `wiki-mirror logs [api\|build\|qdrant]` | Follows a unit's journal (default `api`). For an idle build unit it prints the last 100 lines instead. |
+| `wiki-mirror embed-now` | Starts the semantic index's embedding run ([below](#the-semantic-index-w2-the-first-embedding-run)) in the background and returns. Resets the retry limit. Refuses if a run is going. |
+| `wiki-mirror logs [api\|build\|embed\|qdrant]` | Follows a unit's journal (default `api`). For an idle build or embed unit it prints the last 100 lines instead. |
 | `wiki-mirror update [--accept-format-change]` | The update ([below](#the-nightly-update)). |
 | `wiki-mirror search "<query>" [limit]` | A real query through the real API, default 5 results. |
 | `wiki-mirror key add <name>` / `list` / `revoke <name>` | Agent keys ([API.md](API.md#client-keys)). |
 
-The Python entry point behind it is `python -m wiki_mirror <download|parse|index|build|serve|status|key>`.
+The Python entry point behind it is `python -m wiki_mirror <download|parse|index|build|embed|serve|status|key>`.
 `download`, `parse` and `index` run one stage by hand, for resuming one that failed. Exit codes: 0 success, 1 a
 stage failed, 2 a configuration or usage error (systemd does not retry 2).
 
@@ -413,6 +415,61 @@ with a short reason (no secrets), so `wiki-mirror status` and `/v1/wiki/health` 
 chunks. The service refuses to start a download past `monthly_chunk_budget` (1,200), so a failure loop cannot
 spend the month; two full pulls fit with room for retries. If the budget is spent, the build says so and waits
 for the 1st.
+
+## The semantic index (W2): the first embedding run
+
+The keyword index answers search alone until the semantic index exists. `wiki-mirror embed-now` embeds every passage
+through an Ollama-compatible embedding server into a second Qdrant collection, `wikipedia_semantic_<born>`. It takes
+about two days for the 41.6M passages. Nothing reads the new collection yet (hybrid search is later work), so the
+API and the keyword index are untouched while it runs.
+
+Before the first run:
+
+1. **Check the server answers one vector per text.** A server that returns fewer vectors than texts stops the run
+   (by design, never padded), so try a two-text request first:
+   `curl -s -H "Authorization: Bearer $EMBEDDING_API_KEY" -d '{"model":"bge-m3","input":["a","b"]}' <url>/api/embed`
+   should show two vectors of 1024 numbers.
+2. **Write the key file, if the server wants a key.** In a root shell, so the key never reaches a command line or a
+   log (a server without authentication needs no file):
+   ```bash
+   # read -r -s -p 'Embedding key: ' k; echo
+   # ( umask 077; printf 'EMBEDDING_API_KEY=%s\n' "$k" > /etc/wiki-mirror/embedding.env ); unset k
+   # chown wikimirror-sync:wikimirror /etc/wiki-mirror/embedding.env; chmod 0600 /etc/wiki-mirror/embedding.env
+   ```
+   Only the embed unit loads this file. The key is sent as a bearer header and never appears in a setting, a log or
+   the state file.
+3. **Set `embedding_url`** in `/etc/wiki-mirror/mirror.yaml` (the server's origin, e.g. `http://192.168.1.60:8080`;
+   the firewall must admit `wikimirror-sync` to it: `EMBEDDING_HOST` and `EMBEDDING_PORT` in `site.env`, applied
+   with `install.sh`). The other `embedding_*` keys have the measured defaults (16 requests in flight, 8 texts per
+   request); `embedding_headers` can carry a background-priority header such as `X-Priority: 3` if the server has
+   one. Without `embedding_url` the command exits 2.
+4. **Give the container 32 GB of RAM** (`pct set <ctid> -memory 32768` on the host, live for an LXC) and **restart
+   Qdrant to take its new cap** (`MemoryMax` is now 20G; `wiki-mirror update` installs the unit, then
+   `systemctl restart wiki-mirror-qdrant`). The binary vectors (about 5.3 GB) and the HNSW graphs live in RAM next to
+   the keyword index's 4.3 GB. Disk needs about 95 GB more than today; the run refuses to create the collection below
+   `min_free_disk_gb`.
+
+Then:
+
+```bash
+# wiki-mirror embed-now          # starts the unit in the background and returns
+# wiki-mirror logs embed         # follow it: a progress line each minute (articles, passages/s, time left)
+```
+
+* **It resumes on its own after a failure.** The unit waits 15 minutes and starts again, six starts in a day, and
+  each resume repeats only the windows that were in flight (`state/index_semantic_<born>.json` holds the
+  checkpoint). After that it stays failed until `wiki-mirror embed-now`. A server that refuses the key (401, 403) or
+  does not know the model (404) fails at once and says which; a busy or unreachable one is retried for 15 minutes
+  per request first.
+* **It holds the build lock for the whole run**, so the monthly build waits (exits 1, "a build is already running")
+  until the embedding is done, and `wiki-mirror update` defers the same way.
+* **It finishes by switching HNSW on and pointing the alias `wikipedia_semantic` at the collection.** Qdrant then
+  builds the graphs in the background, one segment at a time, which takes longer than the run. Watch
+  `curl -s localhost:6333/collections/wikipedia_semantic` until its `status` is `green`.
+* **It refuses to mix vectors.** If the chunker, model, dimensions or text form recorded in the state differ from
+  the running configuration, it stops and says so; delete the collection and the state file to start over. A
+  collection with no usable state is never deleted for you.
+* **A failure does not turn health `degraded`:** the embed stage never writes the build state.
 
 ## The monthly build
 
@@ -555,7 +612,7 @@ connection into a hang for the whole connect timeout. Input stays a drop.
 | Mirror `degraded`, `wiki-mirror logs api` says the snapshot "is N days old, past the 40-day limit" | The monthly build did not land | `wiki-mirror status` (Schedule, build unit), `systemctl list-timers`; `wiki-mirror build-now`. |
 | Mirror `degraded`, `wiki-mirror logs api` says the collection "was indexed with chunker ... but this code cuts with ..." | The code that cuts passages changed since the served index was built | Rebuild the index. The next monthly snapshot is cut by the running code and replaces the old index; to fix it sooner, delete the served `wikipedia_lexical_<born>` collection by hand (search is down until `wiki-mirror build-now` finishes). |
 | Build stops "no space left on device" | `/` full: two stores or two collections side by side (about 100 GB peak) | `df -h /`; `du -sh /var/lib/wiki-mirror/*`. A finished build deletes stores and index states older than the serving and rollback snapshots, and superseded collections; if the disk is still full, delete by hand only article stores older than those two (`ls /var/lib/wiki-mirror/articles`), never the serving one. Then `wiki-mirror build-now`. |
-| Qdrant restarts repeatedly, `wiki-mirror logs qdrant` shows it killed | Memory: `MemoryMax=12G` reached, or the container's 32 GB | `systemctl show wiki-mirror-qdrant -p NRestarts`; check the collection still has `max_optimization_threads: 1` and `max_segment_size: 400000` (`curl -s localhost:6333/collections/wikipedia_lexical`); lower `storage.performance.max_search_threads` in `qdrant.yaml`; do not run a build and heavy search together. Qdrant recovers from its WAL after a kill and the build resumes. |
+| Qdrant restarts repeatedly, `wiki-mirror logs qdrant` shows it killed | Memory: `MemoryMax=20G` reached, or the container's 32 GB | `systemctl show wiki-mirror-qdrant -p NRestarts`; check the collection still has `max_optimization_threads: 1` and `max_segment_size: 400000` (`curl -s localhost:6333/collections/wikipedia_lexical`); lower `storage.performance.max_search_threads` in `qdrant.yaml`; do not run a build and heavy search together. Qdrant recovers from its WAL after a kill and the build resumes. |
 | A client says the mirror is unavailable or gets 401 | Key mismatch or revoked, wrong URL, or the firewall | `curl -s -o /dev/null -w '%{http_code}\n' http://<mirror-host>:8300/v1/wiki/health` from the client should print 401 (reachable, key required); then check its key with `wiki-mirror key list`. |
 | An agent gets 401 on `/mcp` | Key mistyped, revoked, or not added on this box | `wiki-mirror key list` shows who has a key. A lost key cannot be shown again: `wiki-mirror key revoke <name>`, then `wiki-mirror key add <name>`. |
 | `wiki-mirror status` says `degraded`; `wiki-mirror logs api` says "the article store for snapshot <date tag> (collection wikipedia_lexical_...) cannot be opened" | A build moved the alias (or the collection's `applied_snapshot` moved) but that snapshot's store is missing, unfinished or damaged | The old snapshot is still serving. `ls /var/lib/wiki-mirror/articles`; `wiki-mirror build-now` repeats parse and index (it resumes). The API picks the result up within 30 seconds. |
