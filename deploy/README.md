@@ -39,8 +39,10 @@ download, about 14 hours for the first build. You also need a free Wikimedia Ent
 3. Inside the container as root, write `/etc/wiki-mirror/enterprise.env` (docs/OPERATIONS.md has the `read -r -s`
    command).
 4. Write the site file `/etc/wiki-mirror/site.env`: copy `/root/site.env.example` there and edit it. `LAN_CIDR` is
-   required and ships commented out: remove the `# ` and write your own network. `EMBEDDING_HOST` and `EMBEDDING_PORT` are optional (both or neither): they only open one egress rule for
-   the planned semantic index (W2, see docs/ROADMAP.md), and nothing uses an embedding server today. The installer
+   required and ships commented out: remove the `# ` and write your own network. `EMBEDDING_HOST` and `EMBEDDING_PORT` are optional (both or neither): they only open one egress rule, to
+   the embedding server (an Ollama node or Ollama-compatible cluster) that `wiki-mirror embed-now` uses for the
+   semantic index; leave them out if you will not run it, or if Ollama runs on this box (docs/OPERATIONS.md, "The
+   embedding server"). The installer
    refuses to go on while the file is missing or still the example, and stops on any value that is not a valid
    network, address or port. The file must be root-owned, 0644 and not a symbolic link, `LAN_CIDR` must be a private
    network of `/8` or longer (10/8, 172.16/12, 192.168/16 or 100.64/10), and both this box and your SSH session must

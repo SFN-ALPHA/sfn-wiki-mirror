@@ -141,8 +141,9 @@ planned, including article annotations (links, references, infoboxes, tables) an
   ([docs/OPERATIONS.md](docs/OPERATIONS.md#2-storage-at-mntwikipedia)).
 * **A free Wikimedia Enterprise account** at <https://enterprise.wikimedia.com/>; its free tier includes the Snapshot
   API this mirror downloads from ([docs/OPERATIONS.md](docs/OPERATIONS.md#3-the-enterprise-account-and-sign-in)).
-* **For the semantic index (W2, optional today):** an Ollama-compatible embedding server with a GPU on the same
-  network, and the 32 GB of RAM above ([the embedding run](#the-semantic-index-embedding-run)).
+* **For the semantic index (W2, optional today):** an Ollama node with a GPU, on the network or on this box, or an
+  Ollama-compatible cluster behind one URL, and the 32 GB of RAM above. Setup for each:
+  [docs/OPERATIONS.md](docs/OPERATIONS.md#the-embedding-server).
 * **Time:** about 30 minutes to install, about 151 GB to download, about 14 hours for the first build (measured:
   2026-10-17 to 10-18).
 

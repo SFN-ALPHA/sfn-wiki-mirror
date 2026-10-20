@@ -10,7 +10,7 @@ script is right, so fix this file. Elsewhere in the docs the mirror's address is
 | The LAN (clients, this box, the NAS, the Proxmox host) | `192.168.1.0/24` | `LAN_CIDR` in `site.env` |
 | Your router, which is also the LAN's DNS resolver | `192.168.1.1` | the resolver the container will use |
 | This box (reserved in your router's DHCP server) | `192.168.1.50` | `<mirror-host>` |
-| The embedding server (optional; for the planned semantic index, W2, see [ROADMAP.md](ROADMAP.md)) | `192.168.1.60`, port `8080` | `EMBEDDING_HOST`, `EMBEDDING_PORT` in `site.env` |
+| The embedding server (optional: an Ollama node or Ollama-compatible cluster for the semantic index's embedding run, [The embedding server](#the-embedding-server)) | `192.168.1.60`, port `11434` | `EMBEDDING_HOST`, `EMBEDDING_PORT` in `site.env` |
 | The NFS export holding the snapshots (if you use a NAS) | `192.168.1.40:/mnt/tank/wikipedia-mirror` | your NFS export |
 | The Proxmox container ID | `<ctid>` | `pct list` shows it |
 
@@ -183,8 +183,8 @@ lives in `/etc/wiki-mirror/site.env` (root:root 0644; no secret belongs in it), 
 | Key | Required | What it is | Example |
 |---|---|---|---|
 | `LAN_CIDR` | yes | The IPv4 network your clients and this box share. SSH and the API port are admitted from it, and DNS, NTP and ping go to it. It must be a private network (see below), this box must have an address inside it, and the resolver in `/etc/resolv.conf` must be inside it. | `192.168.1.0/24` |
-| `EMBEDDING_HOST` | no | IPv4 address of an Ollama-compatible embedding server, for the planned semantic index (W2, see [ROADMAP.md](ROADMAP.md)). It opens one egress rule: the only LAN host the build user (`wikimirror-sync`) may open a connection to. Nothing uses an embedding server today, so leave it out unless you are preparing for W2. | `192.168.1.60` |
-| `EMBEDDING_PORT` | no | That server's TCP port. Give both `EMBEDDING_HOST` and `EMBEDDING_PORT`, or neither; there is no default. | `8080` |
+| `EMBEDDING_HOST` | no | IPv4 address of the embedding server for the semantic index's embedding run: an Ollama node, or the front end of an Ollama-compatible cluster ([The embedding server](#the-embedding-server)). It opens one egress rule: the only LAN host the build user (`wikimirror-sync`) may open a connection to. Leave it out if you will not run the embedding, or if Ollama runs on this box (loopback is already admitted). | `192.168.1.60` |
+| `EMBEDDING_PORT` | no | That server's TCP port (Ollama's own is 11434). Give both `EMBEDDING_HOST` and `EMBEDDING_PORT`, or neither; there is no default. | `11434` |
 
 The file is plain `KEY=value` lines, one per key, no quotes and no spaces; blank lines and whole-line `#` comments
 are fine (`deploy/site.env.example` is the template). Every key in it ships commented out, `LAN_CIDR` included,
@@ -424,7 +424,73 @@ about two days for the 41.6M passages. Nothing reads the new collection yet (hyb
 API and the keyword index are untouched while it runs. It needs a finished keyword build first (it embeds the store
 that build serves), and the run stops with "there is no lexical collection to embed from" if there is none.
 
-Before the first run:
+### The embedding server
+
+The mirror speaks Ollama's embedding API and nothing else: `POST <embedding_url>/api/embed` with
+`{"model": "bge-m3", "input": [...]}`, answered by `{"embeddings": [...]}`. Two setups are supported: one Ollama
+node, or an Ollama-compatible cluster behind one URL. Either way the work runs on your own hardware.
+
+**One Ollama node.** A machine with a GPU on the LAN, or this box itself if it has a GPU passed through.
+
+1. On the node, fetch the model: `ollama pull bge-m3`.
+2. Ollama listens only on `127.0.0.1` by default. For the mirror to reach a node on the LAN, run
+   `systemctl edit ollama` on the node, add the lines below, then `systemctl restart ollama`:
+   ```ini
+   [Service]
+   Environment="OLLAMA_HOST=0.0.0.0:11434"
+   Environment="OLLAMA_NUM_PARALLEL=4"
+   ```
+   `OLLAMA_NUM_PARALLEL` is how many requests the model serves at once; the rest wait in Ollama's queue. Ollama has no
+   authentication, so anyone who can reach the port can use it: limit port 11434 to the mirror's address in the
+   node's own firewall.
+3. On the mirror:
+   * In `site.env`, set `EMBEDDING_HOST=<node IPv4>` and `EMBEDDING_PORT=11434`, then apply with `install.sh`.
+   * In `mirror.yaml`, set `embedding_url: http://<node IPv4>:11434` and `embedding_concurrency` a little above
+     `OLLAMA_NUM_PARALLEL` (6 for 4). More only waits in Ollama's queue; fewer leaves the GPU idle between replies.
+   * No key file is needed.
+
+   **For Ollama on this box**, use `embedding_url: http://127.0.0.1:11434` and leave the embedding pair out of
+   `site.env`: the firewall already admits loopback. Do this only with a GPU. On the CPU, 41.6M passages take weeks.
+
+Ollama unloads a model after five idle minutes (`OLLAMA_KEEP_ALIVE`). A continuous run keeps it loaded. After a
+pause, the first requests wait while it loads again, which the run's retries absorb.
+
+**An Ollama-compatible cluster.** A router or load balancer in front of several Ollama nodes, presenting one URL. The
+mirror sends everything to that one URL and does not spread requests across nodes itself, so a cluster needs a single
+front end. What the cluster must do:
+
+* **Answer a batched request with one vector per input, in order.** Some routers have returned only the first vector
+  of a batch. The run stops rather than pad, and the check in step 1 below catches it before you start.
+* **Run the same bge-m3 build on every node**, so a passage gets the same vector whichever node embeds it. The
+  canary in [EVALUATION.md](EVALUATION.md) embeds one text many times and compares the results; run it again after
+  any node upgrade.
+* **Say "busy" with 429 or 503**, ideally with `Retry-After` in seconds. The run waits and retries each request for up
+  to 15 minutes. 500, 502 and 504, timeouts and dropped connections are retried the same way. 400, 401, 403 and 404
+  stop the run at once.
+
+Settings for a cluster:
+
+* `EMBEDDING_HOST` and `EMBEDDING_PORT` are the router's.
+* If the router authenticates its clients, issue one key for the mirror alone and write it to the key file (step 2
+  below).
+* If the router has a background-priority header, set it in `embedding_headers`, so the bulk run yields to
+  interactive traffic: for example `embedding_headers: {X-Priority: "3"}`.
+* Start at the defaults: 16 requests in flight and 8 texts per request. They were measured on a four-node router,
+  where more requests only queued and larger batches did not help ([EVALUATION.md](EVALUATION.md)). A smaller
+  cluster wants fewer requests in flight, about four per node.
+
+**Either way:**
+
+* Write `embedding_url` with the IPv4 address you gave as `EMBEDDING_HOST`. The firewall admits that one address; a
+  hostname works only if it resolves to it.
+* The model is bge-m3 at 1,024 dimensions, the one the evaluation measured. `embedding_model` and
+  `embedding_dimensions` can name another, but its quality is unmeasured, and it needs a new collection: a resume
+  refuses a model change.
+
+**Not supported:** servers that speak only the OpenAI-style `/v1/embeddings` API (vLLM, Text Embeddings Inference,
+LiteLLM and the like), and hosted embedding services.
+
+### Before the first run
 
 1. **Check the server answers one vector per text.** A server that returns fewer vectors than texts stops the run
    (by design, never padded), so try a two-text request first:
@@ -439,10 +505,11 @@ Before the first run:
    ```
    Only the embed unit loads this file. The key is sent as a bearer header and never appears in a setting, a log or
    the state file.
-3. **Set `embedding_url`** in `/etc/wiki-mirror/mirror.yaml` (the server's origin, e.g. `http://192.168.1.60:8080`;
+3. **Set `embedding_url`** in `/etc/wiki-mirror/mirror.yaml` (the server's origin, e.g. `http://192.168.1.60:11434`;
    the firewall must admit `wikimirror-sync` to it: `EMBEDDING_HOST` and `EMBEDDING_PORT` in `site.env`, applied
-   with `install.sh`). The other `embedding_*` keys have the measured defaults (16 requests in flight, 8 texts per
-   request); `embedding_headers` can carry a background-priority header such as `X-Priority: 3` if the server has
+   with `install.sh`; per setup, see [The embedding server](#the-embedding-server)). The other `embedding_*` keys have
+   the measured cluster defaults (16 requests in flight, 8 texts per request; lower the first for one Ollama node);
+   `embedding_headers` can carry a background-priority header such as `X-Priority: 3` if the server has
    one. Without `embedding_url` the command exits 2.
 4. **Give the container 32 GB of RAM** (`pct set <ctid> -memory 32768` on the host, live for an LXC) and **restart
    Qdrant to take its new cap** (`MemoryMax` is now 20G; `wiki-mirror update` installs the unit, then

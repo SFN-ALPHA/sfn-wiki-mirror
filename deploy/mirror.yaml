@@ -36,9 +36,9 @@
 #
 # The semantic index (W2): `wiki-mirror embed-now`. Off until embedding_url is set. The server's key
 # is EMBEDDING_API_KEY in /etc/wiki-mirror/embedding.env, never here (docs/OPERATIONS.md).
-# embedding_url: null                       # an Ollama-compatible server, e.g. http://192.168.1.60:8080
+# embedding_url: null                       # an Ollama node or Ollama-compatible cluster, e.g. http://192.168.1.60:11434
 # embedding_model: bge-m3
 # embedding_dimensions: 1024                # the model's vector length; a reply of any other stops the run
-# embedding_concurrency: 16                 # requests in flight: the measured knee of the reference server
+# embedding_concurrency: 16                 # requests in flight: the measured knee of a four-node cluster; one Ollama node: OLLAMA_NUM_PARALLEL + 2
 # embedding_batch: 8                        # texts per request
 # embedding_headers: {}                     # extra request headers, e.g. {X-Priority: "3"} for a background-priority router; not Authorization

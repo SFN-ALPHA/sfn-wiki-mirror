@@ -918,7 +918,7 @@ def test_check_site_the_example_with_one_value_changed_counts_as_edited(site: Si
         EXAMPLE.read_text(encoding="utf-8")
         .replace("# LAN_CIDR=", "LAN_CIDR=")
         .replace("# EMBEDDING_HOST=", "EMBEDDING_HOST=")
-        .replace("# EMBEDDING_PORT=8080", "EMBEDDING_PORT=9090")
+        .replace("# EMBEDDING_PORT=11434", "EMBEDDING_PORT=9090")
     )
     site.write(text)
     # The example's own LAN is 192.168.1.0/24, so the box (as the stub reports it) is on that LAN.

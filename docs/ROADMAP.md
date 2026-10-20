@@ -224,8 +224,8 @@ with hybrid on.
 
 1. **Egress from the container to an Ollama-compatible embedding server** (configured by URL). The firewall
    ruleset admits `wikimirror-sync` to the embedding server set in `/etc/wiki-mirror/site.env` when you give it
-   (`EMBEDDING_HOST` and `EMBEDDING_PORT`, both or neither; optional today because nothing uses an embedding server
-   yet; rendered into `deploy/nftables/` by the installer; check the installed ruleset has the rule with
+   (`EMBEDDING_HOST` and `EMBEDDING_PORT`, both or neither; optional, because only the embedding run uses them, and
+   Ollama on the box itself needs neither; rendered into `deploy/nftables/` by the installer; check the installed ruleset has the rule with
    `nft list ruleset`, and apply a change with `install.sh`). The embedding job runs as
    `wikimirror-sync`, like the other build stages.
 2. **An embedding-server key** for the mirror, with no other use (if the server requires one). It must live in a 0600 file readable by `wikimirror-sync` alone
