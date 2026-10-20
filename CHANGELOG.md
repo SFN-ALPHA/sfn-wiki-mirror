@@ -5,6 +5,11 @@ All notable changes are listed here, newest first. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-20
+
+The embedding run for the semantic index. Search still answers from the keyword index alone; hybrid search comes
+when the first full run has finished and been checked.
+
 ### Added
 
 - The semantic index's embedding run (W2, [D7](docs/DECISIONS.md#d7)): `wiki-mirror embed-now` embeds every
@@ -16,6 +21,15 @@ All notable changes are listed here, newest first. The format follows
 ### Changed
 
 - Qdrant's memory cap is 20G (the semantic index needs a 32 GB box).
+- The README leads with what the project is for, and compares it with live-API MCP servers and Kiwix.
+
+### Documented
+
+- How to set up the embedding server: one Ollama node, Ollama on the mirror box itself, or an Ollama-compatible
+  cluster. OpenAI-style `/v1/embeddings` servers and hosted embedding APIs are not supported.
+- What each interruption of an embedding run does, and how a run resumes.
+- The plan for the semantic catch-up: after a monthly build, embed only the passages whose text changed
+  ([docs/ROADMAP.md](docs/ROADMAP.md#the-semantic-catch-up)).
 
 ## [0.1.0] - 2026-10-19
 
@@ -46,5 +60,6 @@ Initial public release.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md).
 
-[Unreleased]: https://github.com/SFN-ALPHA/sfn-wiki-mirror/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/SFN-ALPHA/sfn-wiki-mirror/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/SFN-ALPHA/sfn-wiki-mirror/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/SFN-ALPHA/sfn-wiki-mirror/releases/tag/v0.1.0

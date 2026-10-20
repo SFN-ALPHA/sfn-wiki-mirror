@@ -19,7 +19,7 @@ as it likes: Wikipedia sees no traffic from the agent and applies no rate limit 
 | Replies | **JSON** (`application/json`), not an event stream |
 | Auth | `Authorization: Bearer <key>` on every request ([keys](API.md#client-keys)). A missing or wrong key gets HTTP `401` (a plain JSON error, not a JSON-RPC one) |
 | Required request headers | `Content-Type: application/json` and `Accept: application/json, text/event-stream` (the SDKs send both) |
-| Server identity | name `wikipedia-mirror`, version `0.1.0` |
+| Server identity | name `wikipedia-mirror`, version `0.2.0` |
 | SDK | Python `mcp` 2.x (pinned to 2.2.0 on the box; `mcp>=2.0` in `pyproject.toml`). The server is exercised in the tests with the SDK's own client in both of its protocol modes: the `initialize` handshake and per-request negotiation |
 | Request id | optional `X-Request-ID` header, [rules in API.md](API.md#request-ids), echoed on the response |
 | TLS | none. Plain HTTP on the LAN; the key is sent in the clear, so keep the port on a trusted network or put a TLS proxy in front |

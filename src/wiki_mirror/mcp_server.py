@@ -135,7 +135,7 @@ def build_mcp_door(config: MirrorConfig, served: ServedSnapshot) -> McpDoor:
     Returns:
         The endpoint to mount at `MCP_PATH` and the session manager to run.
     """
-    server = MCPServer("wikipedia-mirror", instructions=_INSTRUCTIONS, version="0.1.0")
+    server = MCPServer("wikipedia-mirror", instructions=_INSTRUCTIONS, version="0.2.0")
 
     @server.tool(
         name="wiki_search",

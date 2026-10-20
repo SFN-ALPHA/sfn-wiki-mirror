@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sfn-wiki-mirror"
-version = "0.1.0"
+version = "0.2.0"
 description = "Wikipedia mirror - a local, searchable, regularly synced English Wikipedia (package wiki_mirror, CLI wiki-mirror)"
 readme = "README.md"
 requires-python = ">=3.12"

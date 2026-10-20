@@ -1284,8 +1284,8 @@ setup_venv() {
         ok "created $VENV"
     fi
 
-    # Stamped with the commit it was installed from: the package version is fixed at 0.1.0,
-    # so pip cannot tell two commits apart, and "already satisfied" would otherwise leave
+    # Stamped with the commit it was installed from: the package version changes only at a
+    # release, so pip cannot tell two commits apart, and "already satisfied" would otherwise leave
     # yesterday's code installed. Non-editable on purpose - the services run an installed copy,
     # so a stray edit in the checkout cannot change what is running.
     local head stamp="$VENV/.installed-commit"
