@@ -1,6 +1,6 @@
 # Roadmap
 
-**Audience:** whoever plans the next piece of work. Status as of 2026-10-19. The phase names (W0 to W3) come from
+**Audience:** whoever plans the next piece of work. Status as of 2026-10-20. The phase names (W0 to W3) come from
 [DESIGN.md §7](DESIGN.md#7-phases) and [§12.8](DESIGN.md#128-phases-and-measurements); the decisions are in
 [DECISIONS.md](DECISIONS.md).
 
@@ -13,12 +13,20 @@
 | Nightly self-update | `update.sh` with deferral, format guard, rollback ([D4](DECISIONS.md#d4)) | Built 2026-10-17; opt-in for an installation (`--auto-update`), on for the maintainer's |
 | **Annotations** | What the parser drops today, kept beside the text: links, images, references, infobox fields, tables, math, quality signals and more; article reads return them | **Planned 2026-10-19**, [below](#article-annotations-and-the-reader); must be on the box before the 2026-11-02 build |
 | **Reader** | A thin web page on the LAN: search, results, article text with clickable links | **Planned 2026-10-19**, [below](#article-annotations-and-the-reader) |
-| **W2** | Semantic index, hybrid search, query-focused snippet | **In progress.** Cut decided 2026-10-19 ([D5](DECISIONS.md#d5)); the embedding run is built ([D7](DECISIONS.md#d7)); hybrid search, the fusion-weight check, the focused snippet and the post-rebuild catch-up remain |
-| **W3** | Monthly in-place updates | Designed ([DESIGN.md §12.6](DESIGN.md#126-the-monthly-update-w3)); not started |
+| **W2** | Semantic index, hybrid search, query-focused snippet | **In progress.** Cut decided 2026-10-19 ([D5](DECISIONS.md#d5)); the embedding run is built ([D7](DECISIONS.md#d7)); the first full run started 2026-10-20; the [semantic catch-up](#the-semantic-catch-up) (needed after the 2026-11-02 build), hybrid search, the fusion-weight check and the focused snippet remain |
+| **W3** | Monthly in-place updates | Designed ([DESIGN.md §12.6](DESIGN.md#126-the-monthly-update-w3)); not started; target the 2026-12-02 update |
 
-Until W3 lands the monthly timer runs a full build beside the live collection and swaps the alias, which should work
-but redoes everything each month. The first build was started by hand; the timer's first unattended run is due
-2026-11-02, so the unattended monthly rebuild is scheduled and not yet proven.
+Until W3 lands the monthly timer runs a full keyword build beside the live collection and swaps the alias, which
+should work but redoes everything each month. The first build was started by hand; the timer's first unattended run
+is due 2026-11-02, so the unattended monthly rebuild is scheduled and not yet proven. The semantic index is never
+rebuilt by the monthly job: the [catch-up](#the-semantic-catch-up) brings it up to the new month by embedding only
+the text that changed.
+
+**The order, and why.** Annotation capture changes the parser, so the 2026-11-02 build has to parse every article
+whatever happens; W3's carry-forward parse could not help that month. So November is a full keyword build (with
+annotations) plus the semantic catch-up, which is the piece that avoids a three-day re-embed. The rest of W3
+(carry-forward parse, validation, diff, the in-place keyword update and the audit) follows for 2026-12-02, after
+which every month touches only what changed.
 
 ## Article annotations and the reader
 
@@ -282,6 +290,67 @@ five minutes can unload bge-m3 and let small GPUs sleep, so a resume may wait a 
 * If a monthly snapshot arrives mid-build, the build lock holds the monthly job until the embed is done.
 
 **Disk.** 206 GB free on NVMe (2026-10-18) against about 85 GB of new float16 vectors: it fits.
+
+### The semantic catch-up
+
+**Goal.** After a monthly keyword build, bring the existing semantic collection up to the new month in place,
+embedding only passages whose text changed. **Done when** the 2026-11-02 snapshot is applied to
+`wikipedia_semantic_20261001` in hours rather than days, its index state's `applied_snapshot` reads `20261101`, and
+a sample of 1,000 random pages has the same point ids and `text_hash` in both collections. **Target: merged by
+2026-10-30**, beside annotation capture; run it after the 2026-11-02 build finishes.
+
+**Why it is needed.** Today `embed` after a new keyword build would start a second full collection named for the new
+month: about three days of embedding and another 85 GB, for a month in which perhaps 3 to 10% of the text changed.
+
+**What the first run already gives it.** Nothing about the run in progress changes. Every semantic point already
+carries what the catch-up compares: a point id worked out from the page id and chunk number
+(`records.passage_point_id`), and a payload with `page_id`, `revision_id`, `chunk` and the article's `text_hash`.
+The keyword build's cleanup touches only `wikipedia_lexical_*` collections and `index_lexical_*` state files, so it
+never deletes the semantic collection or its state, and it keeps the previous month's article store for one more
+build.
+
+**Design.**
+
+1. **`embed` decides by itself whether to catch up.** When a complete semantic collection exists, its settings
+   (model, dimensions, chunker, text form) match the configuration, and its `applied_snapshot` is older than the
+   keyword index's, `embed` catches it up in place. A new full collection is started only by an explicit
+   `embed --full`. If the settings differ, `embed` refuses and names the difference instead of quietly starting a
+   multi-day run.
+2. **The diff reads Qdrant, not last month's store.** It streams the new article store and the semantic
+   collection's payloads (`page_id`, `chunk`, `text_hash`, `revision_id`, scrolled in page-id order) side by side.
+   What the collection actually holds is the truth about what was embedded, so nothing depends on a file that may
+   have been pruned.
+3. **What changed, and what is done about it.**
+   * **Text changed** (`text_hash` differs) or **added**: cut the new text with the same chunker, embed it, upsert
+     by point id, and delete that page's chunks beyond the new count.
+   * **Removed**: delete its points by a `page_id` filter.
+   * **Renamed with the same text**: the embedded text starts with the title (`chunk.indexed_text(title)`), and
+     `text_hash` covers the body only, so a moved page keeps its hash but its vectors carry the old title.
+     Compare titles against the previous month's store, which the keyword build keeps for one more month, and
+     re-embed a page whose title changed. If that store is gone, re-embed every page whose `revision_id` moved
+     (a few hundred thousand at most) and log the count.
+   * **New revision, same text and title**: update `revision_id` in the payload only (no embedding), so both
+     collections agree.
+4. **Resumable like the full run.** The state file records the target month and the last page id applied;
+   `applied_snapshot` moves only when the whole month is in. A crash resumes from the checkpoint, and
+   re-applying a page is idempotent because point ids are fixed.
+5. **A safety valve.** If more than 25% of articles show changed text, stop before embedding anything and say
+   so. That many changes means the text itself changed (a parser or sanitizer change), and an in-place re-embed of
+   most of the index should be a deliberate `embed --full`, not a side effect.
+6. **Pruning keeps what the semantic index reflects.** `_prune_local` also keeps the article store named by
+   the semantic collection's `applied_snapshot`, so a keyword build can never delete the store that a not yet
+   caught-up semantic index pairs with.
+7. **Run by hand the first time.** After the 2026-11-02 build, the operator runs `wiki-mirror embed-now` and
+   reads the counts it logs. W3 chains it after the keyword update so it runs unattended.
+
+**Cost.** Expected churn is 0.3 to 1 million passages a month ([DESIGN.md §12.6](DESIGN.md#126-the-monthly-update-w3)),
+which is about 30 minutes to two hours at the 175 passages/s measured on the first run.
+
+**What it relies on.** Annotation capture must leave the stored text byte-identical (Part 1 above). If it did not,
+every `text_hash` would change and the safety valve would stop the catch-up.
+
+**Until the catch-up has run, nothing serves stale vectors.** Hybrid search switches on only when the semantic
+collection covers `applied_snapshot` (W2 item 5), so in the meantime keyword search answers alone.
 
 ## W3: monthly in-place updates
 
