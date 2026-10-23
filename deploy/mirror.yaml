@@ -35,10 +35,17 @@
 # clients_file: /etc/wiki-mirror/clients.json   # other agents' key hashes: wiki-mirror key add|list|revoke
 #
 # The semantic index (W2): `wiki-mirror embed-now`. Off until embedding_url is set. The server's key
-# is EMBEDDING_API_KEY in /etc/wiki-mirror/embedding.env, never here (docs/OPERATIONS.md).
+# is EMBEDDING_API_KEY in /etc/wiki-mirror/embedding.env, never here (docs/OPERATIONS.md). The same
+# embedding_url serves the API's semantic and hybrid searches (D10): the API embeds each question
+# itself, with a key of its own, EMBEDDING_API_KEY in /etc/wiki-mirror/mirror.env (a different key
+# from the embed run's, so either can be revoked alone; none at all for a server that wants none).
+# Write the URL with the IPv4 address and port you gave as EMBEDDING_HOST and EMBEDDING_PORT in
+# site.env: the firewall admits the API to that one address and port only, and it cannot look a
+# name up.
 # embedding_url: null                       # an Ollama node or Ollama-compatible cluster, e.g. http://192.168.1.60:11434
 # embedding_model: bge-m3
 # embedding_dimensions: 1024                # the model's vector length; a reply of any other stops the run
 # embedding_concurrency: 16                 # requests in flight: the measured knee of a four-node cluster; one Ollama node: OLLAMA_NUM_PARALLEL + 2
 # embedding_batch: 8                        # texts per request
 # embedding_headers: {}                     # extra request headers, e.g. {X-Priority: "3"} for a background-priority router; not Authorization
+# query_embedding_headers: {}               # the same, for the API's own question embeddings only. Separate on purpose: embedding_headers lowers the bulk run's priority, and a person waiting on a search should not get that; leave it empty unless the server has a priority you want for searches. Not Authorization

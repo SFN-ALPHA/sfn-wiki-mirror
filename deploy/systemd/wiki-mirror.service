@@ -6,7 +6,9 @@
 # key from mirror.env, each other agent's from clients.json (hashes; `wiki-mirror key add|revoke`,
 # picked up within seconds, no restart).
 # It reads the article store, build state and clients.json from disk and queries Qdrant over
-# loopback; it never writes data and has no egress (nftables drops anything it tries to open).
+# loopback; it never writes data and has one egress only: the optional embedding server's address
+# and port, to embed the question of a semantic or hybrid search (docs/DECISIONS.md D10). nftables
+# refuses anything else it tries to open, DNS included.
 # A monthly rebuild is picked up by itself: no restart (it follows the Qdrant alias).
 #
 # Runs as `wikimirror`, not the build user: this process faces the network and renders text
@@ -43,8 +45,10 @@ Group=wikimirror
 # flag (multiprocessing re-passes it) and the parent's sys.path - see the build unit.
 WorkingDirectory=/
 ExecStart=/opt/wiki-mirror/.venv/bin/python -I -m wiki_mirror serve
-# WIKI_MIRROR_API_KEY. systemd reads this file as root before dropping privileges, which
-# is why it can be root:root 0600 and unreadable to the service itself.
+# WIKI_MIRROR_API_KEY, and the API's own key for the embedding server, EMBEDDING_API_KEY
+# (optional; not the embed run's, which is in embedding.env). systemd reads this file as root
+# before dropping privileges, which is why it can be root:root 0600 and unreadable to the
+# service itself.
 EnvironmentFile=/etc/wiki-mirror/mirror.env
 UMask=0027
 

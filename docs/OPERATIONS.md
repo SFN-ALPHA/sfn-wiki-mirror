@@ -189,7 +189,7 @@ lives in `/etc/wiki-mirror/site.env` (root:root 0644; no secret belongs in it), 
 | Key | Required | What it is | Example |
 |---|---|---|---|
 | `LAN_CIDR` | yes | The IPv4 network your clients and this box share. SSH and the API port are admitted from it, and DNS, NTP and ping go to it. It must be a private network (see below), this box must have an address inside it, and the resolver in `/etc/resolv.conf` must be inside it. | `192.168.1.0/24` |
-| `EMBEDDING_HOST` | no | IPv4 address of the embedding server for the semantic index's embedding run: an Ollama node, or the front end of an Ollama-compatible cluster ([The embedding server](#the-embedding-server)). It opens one egress rule: the only LAN host the build user (`wikimirror-sync`) may open a connection to. Leave it out if you will not run the embedding, or if Ollama runs on this box (loopback is already admitted). | `192.168.1.60` |
+| `EMBEDDING_HOST` | no | IPv4 address of the embedding server, for the semantic index's embedding run and for the API's `semantic` and `hybrid` searches: an Ollama node, or the front end of an Ollama-compatible cluster ([The embedding server](#the-embedding-server)). It opens two egress rules, each for this one address and port: the only LAN host the build user (`wikimirror-sync`) may open a connection to, and the only connection of any kind the API user (`wikimirror`) may open ([Turning on semantic and hybrid search](#turning-on-semantic-and-hybrid-search)). Leave it out if you will not run the embedding or those searches, or if Ollama runs on this box (loopback is already admitted to every user). | `192.168.1.60` |
 | `EMBEDDING_PORT` | no | That server's TCP port (Ollama's own is 11434). Give both `EMBEDDING_HOST` and `EMBEDDING_PORT`, or neither; there is no default. | `11434` |
 
 The file is plain `KEY=value` lines, one per key, no quotes and no spaces; blank lines and whole-line `#` comments
@@ -335,12 +335,12 @@ $ curl -s -o /dev/null -w '%{http_code}\n' http://<mirror-host>:8300/v1/wiki/hea
 
 | Command | What it does |
 |---|---|
-| `wiki-mirror status` | Services, the mirror's health and, when it is `degraded`, each reason as a red line; the semantic index; the maintenance job's last run, Qdrant's restarts and memory, and any collection the job holds; the build unit, the three timers, the checkout's commit, the firewall counters. Exits non-zero if the API does not answer. |
+| `wiki-mirror status` | Services, the mirror's health and, when it is `degraded`, each reason as a red line; the semantic index, the search modes a search can use now and, when `semantic` and `hybrid` are off, why; the maintenance job's last run, Qdrant's restarts and memory, and any collection the job holds; the build unit, the three timers, the checkout's commit, the firewall counters. Exits non-zero if the API does not answer. |
 | `wiki-mirror build-now` | Starts the build unit in the background and returns. Resets the retry limit. Refuses if a build is running. |
 | `wiki-mirror embed-now` | Starts the semantic index's embedding run ([below](#the-semantic-index-w2-the-first-embedding-run)), or resumes an interrupted one, in the background and returns. Resets the retry limit. Refuses if a run is going. |
 | `wiki-mirror logs [api\|build\|embed\|maintain\|qdrant]` | Follows a unit's journal (default `api`). For an idle build, embed or maintenance unit it prints the last 100 lines instead. |
 | `wiki-mirror update [--accept-format-change]` | The update ([below](#the-nightly-update)). |
-| `wiki-mirror search "<query>" [limit]` | A real query through the real API, default 5 results. |
+| `wiki-mirror search "<query>" [limit] [--mode lexical\|semantic\|hybrid]` | A real query through the real API, default 5 results, in the keyword mode unless you ask for another. An unknown mode is refused before anything is sent. A `semantic` or `hybrid` search the service cannot serve prints its reason and exits 1 ([when a search says `semantic_unavailable`](#when-a-search-says-semantic_unavailable)); it never falls back to keywords. |
 | `wiki-mirror key add <name>` / `list` / `revoke <name>` | Agent keys ([API.md](API.md#client-keys)). |
 
 The Python entry point behind it is `python -m wiki_mirror <download|parse|index|build|embed|maintain|serve|status|key>`.
@@ -361,8 +361,11 @@ graph (N of M indexed)` while Qdrant works on it, which is normal after an embed
 restarts after a failure at 0 or long ago, its memory well under its cap, and no problem lines; all three
 timers enabled (the update timer only if you chose it); a `last update` row whose outcome is `updated` or
 `current`; and **`service_refused` at 0**.
-Anything above 0 there means the API or Qdrant user tried to open an outbound connection, which neither ever
-should: read the kernel log on the Proxmox host (`journalctl -k | grep wiki-mirror`).
+Anything above 0 there means Qdrant tried to open an outbound connection, which it never should, or the API user
+tried one other than to the embedding server (its one permitted connection, and only on a box that names one in
+`site.env`): read the kernel log on the Proxmox host (`journalctl -k | grep wiki-mirror`). The Semantic index section
+also lists the search modes a search can use now (`lexical, semantic, hybrid` once the semantic index is complete and
+of the snapshot being served) and, if `semantic` and `hybrid` are off, the reason.
 
 Other checks:
 
@@ -432,8 +435,9 @@ for the 1st.
 
 The keyword index answers search alone until the semantic index exists. `wiki-mirror embed-now` embeds every passage
 through an Ollama-compatible embedding server into a second Qdrant collection, `wikipedia_semantic_<born>`. It takes
-about two days for the 41.6M passages. Nothing reads the new collection yet (hybrid search is later work), so the
-API and the keyword index are untouched while it runs. It needs a finished keyword build first (it embeds the store
+about two days for the 41.6M passages. The API reads the new collection only once the run is complete and a search
+asks for `semantic` or `hybrid` ([Turning on semantic and hybrid search](#turning-on-semantic-and-hybrid-search)),
+so the API and the keyword index are untouched while it runs. It needs a finished keyword build first (it embeds the store
 that build serves), and the run stops with "there is no lexical collection to embed from" if there is none.
 
 ### The embedding server
@@ -493,8 +497,10 @@ Settings for a cluster:
 
 **Either way:**
 
-* Write `embedding_url` with the IPv4 address you gave as `EMBEDDING_HOST`. The firewall admits that one address; a
-  hostname works only if it resolves to it.
+* Write `embedding_url` with the IPv4 address and the port you gave as `EMBEDDING_HOST` and `EMBEDDING_PORT`. The
+  firewall admits that one address and port. For the embedding run a hostname works only if it resolves to it; for
+  the API's own searches ([below](#turning-on-semantic-and-hybrid-search)) it does not work at all, because the
+  API user is refused DNS along with everything else, so the URL must hold the address itself.
 * The model is bge-m3 at 1,024 dimensions, the one the evaluation measured. `embedding_model` and
   `embedding_dimensions` can name another, but its quality is unmeasured, and it needs a new collection: a resume
   refuses a model change.
@@ -553,7 +559,8 @@ What it reads and writes:
   `building its search graph (N of M indexed)` until `ready`), or `curl -s localhost:6333/collections/wikipedia_semantic`
   until its `status` is `green`. The build is Qdrant's own and survives a restart only with help: a restart in the
   middle leaves the collection `grey` (paused) and the maintenance job resumes it within 15 minutes ([The
-  maintenance job](#the-maintenance-job)). Search does not use the collection yet.
+  maintenance job](#the-maintenance-job)). Search uses the collection only for `semantic` and `hybrid` requests
+  ([D10](DECISIONS.md#d10)).
 * **It holds the build lock for the whole run**, so the monthly build waits (exits 1, "a build is already running")
   until the embedding is done, and `wiki-mirror update` defers the same way.
 * **A failure does not turn health `degraded`:** the embed stage never writes the build state.
@@ -611,12 +618,108 @@ http://127.0.0.1:6333/collections/wikipedia_semantic_<born>`) and its state file
   the articles whose text changed is not built (it is the semantic half of the in-place update, W3, in
   [ROADMAP.md](ROADMAP.md)). Until then, run `embed-now` only when you want that cost, and delete the superseded
   semantic collection and its state file by hand when you no longer need it.
-* **No hybrid search.** The collection is built and the alias points at it, but no query reads it.
+* **Hybrid search is not the default.** `semantic` and `hybrid` are opt-in modes of a search ([D10](DECISIONS.md#d10)):
+  `lexical` stays the default until the golden set and the fusion-weight check have run on the full index. After each
+  monthly build they answer `503 semantic_unavailable` until the catch-up above exists, because the semantic index is
+  then of the month before.
 * **Semantic search latency depends on the page cache.** Measured after the rebuild (over loopback, `limit` 10): about
   45 ms once cached, about half a second the first time a query touches the files, and seconds to tens of seconds
   right after a restart or with a cold cache. A first-time query reads about 290 MB from disk. The first lever, fewer
   and larger segments, was decided on 2026-10-23 ([D9](DECISIONS.md#d9)) and its effect is to be measured when the
   merge has finished; the others, none done yet, are listed in [D8](DECISIONS.md#d8).
+
+## Turning on semantic and hybrid search
+
+A search takes a `mode` ([API.md](API.md#post-v1wikisearch)): `lexical` (the default), `semantic` or `hybrid`. The last
+two need the question embedded, and **the API process does that itself**, by calling the embedding server's
+`/api/embed` ([D10](DECISIONS.md#d10)). So the API user, which is otherwise refused every connection that leaves the
+box, is admitted to the embedding server's address and port and to nothing else, and it holds a key for that server
+that is its own. `lexical` does not notice any of this. Turning the other two on is a security change you make on
+purpose, in five steps; [SECURITY.md](../SECURITY.md) says what it costs.
+
+**Before you start**, the semantic index must be complete (`wiki-mirror status`, Semantic index: `embedding run
+complete`), and `embedding_url` in `mirror.yaml` and the pair `EMBEDDING_HOST` / `EMBEDDING_PORT` in `site.env` must
+be set as for the embedding run ([The embedding server](#the-embedding-server)). With Ollama on this box
+(`embedding_url: http://127.0.0.1:11434`) loopback is already admitted to every user, so there is no firewall step
+and no key: skip steps 1 to 3.
+
+1. **Create a key of its own for the API on the embedding server.** Make it a second key, named so you can tell it
+   apart (for example `wiki-mirror-api`), and not the one in `embedding.env`. The bulk run and the API are different
+   processes with different exposure (the API is what the LAN talks to), so each gets its own key and either can be
+   rotated or revoked without stopping the other. Allow it to call `/api/embed` and nothing else if your server can
+   say so. A server with no authentication (a bare Ollama node) has no keys: skip this step and the next.
+2. **Put the key in `mirror.env`**, the API unit's `EnvironmentFile`. In a root shell, so the key never reaches a
+   command line or a log:
+   ```bash
+   # read -r -s -p 'Embedding key for the API: ' k; echo
+   # ( umask 077; printf 'EMBEDDING_API_KEY=%s\n' "$k" >> /etc/wiki-mirror/mirror.env ); unset k
+   # stat -c '%U:%G %a' /etc/wiki-mirror/mirror.env      # must read root:root 600
+   ```
+   It is appended, never overwritten: the file holds the primary API key too. If it already has an
+   `EMBEDDING_API_KEY` line, edit that line instead of adding a second. The file stays root:root 0600: systemd reads it
+   as root before it drops to `wikimirror`, so the service user cannot open it from disk. The API sends the key as a
+   bearer header to `embedding_url` and nowhere else, and it is never in a setting, a log, an error or a reply.
+3. **Apply the firewall.** Check that `embedding_url` holds the same IPv4 address and port as `EMBEDDING_HOST` and
+   `EMBEDDING_PORT`, as an address and not a name: the API user is refused DNS too, so a name cannot be looked up.
+   Then render and apply the ruleset, because `wiki-mirror update` reports a changed firewall but never applies one:
+   ```bash
+   # /opt/wiki-mirror/deploy/install.sh --dry-run
+   # /opt/wiki-mirror/deploy/install.sh
+   # /opt/wiki-mirror/deploy/install.sh --show-firewall | grep 'skuid "wikimirror" '    # the API's one rule
+   ```
+   The last command prints `meta skuid "wikimirror" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept` (the
+   defines above it hold your address and port). If it prints nothing, `site.env` has no embedding pair. The installer
+   prints one line, and still succeeds, when `site.env` names an embedding server and `mirror.yaml` an
+   `embedding_url` but `mirror.env` has no `EMBEDDING_API_KEY` line; with a server that wants no key, ignore it. It
+   never writes, rewrites or prints that line, and keeps `mirror.env` root:root 0600.
+4. **Restart the API**, which reads its environment at start: `systemctl restart wiki-mirror`.
+5. **Check it.**
+   ```bash
+   # wiki-mirror search --mode semantic "who proved that there are infinitely many primes"
+   # wiki-mirror search --mode hybrid "Albert Einstein"
+   # wiki-mirror status          # Semantic index: "search modes: lexical, semantic, hybrid"; service_refused still 0
+   ```
+   The searches print `mode semantic` and `mode hybrid` with their results. The score on each result is its mode's
+   own (a keyword score, a similarity, a fused rank sum of about 0.03) and is not comparable across modes. If a
+   search prints `error: semantic_unavailable: <reason>` instead, the reason says what is missing: see [the table
+   below](#when-a-search-says-semantic_unavailable).
+
+**Optional: `query_embedding_headers`** in `mirror.yaml` adds request headers to the API's question embeddings only.
+It is separate from `embedding_headers` because that one often lowers the bulk run's priority at the server (for
+example `X-Priority: 3`), which a person waiting on a search should not get. Leave it empty unless the server has a
+priority you want for searches. `Authorization` is refused there; the key comes from the environment.
+
+**Rotating or revoking the key.** Rotate: create a new key on the server, edit the line in `mirror.env`,
+`systemctl restart wiki-mirror`, then revoke the old one on the server. Revoke without replacing: delete it on the
+server; `semantic` and `hybrid` then answer that the server refused the key, and `lexical` carries on. **Taking the API's
+access away again:** remove the `EMBEDDING_HOST` / `EMBEDDING_PORT` pair from `site.env` and run `install.sh`. Both
+embedding rules go (the build user's too, so `embed-now` stops working until you put the pair back), the API user is
+refused everything again, and `semantic` and `hybrid` answer that the server could not be reached.
+
+### When a search says `semantic_unavailable`
+
+A `semantic` or `hybrid` search that cannot be served is `503 semantic_unavailable` with its reason in `detail`, and
+`wiki-mirror search` prints it as `error: semantic_unavailable: <reason>`. It is never answered with keyword results
+under another mode's name. `lexical` keeps working through all of these. The reasons, in the order the service checks
+them:
+
+| The reason says | What it means and what to do |
+|---|---|
+| `there is no semantic index yet (the alias wikipedia_semantic does not exist; ...)` | No embedding run has finished. `wiki-mirror embed-now` ([above](#the-semantic-index-w2-the-first-embedding-run)). |
+| `the semantic index <name> has no readable state (...)` | `state/index_semantic_<born>.json` is missing or unreadable. See the failure-modes row for "has no usable state". |
+| `the semantic index <name> is still being built (its embedding run is not done)` | Wait for the run: `wiki-mirror logs embed`. |
+| `the semantic index is of snapshot <A>, the articles served are of <B>; the semantic catch-up brings it up to date` | The intended state after each monthly build until the catch-up exists ([What is not built yet](#what-is-not-built-yet)). Nothing is wrong and nothing to fix; use `lexical` meanwhile. |
+| `the semantic index <name> was built with a different chunker than this code's, ...` | The code that cuts passages changed since the embedding run. Its passage numbers no longer line up, so it is refused. A new `embed-now` starts a new full collection (about two days). |
+| `the embedding server is not configured (embedding_url in mirror.yaml)` | Set `embedding_url`, then `systemctl restart wiki-mirror`. |
+| `the semantic index has not been checked for this snapshot yet; try again shortly` | The service swapped snapshots a moment ago. Ask again. |
+| `the embedding server could not be reached` | Refused, reset, or the name did not resolve. First `nft list counters`: if `service_refused` rises, the API tried a destination the firewall refuses, and the Proxmox host's `journalctl -k \| grep service-refused` names it; if it is not the embedding server's address and port, `embedding_url` holds a name or another port. Then `install.sh --show-firewall \| grep 'skuid "wikimirror" '` should print the rule (nothing means no pair in `site.env`, or `install.sh` was not run again). Last, the server itself: is it up, and does it listen on that port? |
+| `the embedding server did not answer within 15 s` | The server is busy or its model is loading (a cold load took about 1.5 s on the reference box). There are no retries, by design: ask again. If it persists the server is overloaded. |
+| `the embedding server refused the key (check EMBEDDING_API_KEY in the API's mirror.env)` | A 401 or 403. The key is wrong, revoked, or missing for a server that now wants one (steps 1 and 2), or the unit was not restarted after the edit. The message never holds the key. |
+| `the embedding server answered <status>` | Another HTTP status. A 404 is usually the model: the question is embedded with the model the semantic index recorded (`bge-m3`), and that model must be on the server. A 5xx is the server's own trouble. |
+| `the embedding server answered something that is not JSON`, `... returned N vectors for 1 inputs`, `... a vector that is not 1024 numbers long`, `... a vector with a non-finite or other non-number` | The server is not Ollama-compatible, answers for another model, or is behind a front end that mangles the reply. The check in [Before the first run](#before-the-first-run) (a two-text request) shows the shape. |
+
+The service logs each one as `semantic_unavailable` with the request id, the client, the mode and a short kind
+(`unpaired`, `timeout`, `unreachable`, `rejected`, `status`, `bad_reply`), never the question or a key.
 
 ## The maintenance job
 
@@ -932,20 +1035,28 @@ caps it, and a test compares the two). Upgrade the server and the client togethe
 ## Network
 
 Input is SSH and :8300 from the site's LAN (`LAN_CIDR` in [`site.env`](#4-the-site-file)), nothing else. Output is
-per user: `wikimirror-sync` gets tcp 443
-to the internet, meaning anywhere except the private and shared ranges (10/8, 172.16/12, 192.168/16, 100.64/10),
-so the parse job, which handles editable web content, cannot reach a router or NAS admin page on the LAN
-(Enterprise and the S3 bucket its downloads redirect to cannot be named by address) and, if you set
-`EMBEDDING_HOST` and `EMBEDDING_PORT` in `site.env`, that one embedding server; root gets 80/443 (PyPI, GitHub),
-git-over-SSH to GitHub's published ranges (for an SSH clone) and DHCP renewals (udp 68 to
-67, LAN only); `_apt` gets tcp 80/443 over IPv4; `wikimirror` and `qdrant` get nothing. DNS goes to the LAN resolver
-only.
+per user, because the destinations cannot be listed. Replies to connections already open and loopback (Qdrant, a
+local Ollama) are admitted before any of this, to every user:
+
+| User | May open | Why |
+|---|---|---|
+| `wikimirror` (the API) | When `site.env` names an embedding server: tcp to that one address and port, and nothing else. Without one: nothing. It is refused DNS and NTP too, so it cannot look a name up | The API embeds the question of a `semantic` or `hybrid` search itself ([D10](DECISIONS.md#d10), [Turning on semantic and hybrid search](#turning-on-semantic-and-hybrid-search)). A compromised API process can reach that one server with its key and no other host |
+| `qdrant` | Nothing, with no exception | It is reached over loopback and dials nothing |
+| `wikimirror-sync` (download, parse, index, embed, maintain) | tcp 443 to the internet, meaning anywhere except the private and shared ranges (10/8, 172.16/12, 192.168/16, 100.64/10); and, when `site.env` names an embedding server, tcp to that one address and port | The parse job handles editable web content, so it cannot reach a router or NAS admin page on the LAN (Enterprise and the S3 bucket its downloads redirect to cannot be named by address) |
+| `root` | tcp 80/443 anywhere (PyPI, GitHub), git-over-SSH to GitHub's published ranges (for an SSH clone), DHCP renewals (udp 68 to 67, LAN only) | Installs and updates; it parses nothing an attacker edits |
+| `_apt` | tcp 80/443 over IPv4 | `apt` fetches as its own sandbox user |
+| everyone else | DNS and NTP to the LAN resolver, ping to the LAN | Not given to `wikimirror` or `qdrant`: their refusals come first |
+
+The API's rule and the build user's rule come from the same two lines in `site.env`, so a site without them has
+neither. The `wikimirror` and `qdrant` refusals sit above every other accept except that one rule, on purpose, so
+that no later rule can widen what those two may do.
 
 **Refused is rejected, not dropped.** Everything the output chain does not admit is refused with an immediate
 error (a TCP reset or an ICMP admin-prohibited) after being counted (`out_refused`, `service_refused`) and,
 rate-limited, logged with the prefix `wiki-mirror-egress-refused` (or `...-service-refused` for `wikimirror`
 and `qdrant`; `journalctl -k | grep service-refused` names the destination). A silent drop would turn a blocked
-connection into a hang for the whole connect timeout. Input stays a drop.
+connection into a hang for the whole connect timeout. Input stays a drop. **`service_refused` should stay at 0:** for
+the API user it counts any connection except the one to the embedding server, for Qdrant any at all.
 
 ## Failure modes and recovery
 
@@ -963,6 +1074,8 @@ connection into a hang for the whole connect timeout. Input stays a drop.
 | Embed stops "wikipedia_semantic_... exists but has no usable state" | The collection is there but `state/index_semantic_<born>.json` is missing, unreadable or another snapshot's. The run will not delete two days of vectors on a guess | Restore the state file from a backup of `/var/lib/wiki-mirror/state/` if you have one. Otherwise start over: `curl -X DELETE http://127.0.0.1:6333/collections/wikipedia_semantic_<born>`, then `wiki-mirror embed-now`. |
 | Embed stops "was started with different settings (chunker / model / dimensions / text form ...)" | The embedding settings or the code changed since the collection was started, so new vectors would not mix with the old | Put the setting back (`embedding_model`, `embedding_dimensions` in `mirror.yaml`) and `wiki-mirror embed-now`, or accept the cost of starting over: delete the collection and its state file, as in the previous row. |
 | Embed logs "the checkpoint at page id N ... does not match Qdrant" | Qdrant holds fewer (or more) points than the state recorded, usually after a power loss or host crash | Nothing: the run steps its checkpoint back and re-embeds from there. See [Interruptions and resuming](#interruptions-and-resuming). Repeated every restart means Qdrant keeps losing data; check the disk and `wiki-mirror logs qdrant`. |
+| `wiki-mirror search --mode semantic` (or `hybrid`) prints `error: semantic_unavailable: <reason>` | The service cannot serve that mode and says why: no usable semantic index for the snapshot served (normal after each monthly build, until the catch-up), or the embedding server could not embed the question | The reason is one of a fixed list: [When a search says `semantic_unavailable`](#when-a-search-says-semantic_unavailable). `lexical` is unaffected. |
+| `service_refused` is above 0 in `wiki-mirror status`, after semantic search was turned on or the embedding server moved | The API user tried a connection the firewall refuses: usually `embedding_url` holds a hostname (the API cannot resolve one) or another port than `EMBEDDING_PORT`, or the ruleset was not re-applied after `site.env` changed. Anything else Qdrant or the API opens is a compromise until shown otherwise | On the Proxmox host `journalctl -k \| grep service-refused` names the destination. If it is the embedding server's address, write `embedding_url` with the address and port in `site.env` and `systemctl restart wiki-mirror`; if the rule is missing, run `install.sh` ([Turning on semantic and hybrid search](#turning-on-semantic-and-hybrid-search), step 3). If it is anywhere else, treat the API process as compromised. |
 | Build fails "not enough free disk to create ..." | Less than `min_free_disk_gb` (20) free when it went to create a store or collection | `df -h /`; free space (see "no space" below) or lower the floor in `mirror.yaml` if you judge it too high; `wiki-mirror build-now`. |
 | Parse fails "(N corrupt files deleted; download again)" | A snapshot chunk was truncated or corrupt (an interrupted download, an NFS fault) | Nothing to repair: the build deleted the bad file and its `.etag`. `wiki-mirror build-now` downloads those chunks again (they count against the monthly budget). Repeats on the same chunk point at the NAS. |
 | Parse fails "holds a different snapshot" or "is already built ... from a different chunk list" | The store of that date is finished, and Enterprise now lists different chunks for it | The build will not mix two versions. Delete that date's store (`/var/lib/wiki-mirror/articles/<identifier>_<date>.db`) only if it is not the serving or the previous one, then `wiki-mirror build-now`. |

@@ -46,6 +46,20 @@ Non-obvious constraints:
   and the snippet all come from one snapshot and the answer is internally consistent. The old
   collection is still there to be asked: a build keeps the one it replaced
   (`index._swap_alias`).
+* **The semantic index is paired with the served store the same way, on the same cadence, and
+  never raises.** After each look at the lexical alias, `_follow_semantic` follows the
+  `wikipedia_semantic` alias and gives the served `WikiSearch` either a `SemanticBinding` or a
+  plain reason why not. The semantic index is usable only when all of these hold: the alias
+  exists; its state file is readable and `complete`; its `applied_snapshot` is the served
+  store's; it was cut by this code's chunker; and `embedding_url` is set. Otherwise `semantic`
+  and `hybrid` searches answer 503 `semantic_unavailable` with that reason, never keyword
+  results. This matters at the monthly build: the lexical index moves to the new snapshot at
+  once and the semantic one stays on the old until the catch-up (docs/ROADMAP.md), and a
+  semantic hit's snippet would be cut from the wrong month's text. The pairing reads only local
+  state and Qdrant and never calls the embedding server, so a down embedding server cannot
+  slow a look or turn a pairing off: it fails the one search that needs it. A semantic problem
+  is not `problem`: nothing depends on the semantic index by default, so health stays `ok`.
+  If Qdrant cannot be asked, the previous verdict stands (as for the lexical alias).
 * **The index must have been cut by this code's chunker.** The index state a build leaves
   records `index.chunker_fingerprint()`; when the served collection's differs from the running
   code's, passage numbers no longer line up with the stored text and snippets would be cut from
@@ -60,22 +74,27 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 
+import httpx
 from qdrant_client import QdrantClient
 
 from wiki_mirror.config import MirrorConfig
+from wiki_mirror.embed import ALIAS as SEMANTIC_ALIAS
+from wiki_mirror.embed import semantic_index_info
 from wiki_mirror.index import (
     aliased_collection,
     applied_snapshot,
     chunker_fingerprint,
     indexed_chunker,
 )
-from wiki_mirror.search import WikiSearch
+from wiki_mirror.query_embed import QueryEmbedder
+from wiki_mirror.search import SemanticBinding, WikiSearch
 from wiki_mirror.store import ArticleStore, StoreError
 
 __all__ = [
@@ -94,6 +113,22 @@ ALIAS_RECHECK_SECONDS = 30.0
 
 #: What `ServedSnapshot.problem` says when the served index was cut by another chunker.
 _CHUNKER_PROBLEM = "the served index was built with a different chunker than this code's"
+
+#: Why semantic search is off when Qdrant could not be asked about the semantic alias and there is
+#: no earlier verdict to keep.
+_SEMANTIC_QDRANT_DOWN = "Qdrant could not be asked where the semantic alias points"
+
+
+@dataclass(frozen=True)
+class _SemanticPairing:
+    """A semantic collection usable with the snapshot being served, and what to embed with."""
+
+    #: The concrete collection the alias pointed at (`wikipedia_semantic_<born>`).
+    collection: str
+    #: The model and vector length the collection's state records: what a question is embedded
+    #: with, not the settings' `embedding_model` (`query_embed`).
+    model: str
+    dimensions: int
 
 
 @dataclass(eq=False)
@@ -159,6 +194,8 @@ class ServedSnapshot:
         *,
         clock: Callable[[], float] = time.monotonic,
         refresh_seconds: float = ALIAS_RECHECK_SECONDS,
+        environ: Mapping[str, str] | None = None,
+        embed_transport: httpx.BaseTransport | None = None,
     ) -> None:
         """Hold nothing yet; the first `lease()` or `refresh()` opens what the alias names.
 
@@ -167,16 +204,24 @@ class ServedSnapshot:
             client: The Qdrant client, asked where the alias points and given to each search.
             clock: Monotonic seconds, for the recheck interval; tests inject theirs.
             refresh_seconds: Longest between two looks at the alias.
+            environ: The process environment, where the API's own `EMBEDDING_API_KEY` for query
+                embedding is read; `os.environ` when None. Tests inject theirs.
+            embed_transport: Test seam for the query embedding's HTTP. Never set in production.
         """
         self._config = config
         self._client = client
         self._clock = clock
         self._interval = refresh_seconds
+        self._environ: Mapping[str, str] = os.environ if environ is None else environ
+        self._embed_transport = embed_transport
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
         self._serving: Serving | None = None
         self._alias: str | None = None
         self._problem: str | None = None
+        # The last semantic verdict and the snapshot it was given for: a pairing, or the reason
+        # there is none. Touched only under the refresh lock, so it needs no other.
+        self._semantic_verdict: tuple[Serving, _SemanticPairing | str] | None = None
         self._closed = False
         # Negative infinity: the first request always looks.
         self._next_check = float("-inf")
@@ -231,7 +276,7 @@ class ServedSnapshot:
         """
         with self._refresh_lock:
             self._next_check = self._clock() + self._interval
-            self._follow_alias()
+            self._follow_aliases()
 
     def close(self) -> None:
         """Stop serving; the open store is closed as soon as no request is using it."""
@@ -254,9 +299,18 @@ class ServedSnapshot:
             # Set before the work, so a failing look is repeated after the interval and not on
             # every request while Qdrant or the disk is struggling.
             self._next_check = self._clock() + self._interval
-            self._follow_alias()
+            self._follow_aliases()
         finally:
             self._refresh_lock.release()
+
+    def _follow_aliases(self) -> None:
+        """Follow the lexical alias, then pair the semantic index with what is served; no raise.
+
+        In this order because the semantic index is judged against the snapshot being served,
+        which the first step may just have changed.
+        """
+        self._follow_alias()
+        self._follow_semantic()
 
     def _follow_alias(self) -> None:
         """Ask where the alias points and make the served snapshot match; never raises."""
@@ -338,6 +392,99 @@ class ServedSnapshot:
             extra={"component": "serving", "event": "chunker_mismatch"},
         )
         return True
+
+    def _follow_semantic(self) -> None:
+        """Give the served search its semantic verdict: a pairing, or the reason there is none.
+
+        Never raises. A verdict that has not changed for the snapshot being served is left alone
+        (and not logged again), so a look every half minute costs one alias lookup and one small
+        file read. With nothing served there is nothing to pair; a snapshot opened later starts
+        unpaired and is judged on the look that opened it.
+        """
+        current = self._serving
+        if current is None:
+            return
+        try:
+            verdict = self._semantic_for(current)
+        except Exception:
+            # Deliberately broad, as for the lexical alias: the Qdrant client raises its own
+            # family of errors for a server that is down, restarting or refusing. Not logged
+            # here: the lexical look, which asks Qdrant the same kind of question just before,
+            # logs a failure once (`_note_problem`). An earlier verdict for this snapshot stands,
+            # so a hiccup does not switch semantic search off for half a minute; with none, the
+            # reason says why.
+            if self._semantic_verdict is not None and self._semantic_verdict[0] is current:
+                return
+            verdict = _SEMANTIC_QDRANT_DOWN
+        if self._semantic_verdict == (current, verdict):
+            return
+        self._semantic_verdict = (current, verdict)
+        if isinstance(verdict, str):
+            current.search.unpair_semantic(verdict)
+            logger.info(
+                "semantic and hybrid search are unavailable: %s",
+                verdict,
+                extra={"component": "serving", "event": "semantic_unpaired"},
+            )
+            return
+        # The model and length are the index's own, from its state (`query_embed` says why).
+        embedder = QueryEmbedder.from_config(
+            self._config,
+            self._environ,
+            model=verdict.model,
+            dimensions=verdict.dimensions,
+            transport=self._embed_transport,
+        )
+        current.search.pair_semantic(SemanticBinding(verdict.collection, embedder.embed))
+        logger.info(
+            "semantic and hybrid search are available over %s",
+            verdict.collection,
+            extra={"component": "serving", "event": "semantic_paired"},
+        )
+
+    def _semantic_for(self, serving: Serving) -> _SemanticPairing | str:
+        """Judge the semantic index against the snapshot being served.
+
+        Args:
+            serving: The snapshot being served.
+
+        Returns:
+            The pairing when the semantic index is usable with it; else one plain sentence saying
+            why not (the conditions are in the module docstring). Holds no key, path or
+            exception text.
+
+        Raises:
+            Exception: Whatever the Qdrant client raises when it cannot be asked.
+        """
+        aliases = self._client.get_aliases().aliases
+        name = next((a.collection_name for a in aliases if a.alias_name == SEMANTIC_ALIAS), None)
+        if name is None:
+            return (
+                f"there is no semantic index yet (the alias {SEMANTIC_ALIAS} does not exist; "
+                "`wiki-mirror embed-now` builds it)"
+            )
+        info = semantic_index_info(self._config.data_dir, name, quiet=True)
+        if info is None:
+            return (
+                f"the semantic index {name} has no readable state "
+                "(state/index_semantic_<born>.json is missing or unreadable)"
+            )
+        if not info.complete:
+            return f"the semantic index {name} is still being built (its embedding run is not done)"
+        if info.applied_snapshot != serving.applied_snapshot:
+            return (
+                f"the semantic index is of snapshot {info.applied_snapshot}, the articles served "
+                f"are of {serving.applied_snapshot}; the semantic catch-up brings it up to date "
+                "(docs/ROADMAP.md)"
+            )
+        if info.chunker != chunker_fingerprint():
+            return (
+                f"the semantic index {name} was built with a different chunker than this code's, "
+                "so its passage numbers would not line up with the articles"
+            )
+        if self._config.embedding_url is None:
+            return "the embedding server is not configured (embedding_url in mirror.yaml)"
+        return _SemanticPairing(name, info.model, info.dimensions)
 
     def _swap_in(self, new: Serving) -> None:
         """Make `new` the served snapshot and retire the old one (closed once unused)."""

@@ -163,6 +163,39 @@ def test_load_config_embedding_headers_that_are_not_valid_http_are_refused(
 
 
 @pytest.mark.unit
+def test_load_config_query_embedding_headers_default_to_none_and_are_separate(
+    tmp_path: Path,
+) -> None:
+    config = _load(tmp_path, 'embedding_headers: {X-Priority: "3"}\n')
+    assert config.query_embedding_headers == {}
+
+
+@pytest.mark.unit
+def test_load_config_query_embedding_headers_accept_a_priority_header(tmp_path: Path) -> None:
+    config = _load(tmp_path, 'query_embedding_headers: {X-Priority: "1"}\n')
+    assert config.query_embedding_headers == {"X-Priority": "1"}
+
+
+@pytest.mark.unit
+def test_load_config_query_embedding_headers_refuse_credentials_without_echoing_the_value(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(MirrorConfigError) as raised:
+        _load(tmp_path, 'query_embedding_headers: {Authorization: "Bearer hunter2"}\n')
+    assert "EMBEDDING_API_KEY" in str(raised.value)
+    assert "hunter2" not in str(raised.value)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("headers", ['{"Bad Name": "1"}', '{"X-A": "line\\nbreak"}'])
+def test_load_config_query_embedding_headers_that_are_not_valid_http_are_refused(
+    tmp_path: Path, headers: str
+) -> None:
+    with pytest.raises(MirrorConfigError, match="query_embedding_headers"):
+        _load(tmp_path, f"query_embedding_headers: {headers}\n")
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "setting", ["embedding_concurrency: 0", "embedding_concurrency: 65", "embedding_batch: 0",
                 "embedding_batch: 65", "embedding_dimensions: 0"]

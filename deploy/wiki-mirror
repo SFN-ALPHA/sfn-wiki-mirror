@@ -17,7 +17,8 @@
 #   wiki-mirror update [--accept-format-change]
 #                                 fast-forward the checkout, reinstall, restart the API; the
 #                                 flag allows a commit that changes the built data's format
-#   wiki-mirror search "<query>"        a quick local search through the real API
+#   wiki-mirror search "<query>" [limit] [--mode lexical|semantic|hybrid]
+#                                 a quick local search through the real API (default mode: lexical)
 #   wiki-mirror key add <name>          issue an API key to another agent (shown once, only its hash kept)
 #   wiki-mirror key list                the agents that have a key (names only)
 #   wiki-mirror key revoke <name>       withdraw an agent's key (takes effect in seconds, no restart)
@@ -73,13 +74,15 @@ require_root() {
 
 # GET or POST to the API. The key goes to curl as a config file on a pipe (`-K <(...)`), so
 # it never appears in `ps` or in this script's output. $1 is the path; any further arguments
-# go to curl (e.g. a JSON body).
+# go to curl (e.g. a JSON body). An HTTP error status fails the call (exit 22) but, with
+# --fail-with-body (curl 7.76; Debian 12 has 7.88), still prints the reply's body, so a caller can
+# show the service's own `{"error", "detail"}` reason instead of curl's bare status line.
 api_call() {
     local path="$1" key
     shift
     key="$(sed -n 's/^WIKI_MIRROR_API_KEY=//p' "$MIRROR_ENV" 2>/dev/null | head -1)"
     [[ -n "$key" ]] || die "no WIKI_MIRROR_API_KEY in $MIRROR_ENV (run install.sh)"
-    curl -fsS --max-time 30 -K <(printf 'header = "Authorization: Bearer %s"\n' "$key") \
+    curl --fail-with-body -sS --max-time 30 -K <(printf 'header = "Authorization: Bearer %s"\n' "$key") \
         "$@" "$API_URL$path"
 }
 
@@ -185,7 +188,9 @@ for reason in json.load(sys.stdin).get("reasons") or []:
         printf '%s' "$health" | py -c '
 import json, sys
 
-semantic = json.load(sys.stdin).get("semantic")
+health = json.load(sys.stdin)
+semantic = health.get("semantic")
+modes = health.get("search_modes")
 
 
 def count(value):
@@ -213,6 +218,13 @@ else:
         "good" if semantic.get("complete") else "dim",
         "complete" if semantic.get("complete") else "not complete"))
     print("dim\tcollection %s" % semantic.get("collection"))
+# Which searches work now, and why semantic and hybrid are off when an index exists but cannot be
+# searched (D10). A reply from an older API has neither key: say nothing rather than guess.
+if isinstance(modes, list):
+    print("%s\tsearch modes: %s" % (
+        "good" if "semantic" in modes and "hybrid" in modes else "dim", ", ".join(modes) or "none"))
+if isinstance(semantic, dict) and semantic.get("searchable_reason"):
+    print("warn\tsemantic and hybrid search are off: %s" % semantic["searchable_reason"])
 ' | render
 
         head2 "Maintenance"
@@ -279,6 +291,9 @@ for problem in record.get("problems") or []:
     print("bad\t" + str(problem))
 ' | render
     else
+        # api_call prints an error reply's body (--fail-with-body); status must not take that for
+        # a health report, and exits 1 below when the API did not answer.
+        health=""
         bad "the API did not answer at $API_URL/v1/wiki/health"
         dim "wiki-mirror logs api"
     fi
@@ -382,24 +397,74 @@ cmd_update() {
     exec "$APP_DIR/deploy/update.sh" "$@"
 }
 
+# `search "<query>" [limit] [--mode lexical|semantic|hybrid]`. The mode is checked here, so a typo
+# is a usage error and not a request; it is sent only when given, so the service's own default
+# (lexical) stays the one place that decides it. A semantic or hybrid search the service cannot
+# serve (503 semantic_unavailable, D10) prints its reason; it never falls back to keywords.
 cmd_search() {
     require_root search
-    [[ $# -ge 1 && -n "$1" ]] || die 'usage: wiki-mirror search "<query>" [limit]'
-    local limit="${2:-5}"
+    local usage='usage: wiki-mirror search "<query>" [limit] [--mode lexical|semantic|hybrid]'
+    local mode="" have_mode=false limit reply status=0
+    local -a positional=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode)   [[ $# -ge 2 ]] || die "--mode needs a value; $usage"
+                      mode="$2"; have_mode=true; shift ;;
+            --mode=*) mode="${1#--mode=}"; have_mode=true ;;
+            --*)      die "unknown option '${1:0:30}'; $usage" ;;
+            *)        positional+=("$1") ;;
+        esac
+        shift
+    done
+    if $have_mode; then
+        case "$mode" in
+            lexical|semantic|hybrid) ;;
+            *) die "unknown mode '${mode:0:20}' (lexical|semantic|hybrid); $usage" ;;
+        esac
+    fi
+    [[ ${#positional[@]} -ge 1 && ${#positional[@]} -le 2 && -n "${positional[0]}" ]] || die "$usage"
+    limit="${positional[1]:-5}"
+    [[ "$limit" =~ ^[0-9]+$ ]] || die "limit must be a whole number; $usage"
+
     # The body is built by Python so quotes in the query cannot break the JSON.
-    py -c 'import json, sys; print(json.dumps({"query": sys.argv[1], "limit": int(sys.argv[2])}))' "$1" "$limit" \
-        | api_call /v1/wiki/search -H 'Content-Type: application/json' --data-binary @- \
-        | py -c '
+    reply="$(py -c '
 import json, sys
 
-reply = json.load(sys.stdin)
+body = {"query": sys.argv[1], "limit": int(sys.argv[2])}
+if sys.argv[3]:
+    body["mode"] = sys.argv[3]
+print(json.dumps(body))
+' "${positional[0]}" "$limit" "$mode" \
+        | api_call /v1/wiki/search -H 'Content-Type: application/json' --data-binary @-)" || status=$?
+    # Nothing came back (the API is down, or there is no key): curl or die has said why.
+    if [[ $status -ne 0 && -z "$reply" ]]; then
+        exit 1
+    fi
+    printf '%s' "$reply" | py -c '
+import json, sys
+
+try:
+    reply = json.load(sys.stdin)
+except ValueError:
+    print("error: the API answered something that is not JSON", file=sys.stderr)
+    raise SystemExit(1)
+if isinstance(reply, dict) and "error" in reply:
+    # The service error shape, {"error": code, "detail": reason}. For a semantic or hybrid search
+    # it cannot serve, `detail` is the plain reason: never the query or a key.
+    print("error: %s: %s" % (reply["error"], reply.get("detail") or "-"), file=sys.stderr)
+    if reply["error"] == "semantic_unavailable":
+        print("  lexical search still works; wiki-mirror status shows which modes are usable", file=sys.stderr)
+    raise SystemExit(1)
 print("snapshot %s, mode %s, %d result(s)" % (reply.get("snapshot"), reply.get("mode"), len(reply.get("results", []))))
 for hit in reply.get("results", []):
     print()
-    print("%s  [%s]  score %.2f" % (hit["title"], hit.get("section") or "-", hit.get("score", 0)))
+    # %.4g suits every mode: a BM25 sum (12.35), a cosine similarity (0.8234) and a reciprocal-rank-fusion
+    # sum (0.03279), which %.2f would show as 0.03 for every hit.
+    print("%s  [%s]  score %.4g" % (hit["title"], hit.get("section") or "-", hit.get("score", 0)))
     print("  %s" % hit["url"])
     print("  %s" % (hit.get("snippet") or "")[:200])
 '
+    [[ $status -eq 0 ]] || exit 1
 }
 
 # The clients file (hashes of the other agents' keys) belongs to the Python module, which

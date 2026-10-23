@@ -6,7 +6,10 @@ Provides an in-memory `ArticleSource` (`FakeSource`), articles shaped like the o
 produces (markdown `## Heading` sections, an `## Infobox` block of `label: value` lines, no
 references), a Qdrant client in local mode, real finalized article stores written under a test's
 `data_dir` (`write_store`, `build_snapshot`, `served_over`) for the tests that exercise the
-holder that follows the alias, and a stand-in for the build-state functions of `build`.
+holder that follows the alias, and a stand-in for the build-state functions of `build`. Also a
+semantic index small enough to reason about (`add_semantic_index`, the real `run_embed` with a fake
+model whose vectors count topic words) and `FakeEmbeddingServer`, an Ollama-shaped `/api/embed`
+over `httpx.MockTransport` for the API's query embedding.
 
 Non-obvious constraints:
 
@@ -26,16 +29,22 @@ See docs/DESIGN.md sections 5 and 12.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator
+import asyncio
+import json
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 from pydantic import SecretStr
 from qdrant_client import QdrantClient
 
 from wiki_mirror.config import MirrorConfig
+from wiki_mirror.embed import collection_name as embed_collection_name
+from wiki_mirror.embed import run_embed
 from wiki_mirror.index import collection_name, run_index
 from wiki_mirror.parse import PARSER_VERSION
 from wiki_mirror.records import Article, SnapshotMeta, normalise_title, text_hash
@@ -45,10 +54,16 @@ from wiki_mirror.store import ArticleStore, store_path
 
 __all__ = [
     "API_KEY",
+    "EMBEDDING_URL",
+    "TOPIC_DIMS",
+    "TOPIC_WORDS",
+    "FakeEmbeddingServer",
     "FakeSource",
     "FakeState",
     "FakeStateStore",
     "StubServed",
+    "TopicEmbedder",
+    "add_semantic_index",
     "build_snapshot",
     "index_articles",
     "index_without_store",
@@ -57,6 +72,7 @@ __all__ = [
     "make_snapshot",
     "memory_client",
     "served_over",
+    "topic_vector",
     "write_store",
 ]
 
@@ -341,6 +357,8 @@ def served_over(
     articles: list[Article],
     *,
     clock: Callable[[], float],
+    semantic: FakeEmbeddingServer | None = None,
+    environ: Mapping[str, str] | None = None,
     **config: object,
 ) -> tuple[ServedSnapshot, QdrantClient, MirrorConfig]:
     """A snapshot holder over a real store and an in-memory index of `articles`.
@@ -349,16 +367,122 @@ def served_over(
         tmp_path: Becomes the config's `data_dir` parent.
         articles: The default snapshot's articles.
         clock: The holder's clock (tests pass `frozen_clock.monotonic`).
+        semantic: When given, the snapshot also gets a semantic index of the same articles
+            (`add_semantic_index`), `embedding_url` is set, and the holder embeds its questions
+            through this fake server.
+        environ: The holder's process environment (where `EMBEDDING_API_KEY` is read); empty
+            when None, whatever the machine running the tests has.
         **config: `MirrorConfig` overrides.
 
     Returns:
         The holder (nothing opened yet: its first look happens on first use), the client, and
         the config.
     """
+    if semantic is not None:
+        config = {"embedding_url": EMBEDDING_URL, "embedding_dimensions": TOPIC_DIMS, **config}
     settings = make_config(tmp_path, **config)
     client = memory_client()
     build_snapshot(settings, client, articles)
-    return ServedSnapshot(settings, client, clock=clock), client, settings
+    if semantic is not None:
+        add_semantic_index(settings, client, articles)
+    return (
+        ServedSnapshot(
+            settings,
+            client,
+            clock=clock,
+            environ=environ or {},
+            embed_transport=semantic.transport if semantic is not None else None,
+        ),
+        client,
+        settings,
+    )
+
+
+# -- a semantic index and an embedding server, small enough to reason about ------------------
+
+#: A made-up embedding server address (the shared address space, nobody's own network).
+EMBEDDING_URL = "http://100.64.0.9:8080"
+
+#: The "topics" of the tests' fake model, one per vector component. A text's vector counts how
+#: often each topic word occurs in it, so which passage a question lands nearest is plain to see.
+TOPIC_WORDS = ("airship", "planet", "chlorophyll", "relativity")
+
+#: Vector length of the fake model.
+TOPIC_DIMS = len(TOPIC_WORDS)
+
+
+def topic_vector(text: str) -> list[float]:
+    """The fake model's vector for a text: topic-word counts, plus a little so none is zero."""
+    lowered = text.lower()
+    return [lowered.count(word) + 0.01 for word in TOPIC_WORDS]
+
+
+class TopicEmbedder:
+    """The bulk embedder of `run_embed`, backed by `topic_vector`."""
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        """One vector per text, in order."""
+        return [topic_vector(text) for text in texts]
+
+
+class FakeEmbeddingServer:
+    """An Ollama-shaped `/api/embed` over `httpx.MockTransport`, for the query embedding.
+
+    Answers `{"embeddings": [[...]]}` (the keys the clients read; the existing embed tests use the
+    same shape) with `topic_vector` of the input, or the vector a test chose for that exact text,
+    so a question can be made to land near a passage that shares none of its words. A test makes
+    it fail by setting `reply`.
+    """
+
+    def __init__(self, answers: Mapping[str, list[float]] | None = None) -> None:
+        """Start answering, with `answers` (question to vector) overriding the topic vector."""
+        self.answers: dict[str, list[float]] = dict(answers or {})
+        #: Every request received, in order.
+        self.requests: list[httpx.Request] = []
+        #: When set, answered instead of a vector: a response, or an exception to raise.
+        self.reply: httpx.Response | Exception | None = None
+        self.transport = httpx.MockTransport(self._handle)
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        """Record the request and answer it."""
+        self.requests.append(request)
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        if self.reply is not None:
+            return self.reply
+        inputs = json.loads(request.content)["input"]
+        vectors = [self.answers.get(text, topic_vector(text)) for text in inputs]
+        return httpx.Response(200, json={"embeddings": vectors})
+
+
+def add_semantic_index(
+    config: MirrorConfig,
+    client: QdrantClient,
+    articles: Iterable[Article],
+    snapshot: SnapshotMeta | None = None,
+) -> str:
+    """What `wiki-mirror embed-now` leaves behind: a complete semantic collection, alias and state.
+
+    Runs the real `run_embed` over an in-memory source with the topic model, so the collection,
+    its payloads, its point ids and its state file are the stage's own.
+
+    Args:
+        config: Service settings; `embedding_dimensions` must be `TOPIC_DIMS`.
+        client: The Qdrant client the collection goes into (the one holding the lexical index).
+        articles: The articles to embed.
+        snapshot: Their snapshot; the default test snapshot if None.
+
+    Returns:
+        The collection's name (`wikipedia_semantic_<born>`).
+    """
+    source = FakeSource(articles, snapshot)
+    # In a thread of its own: an async test (the MCP door's) already has a running event loop,
+    # and `asyncio.run` refuses to start inside one.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(
+            asyncio.run, run_embed(config, source, client, TopicEmbedder())
+        ).result()
+    return embed_collection_name(source.snapshot.tag)
 
 
 class StubServed:

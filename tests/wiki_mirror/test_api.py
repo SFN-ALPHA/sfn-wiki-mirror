@@ -7,6 +7,10 @@ Failure paths named here: no key, a wrong key and a revoked key (401), a bad req
 (replaced), unknown fields and out-of-range values (422), no snapshot yet (503 not_ready),
 Qdrant refusing (503 index_unavailable), a crash (JSON 500), a malformed clients file (refused at
 start, ignored at runtime), the alias moving or its store being unusable, and every health state.
+The search modes: an unknown mode (422), and `semantic` or `hybrid` with no usable semantic index,
+after the monthly build, with the embedding server failing, timing out or refusing the key (503
+semantic_unavailable, never keyword results, never the key or the query), and health's
+`search_modes` and `searchable_reason`.
 
 See docs/DESIGN.md section 6.
 """
@@ -18,12 +22,13 @@ import logging
 import os
 import threading
 from collections.abc import Callable, Iterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from qdrant_client import QdrantClient, models
@@ -33,6 +38,7 @@ from starlette.testclient import WebSocketDisconnect
 from tests.fixtures.clock import FrozenClock
 from tests.fixtures.wiki_mirror_fakes import (
     API_KEY,
+    FakeEmbeddingServer,
     FakeState,
     FakeStateStore,
     StubServed,
@@ -62,7 +68,7 @@ from wiki_mirror.keys import (
     revoke_client,
 )
 from wiki_mirror.records import MAX_PAGE_ID, Article
-from wiki_mirror.search import SearchReply
+from wiki_mirror.search import SearchReply, SemanticUnavailableError
 from wiki_mirror.serving import ALIAS_RECHECK_SECONDS, ServedSnapshot
 
 pytestmark = pytest.mark.contract
@@ -118,7 +124,9 @@ class _StubSearch:
     def __init__(self, error: Exception) -> None:
         self._error = error
 
-    def search(self, query: str, limit: int) -> SearchReply:
+    def search(
+        self, query: str, limit: int, mode: str = "lexical", *, request_id: str | None = None
+    ) -> SearchReply:
         raise self._error
 
 
@@ -355,6 +363,8 @@ def test_api_search_limit_defaults_to_eight(tmp_path: Path, frozen_clock: Frozen
     "body",
     [
         {"query": "x", "surprise": True},
+        {"query": "x", "mode": "fuzzy"},
+        {"query": "x", "mode": None},
         {"query": "x", "limit": 0},
         {"query": "x", "limit": 21},
         {"query": ""},
@@ -417,6 +427,221 @@ def test_api_search_logs_the_query_length_and_never_the_query(
     assert "query_chars=19" in caplog.text
     assert "request=req-77" in caplog.text
     assert "secretword" not in caplog.text
+    assert "mode=lexical" in caplog.text
+
+
+# -- search modes -----------------------------------------------------------------------------
+
+_SEARCH_RESULT_FIELDS = {
+    "page_id",
+    "revision_id",
+    "title",
+    "section",
+    "snippet",
+    "score",
+    "url",
+    "disambiguation",
+}
+
+
+@dataclass
+class SemanticApp:
+    """An app whose snapshot has a semantic index, and the fake server that embeds questions."""
+
+    client: TestClient
+    server: FakeEmbeddingServer
+    served: ServedSnapshot
+    qdrant: QdrantClient
+    config: MirrorConfig
+    clock: FrozenClock
+
+
+@pytest.fixture
+def semantic_app(tmp_path: Path, frozen_clock: FrozenClock) -> Iterator[SemanticApp]:
+    """An app over `_articles` with a paired semantic index; its holder is closed afterwards."""
+    server = FakeEmbeddingServer()
+    served, qdrant, settings = served_over(
+        tmp_path, _articles(), clock=frozen_clock.monotonic, semantic=server
+    )
+    health = ServiceHealth(settings, served, qdrant, state_reader=FakeStateStore().read, clock=_now)
+    app = TestClient(create_app(settings, served, health))
+    yield SemanticApp(app, server, served, qdrant, settings, frozen_clock)
+    served.close()
+
+
+def _search(app: SemanticApp | TestClient, **body: object) -> Any:
+    """POST a search with the primary key."""
+    client = app.client if isinstance(app, SemanticApp) else app
+    return client.post("/v1/wiki/search", json=body, headers=_AUTH)
+
+
+def test_api_search_without_a_mode_is_lexical(app_factory: AppFactory) -> None:
+    client, _ = app_factory()
+    assert _search(client, query="mercury planet").json()["mode"] == "lexical"
+
+
+@pytest.mark.parametrize("mode", ["lexical", "semantic", "hybrid"])
+def test_api_search_every_mode_returns_the_same_shape_and_names_itself(
+    semantic_app: SemanticApp, mode: str
+) -> None:
+    response = _search(semantic_app, query="mercury planet", mode=mode)
+    body = response.json()
+    assert response.status_code == 200
+    assert (set(body), body["mode"]) == ({"snapshot", "mode", "results"}, mode)
+    assert set(body["results"][0]) == _SEARCH_RESULT_FIELDS
+    assert body["results"][0]["title"] == "Mercury"
+    assert body["results"][0]["page_id"] == 5
+
+
+def test_api_search_semantic_asks_the_embedding_server_and_lexical_does_not(
+    semantic_app: SemanticApp,
+) -> None:
+    _search(semantic_app, query="mercury planet", mode="lexical")
+    assert semantic_app.server.requests == []
+    _search(semantic_app, query="mercury planet", mode="semantic")
+    assert len(semantic_app.server.requests) == 1
+
+
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+def test_api_search_semantic_mode_without_a_semantic_index_is_503_and_never_keyword_results(
+    app_factory: AppFactory, mode: str
+) -> None:
+    client, _ = app_factory()
+    response = _search(client, query="mercury planet", mode=mode)
+    assert response.status_code == 503
+    assert set(response.json()) == {"error", "detail"}
+    assert response.json()["error"] == "semantic_unavailable"
+    assert "no semantic index yet" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+def test_api_search_after_the_monthly_build_is_503_until_the_semantic_catch_up(
+    semantic_app: SemanticApp, mode: str
+) -> None:
+    november = make_snapshot("2026-11-01")
+    build_snapshot(semantic_app.config, semantic_app.qdrant, _articles("november"), november)
+    semantic_app.clock.advance(ALIAS_RECHECK_SECONDS + 1)
+    semantic = _search(semantic_app, query="mercury planet", mode=mode)
+    lexical = _search(semantic_app, query="mercury planet")
+    assert semantic.status_code == 503
+    assert semantic.json()["error"] == "semantic_unavailable"
+    assert "of snapshot 20261001" in semantic.json()["detail"]
+    assert "of 20261101" in semantic.json()["detail"]
+    assert (lexical.status_code, lexical.json()["snapshot"]) == (200, "2026-11-01")
+
+
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+def test_api_search_embedding_server_failing_is_503_semantic_unavailable_with_its_reason(
+    semantic_app: SemanticApp, mode: str
+) -> None:
+    semantic_app.server.reply = httpx.Response(500, text="the router's own error page")
+    response = _search(semantic_app, query="mercury planet", mode=mode)
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": "semantic_unavailable",
+        "detail": "the embedding server answered 500",
+    }
+
+
+def test_api_search_embedding_server_not_answering_is_503_naming_the_timeout(
+    semantic_app: SemanticApp,
+) -> None:
+    semantic_app.server.reply = httpx.ReadTimeout("slow")
+    response = _search(semantic_app, query="mercury planet", mode="semantic")
+    assert response.status_code == 503
+    assert "did not answer within" in response.json()["detail"]
+
+
+def test_api_search_refused_embedding_key_is_503_without_the_key_or_the_query(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    key = "sk-sentinel-0123456789abcdef"
+    server = FakeEmbeddingServer()
+    server.reply = httpx.Response(401, text=f"bad key {key} for my private question")
+    # The holder reads the key from its environment, as the service does from mirror.env.
+    served, qdrant, settings = served_over(
+        tmp_path,
+        _articles(),
+        clock=frozen_clock.monotonic,
+        semantic=server,
+        environ={"EMBEDDING_API_KEY": key},
+    )
+    health = ServiceHealth(settings, served, qdrant, state_reader=FakeStateStore().read, clock=_now)
+    try:
+        client = TestClient(create_app(settings, served, health))
+        response = _search(client, query="my private question", mode="hybrid")
+    finally:
+        served.close()
+    assert response.status_code == 503
+    assert response.json()["error"] == "semantic_unavailable"
+    assert key not in response.text
+    assert "private" not in response.text
+
+
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+def test_api_search_forwards_the_request_id_to_the_embedding_server(
+    semantic_app: SemanticApp, mode: str
+) -> None:
+    semantic_app.client.post(
+        "/v1/wiki/search",
+        json={"query": "mercury planet", "mode": mode},
+        headers={**_AUTH, "X-Request-ID": "turn-42:a.b_c"},
+    )
+    (request,) = semantic_app.server.requests
+    assert request.headers["x-request-id"] == "turn-42:a.b_c"
+
+
+def test_api_search_replaced_request_id_is_the_one_forwarded_to_the_embedding_server(
+    semantic_app: SemanticApp,
+) -> None:
+    response = semantic_app.client.post(
+        "/v1/wiki/search",
+        json={"query": "mercury planet", "mode": "semantic"},
+        headers={**_AUTH, "X-Request-ID": "has space"},
+    )
+    (request,) = semantic_app.server.requests
+    assert request.headers["x-request-id"] == response.headers["X-Request-ID"]
+    assert request.headers["x-request-id"] != "has space"
+
+
+def test_api_search_semantic_failure_is_logged_with_its_kind_and_never_the_query(
+    semantic_app: SemanticApp, caplog: pytest.LogCaptureFixture
+) -> None:
+    semantic_app.server.reply = httpx.Response(403, text="no")
+    with caplog.at_level(logging.WARNING, logger="wiki_mirror.api"):
+        _search(semantic_app, query="a very private question", mode="semantic")
+    assert "kind=rejected" in caplog.text
+    assert "mode=semantic" in caplog.text
+    assert "private" not in caplog.text
+
+
+def test_api_search_semantic_success_is_logged_with_its_mode_and_never_the_query(
+    semantic_app: SemanticApp, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="wiki_mirror.api"):
+        _search(semantic_app, query="a very private question", mode="hybrid")
+    assert "mode=hybrid" in caplog.text
+    assert "query_chars=23" in caplog.text
+    assert "private" not in caplog.text
+
+
+def test_api_search_semantic_when_qdrant_refuses_is_503_index_unavailable_not_semantic(
+    tmp_path: Path,
+) -> None:
+    error = UnexpectedResponse(404, "Not Found", b"collection missing", {})  # type: ignore[arg-type]
+    client = _stub_app(make_config(tmp_path), error)
+    response = _search(client, query="zeppelin", mode="semantic")
+    assert (response.status_code, response.json()["error"]) == (503, "index_unavailable")
+
+
+def test_api_search_semantic_unavailable_from_the_search_is_503_with_its_reason(
+    tmp_path: Path,
+) -> None:
+    error = SemanticUnavailableError("the stand-in reason", "unpaired")
+    client = _stub_app(make_config(tmp_path), error)
+    response = _search(client, query="zeppelin", mode="semantic")
+    assert response.status_code == 503
+    assert response.json() == {"error": "semantic_unavailable", "detail": "the stand-in reason"}
 
 
 # -- article ----------------------------------------------------------------------------------
@@ -591,6 +816,7 @@ def test_health_serving_snapshot_is_ok_with_counts_and_the_build_state(
         "collection",
         "build",
         "update",
+        "search_modes",
     }
 
 
@@ -1154,6 +1380,12 @@ def test_health_semantic_reports_the_collection_the_alias_points_at(
         "indexed_vectors": 25855559,
         "segments": 85,
         "complete": True,
+        # The real client here has no semantic alias of its own (the stub answers the lookup),
+        # so the holder has found no index to pair with.
+        "searchable_reason": (
+            "there is no semantic index yet (the alias wikipedia_semantic does not exist; "
+            "`wiki-mirror embed-now` builds it)"
+        ),
     }
 
 
@@ -1240,6 +1472,68 @@ def test_health_semantic_complete_follows_the_embedding_state_file(
         _write_semantic_state(tmp_path, content)
     report = _semantic_health(tmp_path, frozen_clock)
     assert report["semantic"]["complete"] is expected
+
+
+# -- the search modes on health ----------------------------------------------------------------
+
+
+def _health_body(app: SemanticApp) -> dict[str, Any]:
+    """`GET /v1/wiki/health` of an app, as JSON."""
+    body = app.client.get("/v1/wiki/health", headers=_AUTH).json()
+    assert isinstance(body, dict)
+    return body
+
+
+def test_health_search_modes_without_a_semantic_index_is_lexical_only(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    report = _health(tmp_path, frozen_clock, FakeState(phase="serving"))
+    assert report["search_modes"] == ["lexical"]
+
+
+def test_health_search_modes_with_nothing_served_is_empty(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    report = _health(tmp_path, frozen_clock, FakeState(phase="idle"), indexed=False)
+    assert report["search_modes"] == []
+
+
+def test_health_search_modes_with_a_paired_semantic_index_lists_all_three(
+    semantic_app: SemanticApp,
+) -> None:
+    report = _health_body(semantic_app)
+    assert report["search_modes"] == ["lexical", "semantic", "hybrid"]
+    assert report["semantic"]["searchable_reason"] is None
+    assert report["status"] == "ok"
+
+
+def test_health_semantic_index_not_paired_is_not_degraded_and_says_why(
+    semantic_app: SemanticApp,
+) -> None:
+    path = semantic_app.config.data_dir / "state" / "index_semantic_20261001.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps({**state, "complete": False}), encoding="utf-8")
+    report = _health_body(semantic_app)
+    assert report["search_modes"] == ["lexical"]
+    assert "still being built" in report["semantic"]["searchable_reason"]
+    assert (report["status"], report["reasons"]) == ("ok", [])
+
+
+def test_health_after_the_monthly_build_says_the_semantic_index_is_of_the_earlier_snapshot(
+    semantic_app: SemanticApp,
+) -> None:
+    build_snapshot(
+        semantic_app.config, semantic_app.qdrant, _articles("november"), make_snapshot("2026-11-01")
+    )
+    report = _health_body(semantic_app)
+    assert report["search_modes"] == ["lexical"]
+    assert "of snapshot 20261001" in report["semantic"]["searchable_reason"]
+
+
+def test_health_never_calls_the_embedding_server(semantic_app: SemanticApp) -> None:
+    _health_body(semantic_app)
+    _health_body(semantic_app)
+    assert semantic_app.server.requests == []
 
 
 # -- the maintenance record on health ----------------------------------------------------------

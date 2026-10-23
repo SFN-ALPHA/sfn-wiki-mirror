@@ -8,6 +8,12 @@ index state is missing, unreadable or unfinished, Qdrant not answering, an alias
 disappears, a store file whose name lies, a request still reading a snapshot while it is
 swapped out (its store must stay open until the request ends), and a swap racing worker threads.
 
+The semantic index is paired with the served store in the same looks: real `run_embed` output
+(collection, alias, state file) over the same snapshot, and a fake embedding server. Named here:
+no semantic alias, an unreadable or incomplete state, an index of another snapshot (the month
+after a build, until the catch-up), one cut by another chunker, no `embedding_url`, Qdrant not
+answering, and that pairing never calls the embedding server and never logs the key.
+
 The served pair is (collection, applied snapshot) (docs/DESIGN.md section 12.3): a recheck that
 finds the same alias target but a different `applied_snapshot` in the index state must swap the
 new store in, which is how W3's in-place monthly update will reach the API.
@@ -29,6 +35,10 @@ from qdrant_client import QdrantClient, models
 
 from tests.fixtures.clock import FrozenClock
 from tests.fixtures.wiki_mirror_fakes import (
+    EMBEDDING_URL,
+    TOPIC_DIMS,
+    FakeEmbeddingServer,
+    add_semantic_index,
     build_snapshot,
     index_without_store,
     make_article,
@@ -39,8 +49,10 @@ from tests.fixtures.wiki_mirror_fakes import (
 )
 from wiki_mirror import index, serving
 from wiki_mirror.config import MirrorConfig
+from wiki_mirror.embed import semantic_state_file
 from wiki_mirror.index import ALIAS, aliased_collection
 from wiki_mirror.records import Article, SnapshotMeta
+from wiki_mirror.search import SemanticUnavailableError
 from wiki_mirror.serving import (
     ALIAS_RECHECK_SECONDS,
     ServedSnapshot,
@@ -689,6 +701,267 @@ def test_alias_pointing_at_a_collection_this_service_did_not_build_is_a_problem(
     assert _date_served(served) is None
     assert served.problem is not None
     assert "scratch has no usable index state" in served.problem
+
+
+# -- the semantic index -----------------------------------------------------------------------
+
+_KEY = "sk-sentinel-0123456789abcdef"
+
+
+def _semantic_holder(
+    tmp_path: Path, clock: FrozenClock, **settings: object
+) -> tuple[ServedSnapshot, QdrantClient, MirrorConfig, FakeEmbeddingServer]:
+    """A holder that embeds questions through a fake server; `settings` override the config.
+
+    The semantic index is built by `_semantic_built` with the default settings; a holder with
+    other settings (no `embedding_url`, another `embedding_model`) reads the same data directory.
+    """
+    config = make_config(
+        tmp_path, **{"embedding_url": EMBEDDING_URL, "embedding_dimensions": TOPIC_DIMS, **settings}
+    )
+    client = memory_client()
+    server = FakeEmbeddingServer()
+    served = ServedSnapshot(
+        config,
+        client,
+        clock=clock.monotonic,
+        environ={"EMBEDDING_API_KEY": _KEY},
+        embed_transport=server.transport,
+    )
+    _OPEN_HOLDERS.append(served)
+    return served, client, config, server
+
+
+def _semantic_built(
+    config: MirrorConfig, client: QdrantClient, label: str, snapshot: SnapshotMeta = _OCTOBER
+) -> None:
+    """A lexical and a semantic index of one snapshot's articles, as a build and an embed leave."""
+    build_snapshot(config, client, _articles(label), snapshot)
+    add_semantic_index(config, client, _articles(label), snapshot)
+
+
+def _modes_and_reason(served: ServedSnapshot) -> tuple[tuple[str, ...], str | None]:
+    """What a search served right now can use, and why not semantic; takes (and ends) a lease."""
+    with served.lease() as current:
+        assert current is not None
+        return current.search.modes, current.search.semantic_reason
+
+
+def _rewrite_semantic_state(config: MirrorConfig, **changes: object) -> None:
+    """Change fields of the semantic index's state file, as a run that differed would leave it."""
+    path = semantic_state_file(config.data_dir, "20261001")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state.update(changes)
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
+_ALL_MODES = ("lexical", "semantic", "hybrid")
+
+
+def test_semantic_index_of_the_served_snapshot_is_paired_and_all_modes_are_usable(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+    assert _modes_and_reason(served) == (_ALL_MODES, None)
+
+
+def test_semantic_search_through_the_holder_embeds_with_the_index_model_and_the_api_key(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    # The settings name another model than the index was built with: a question must be embedded
+    # by the index's own, or the similarity is meaningless.
+    served, client, config, server = _semantic_holder(
+        tmp_path, frozen_clock, embedding_model="a-newer-model"
+    )
+    _semantic_built(make_config(tmp_path, embedding_dimensions=TOPIC_DIMS), client, "october")
+    with served.lease() as current:
+        assert current is not None
+        reply = current.search.search("mercury planet", 5, "semantic")
+    (request,) = server.requests
+    assert reply.mode == "semantic"
+    assert json.loads(request.content)["model"] == "bge-m3"
+    assert request.headers["authorization"] == f"Bearer {_KEY}"
+    assert config.embedding_model == "a-newer-model"
+
+
+def test_no_semantic_alias_leaves_lexical_only_with_a_plain_reason(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
+    build_snapshot(config, client, _articles("october"), _OCTOBER)
+    modes, reason = _modes_and_reason(served)
+    assert modes == ("lexical",)
+    assert reason is not None
+    assert "no semantic index yet" in reason
+
+
+def test_unreadable_semantic_state_leaves_lexical_only(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+    semantic_state_file(config.data_dir, "20261001").write_text("{not json", encoding="utf-8")
+    modes, reason = _modes_and_reason(served)
+    assert modes == ("lexical",)
+    assert reason is not None
+    assert "no readable state" in reason
+
+
+def test_incomplete_semantic_index_leaves_lexical_only(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+    _rewrite_semantic_state(config, complete=False)
+    modes, reason = _modes_and_reason(served)
+    assert modes == ("lexical",)
+    assert reason is not None
+    assert "still being built" in reason
+
+
+def test_semantic_index_of_another_snapshot_leaves_lexical_only_and_names_both(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+    assert _modes_and_reason(served)[0] == _ALL_MODES
+    build_snapshot(config, client, _articles("november"), _NOVEMBER)  # the monthly build
+    frozen_clock.advance(ALIAS_RECHECK_SECONDS + 1)
+    modes, reason = _modes_and_reason(served)
+    assert modes == ("lexical",)
+    assert reason == (
+        "the semantic index is of snapshot 20261001, the articles served are of 20261101; "
+        "the semantic catch-up brings it up to date (docs/ROADMAP.md)"
+    )
+
+
+def test_semantic_search_after_the_monthly_build_is_refused_and_lexical_still_serves(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, client, config, server = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+    build_snapshot(config, client, _articles("november"), _NOVEMBER)
+    frozen_clock.advance(ALIAS_RECHECK_SECONDS + 1)
+    with served.lease() as current:
+        assert current is not None
+        with pytest.raises(SemanticUnavailableError, match="semantic catch-up"):
+            current.search.search("mercury planet", 5, "hybrid")
+        assert current.search.search("mercury planet", 5).results[0].title == "Mercury"
+    assert server.requests == []
+
+
+def test_semantic_index_caught_up_to_the_new_snapshot_is_paired_again(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+    build_snapshot(config, client, _articles("november"), _NOVEMBER)
+    frozen_clock.advance(ALIAS_RECHECK_SECONDS + 1)
+    assert _modes_and_reason(served)[0] == ("lexical",)
+    add_semantic_index(config, client, _articles("november"), _NOVEMBER)
+    frozen_clock.advance(ALIAS_RECHECK_SECONDS + 1)
+    assert _modes_and_reason(served) == (_ALL_MODES, None)
+
+
+def test_semantic_index_cut_by_another_chunker_leaves_lexical_only(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+    _rewrite_semantic_state(config, chunker="v0:1/1")
+    modes, reason = _modes_and_reason(served)
+    assert modes == ("lexical",)
+    assert reason is not None
+    assert "different chunker" in reason
+
+
+def test_no_embedding_url_leaves_lexical_only_with_a_plain_reason(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock, embedding_url=None)
+    _semantic_built(config, client, "october")
+    modes, reason = _modes_and_reason(served)
+    assert modes == ("lexical",)
+    assert reason is not None
+    assert "embedding_url" in reason
+
+
+def test_pairing_never_calls_the_embedding_server(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, client, config, server = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+    for _ in range(3):
+        _modes_and_reason(served)
+        frozen_clock.advance(ALIAS_RECHECK_SECONDS + 1)
+    served.refresh()
+    assert server.requests == []
+
+
+def test_qdrant_failing_to_answer_keeps_the_semantic_verdict_of_the_snapshot_served(
+    tmp_path: Path, frozen_clock: FrozenClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+    assert _modes_and_reason(served)[0] == _ALL_MODES
+
+    def down() -> None:
+        raise ConnectionError("Qdrant is restarting")
+
+    monkeypatch.setattr(client, "get_aliases", down)
+    frozen_clock.advance(ALIAS_RECHECK_SECONDS + 1)
+    assert _modes_and_reason(served)[0] == _ALL_MODES
+    assert served.problem is not None
+
+
+def test_snapshot_opened_while_qdrant_cannot_be_asked_has_semantic_off_with_the_reason(
+    tmp_path: Path, frozen_clock: FrozenClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+    assert _modes_and_reason(served)[0] == _ALL_MODES
+    build_snapshot(config, client, _articles("november"), _NOVEMBER)
+
+    def down() -> None:
+        raise ConnectionError("Qdrant is restarting")
+
+    # The lexical side is told the new alias target by a stand-in, so the swap happens while the
+    # semantic alias cannot be read.
+    monkeypatch.setattr(serving, "aliased_collection", lambda _: "wikipedia_lexical_20261101")
+    monkeypatch.setattr(client, "get_aliases", down)
+    frozen_clock.advance(ALIAS_RECHECK_SECONDS + 1)
+    modes, reason = _modes_and_reason(served)
+    assert modes == ("lexical",)
+    assert reason == "Qdrant could not be asked where the semantic alias points"
+
+
+def test_an_unchanged_semantic_verdict_is_logged_once_not_on_every_look(
+    tmp_path: Path, frozen_clock: FrozenClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+    with caplog.at_level(logging.INFO, logger="wiki_mirror.serving"):
+        for _ in range(4):
+            _modes_and_reason(served)
+            frozen_clock.advance(ALIAS_RECHECK_SECONDS + 1)
+    paired = [r for r in caplog.records if "semantic and hybrid search are" in r.getMessage()]
+    assert len(paired) == 1
+
+
+def test_the_embedding_key_is_in_no_log_line(
+    tmp_path: Path, frozen_clock: FrozenClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+    with caplog.at_level(logging.DEBUG):
+        with served.lease() as current:
+            assert current is not None
+            current.search.search("mercury planet", 5, "semantic")
+        _rewrite_semantic_state(config, complete=False)
+        frozen_clock.advance(ALIAS_RECHECK_SECONDS + 1)
+        _modes_and_reason(served)
+    assert _KEY not in caplog.text
 
 
 # -- threads ----------------------------------------------------------------------------------

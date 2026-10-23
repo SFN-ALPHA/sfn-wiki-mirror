@@ -12,8 +12,11 @@ placeholder left and differs from the template only in its `define` lines; LAN_C
 a private network of /8 or longer; the SSH session running the installer and the box itself must
 be inside it; the site file must belong to root and not be writable by anyone else; the resolver
 preflight follows the site's LAN instead of a fixed network; the firewall install puts the
-previous file back when the check fails; and a dry run reports each of these as a blocker and
-touches nothing.
+previous file back when the check fails; a dry run reports each of these as a blocker and
+touches nothing; with an embedding server the API user (not only the build user) is admitted to
+that one host and port, above the refusals that cover it, and Qdrant to nothing; and the
+configuration stage mentions a missing `EMBEDDING_API_KEY` line, once, without ever writing or
+printing a key, while the verify step claims of the API user only what it probes.
 
 The installer is exercised two ways, both without root or a box: `install.sh --show-firewall`
 as a child process (the mode `update.sh` uses), and by sourcing the script and calling one
@@ -78,6 +81,12 @@ _INSTALLER_ENVIRONMENT = frozenset(
 PLACEHOLDER = re.compile(r"@[A-Z][A-Z0-9_]*@")
 #: The comment lines that bracket the embedding server's `define`s and rule in the template.
 EMBEDDING_MARKER = re.compile(r"^\s*# [<>]{3} embedding-server$", re.M)
+#: The two embedding egress rules as the template writes them (the defines carry the site's values):
+#: the API user's one permitted connection (D10), and the build user's for the embedding run.
+API_USER_RULE = 'meta skuid "wikimirror" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept'
+BUILD_USER_RULE = (
+    'meta skuid "wikimirror-sync" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept'
+)
 
 
 @dataclass
@@ -589,9 +598,56 @@ def test_show_firewall_with_an_embedding_server_keeps_the_rule_and_resolves_its_
         "EMBEDDING_V4": HOST,
         "EMBEDDING_PORT": PORT,
     }
-    rule = 'meta skuid "wikimirror-sync" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept'
-    assert rule in result.stdout
-    assert len(EMBEDDING_MARKER.findall(result.stdout)) == 4, "kept, as comments"
+    assert BUILD_USER_RULE in result.stdout
+    assert API_USER_RULE in result.stdout
+    assert len(EMBEDDING_MARKER.findall(result.stdout)) == 6, "three blocks, kept as comments"
+
+
+def test_show_firewall_with_an_embedding_server_admits_the_api_above_the_service_refusals(
+    site: Site,
+) -> None:
+    site.write(VALID)
+    lines = site.run("--show-firewall").stdout.splitlines()
+    rule = lines.index(f"        {API_USER_RULE}")
+    refusals = [i for i, line in enumerate(lines) if '"wikimirror", "qdrant"' in line]
+    assert len(refusals) == 3
+    assert rule < min(refusals)
+    # And it is one host and one port, the site's own, which the defines carry.
+    assert _defines("\n".join(lines))["EMBEDDING_V4"] == HOST
+
+
+def test_show_firewall_without_an_embedding_server_has_no_rule_for_the_api_or_the_build_user(
+    site: Site,
+) -> None:
+    site.write(NO_EMBEDDING)
+    stdout = site.run("--show-firewall").stdout
+    assert API_USER_RULE not in stdout
+    assert BUILD_USER_RULE not in stdout
+    assert not [line for line in stdout.splitlines() if 'skuid "wikimirror"' in line]
+
+
+def test_show_firewall_without_an_embedding_server_still_refuses_the_api_and_qdrant(
+    site: Site,
+) -> None:
+    site.write(NO_EMBEDDING)
+    stdout = site.run("--show-firewall").stdout
+    refusals = [line for line in stdout.splitlines() if '"wikimirror", "qdrant"' in line]
+    assert len(refusals) == 3
+    assert not [line for line in refusals if "accept" in line]
+
+
+def test_show_firewall_with_or_without_an_embedding_server_admits_qdrant_nowhere(
+    site: Site,
+) -> None:
+    for settings in (VALID, NO_EMBEDDING):
+        site.write(settings)
+        stdout = site.run("--show-firewall").stdout
+        admitted = [
+            line
+            for line in stdout.splitlines()
+            if "qdrant" in line and "skuid" in line and "accept" in line
+        ]
+        assert admitted == []
 
 
 @pytest.mark.parametrize(
@@ -1558,6 +1614,209 @@ def test_install_firewall_template_with_an_unknown_placeholder_installs_nothing(
     assert "still holds the placeholder @EMBEDDING_PORTS@" in result.stderr
     assert not site.installed.exists()
     assert site.calls() == []
+
+
+def test_render_firewall_without_embedding_and_the_api_block_left_unclosed_renders_nothing(
+    site: Site,
+) -> None:
+    # The API's block is the first of the output chain's two: dropping its closing marker makes
+    # the build user's opening marker arrive while it is still open.
+    template = site.app / "deploy" / "nftables" / TEMPLATE.name
+    template.write_text(
+        template.read_text(encoding="utf-8").replace("        # <<< embedding-server\n", "", 1),
+        encoding="utf-8",
+    )
+    result = _render(site, template, f"LAN_CIDR={LAN}; ")
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "twice without closing it" in result.stderr
+
+
+# -- the API's key for the embedding server, and the verify step ------------------------------
+
+#: A key as an operator would have put it in `mirror.env`; no output of the installer may hold it.
+EMBEDDING_KEY = "emb-" + "k" * 40
+PRIMARY_KEY = "pri-" + "p" * 40
+#: What mirror.yaml says when the semantic index's server is set, and when it is not.
+URL_LINE = f"embedding_url: http://{HOST}:{PORT}"
+INFO_LINE = "has no EMBEDDING_API_KEY line"
+
+
+def _install_config(
+    site: Site,
+    *,
+    yaml_lines: str = URL_LINE + "\n",
+    mirror_env: str = f"WIKI_MIRROR_API_KEY={PRIMARY_KEY}\n",
+    embedding: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run the real configuration stage on a scratch box that has already been installed once.
+
+    mirror.yaml is the shipped template plus `yaml_lines`, so the stage finds it edited and leaves
+    it alone; mirror.env and clients.json exist, so nothing is generated and the stage only
+    reports. `chown` is stubbed (a test is not root). Without `embedding`, the site names none.
+    """
+    stubs = site.root / "stubs"
+    stubs.mkdir(exist_ok=True)
+    for name, body in {**_STUBS, "chown": "#!/bin/sh\nexit 0\n"}.items():
+        (stubs / name).write_text(body, encoding="utf-8")
+        (stubs / name).chmod(0o755)
+    for name in ("mirror.yaml", "qdrant.yaml"):
+        shutil.copy(DEPLOY / name, site.app / "deploy" / name)
+    (site.conf / "mirror.yaml").write_text(
+        (DEPLOY / "mirror.yaml").read_text(encoding="utf-8") + yaml_lines, encoding="utf-8"
+    )
+    (site.conf / "qdrant.yaml").write_text(
+        (DEPLOY / "qdrant.yaml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (site.conf / "mirror.env").write_text(mirror_env, encoding="utf-8")
+    (site.conf / "clients.json").write_text("{}\n", encoding="utf-8")
+    settings = f"LAN_CIDR={LAN}; "
+    if embedding:
+        settings += f"EMBEDDING_HOST={HOST}; EMBEDDING_PORT={PORT}; "
+    return site.call(f"{settings}install_config", PATH=f"{stubs}:{os.environ['PATH']}")
+
+
+def test_install_config_embedding_server_and_url_without_a_key_line_says_how_to_add_one(
+    site: Site,
+) -> None:
+    result = _install_config(site)
+    assert result.returncode == 0, result.stderr
+    assert INFO_LINE in result.stdout
+    assert "docs/OPERATIONS.md" in result.stdout
+    assert "wants no key needs nothing" in result.stdout, "a keyless server is a valid setup"
+
+
+def test_install_config_a_key_line_is_left_byte_for_byte_and_never_printed(site: Site) -> None:
+    env = f"WIKI_MIRROR_API_KEY={PRIMARY_KEY}\nEMBEDDING_API_KEY={EMBEDDING_KEY}\n"
+    result = _install_config(site, mirror_env=env)
+    assert result.returncode == 0, result.stderr
+    assert INFO_LINE not in result.stdout
+    assert (site.conf / "mirror.env").read_text(encoding="utf-8") == env
+    assert stat.S_IMODE((site.conf / "mirror.env").stat().st_mode) == 0o600
+    for key in (EMBEDDING_KEY, PRIMARY_KEY):
+        assert key not in result.stdout + result.stderr
+
+
+def test_install_config_an_empty_key_line_is_the_operators_decision_and_stays_quiet(
+    site: Site,
+) -> None:
+    env = f"WIKI_MIRROR_API_KEY={PRIMARY_KEY}\nEMBEDDING_API_KEY=\n"
+    result = _install_config(site, mirror_env=env)
+    assert INFO_LINE not in result.stdout
+    assert (site.conf / "mirror.env").read_text(encoding="utf-8") == env
+
+
+def test_install_config_without_a_key_line_never_writes_one(site: Site) -> None:
+    result = _install_config(site)
+    assert result.returncode == 0, result.stderr
+    env = (site.conf / "mirror.env").read_text(encoding="utf-8")
+    assert env == f"WIKI_MIRROR_API_KEY={PRIMARY_KEY}\n"
+    assert stat.S_IMODE((site.conf / "mirror.env").stat().st_mode) == 0o600
+
+
+def test_install_config_without_an_embedding_server_in_the_site_file_says_nothing(
+    site: Site,
+) -> None:
+    # The firewall would not admit the API to it, and an Ollama on this box needs no rule or key.
+    result = _install_config(site, embedding=False)
+    assert result.returncode == 0, result.stderr
+    assert INFO_LINE not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "yaml_lines",
+    [
+        "",
+        "# embedding_url: http://100.64.1.77:11434\n",
+        "embedding_url: null\n",
+        "embedding_url: ~\n",
+        "embedding_url:\n",
+        "embedding_url: null   # off for now\n",
+        "embedding_url:   # off for now\n",
+    ],
+    ids=["absent", "commented", "null", "tilde", "empty", "null-comment", "empty-comment"],
+)
+def test_install_config_without_an_embedding_url_in_mirror_yaml_says_nothing(
+    site: Site, yaml_lines: str
+) -> None:
+    result = _install_config(site, yaml_lines=yaml_lines)
+    assert result.returncode == 0, result.stderr
+    assert INFO_LINE not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        URL_LINE,
+        f'embedding_url: "http://{HOST}:{PORT}"',
+        f"embedding_url:  http://{HOST}:{PORT}   # the node",
+        f"embedding_url: 'http://{HOST}:{PORT}'",
+    ],
+    ids=["plain", "double-quoted", "with-comment", "single-quoted"],
+)
+def test_install_config_an_embedding_url_in_any_ordinary_spelling_is_noticed(
+    site: Site, line: str
+) -> None:
+    result = _install_config(site, yaml_lines=line + "\n")
+    assert INFO_LINE in result.stdout
+
+
+#: Stubs for `verify`: curl and runuser answer and log; the API user's probes are refused
+#: (exit 22) unless STUB_API_REACHES is set.
+_VERIFY_STUBS = {
+    "curl": '#!/bin/sh\necho "curl $*" >> "$STUB_LOG"\nexit 0\n',
+    "runuser": (
+        '#!/bin/sh\necho "runuser $*" >> "$STUB_LOG"\n'
+        '[ "$2" = wikimirror ] && [ -z "${STUB_API_REACHES:-}" ] && exit 22\nexit 0\n'
+    ),
+}
+
+
+def _verify(site: Site, *, embedding: bool, **env: str) -> subprocess.CompletedProcess[str]:
+    """Run the real verify step against stubbed curl and runuser; the API user is refused."""
+    stubs = site.root / "stubs"
+    stubs.mkdir(exist_ok=True)
+    for name, body in _VERIFY_STUBS.items():
+        (stubs / name).write_text(body, encoding="utf-8")
+        (stubs / name).chmod(0o755)
+    (site.conf / "mirror.env").write_text(f"WIKI_MIRROR_API_KEY={PRIMARY_KEY}\n", encoding="utf-8")
+    settings = f"LAN_CIDR={LAN}; "
+    if embedding:
+        settings += f"EMBEDDING_HOST={HOST}; EMBEDDING_PORT={PORT}; "
+    return site.call(f"{settings}verify", PATH=f"{stubs}:{os.environ['PATH']}", **env)
+
+
+def test_verify_with_an_embedding_server_says_the_api_is_refused_everywhere_but_there(
+    site: Site,
+) -> None:
+    result = _verify(site, embedding=True)
+    assert result.returncode == 0, result.stderr
+    assert "wikimirror is refused outbound connections other than to the embedding server" in (
+        result.stdout
+    )
+
+
+def test_verify_without_an_embedding_server_says_the_api_is_refused_everywhere(site: Site) -> None:
+    result = _verify(site, embedding=False)
+    assert "wikimirror is refused outbound connections, as designed" in result.stdout
+    assert "other than to the embedding server" not in result.stdout
+
+
+def test_verify_never_connects_to_the_embedding_server_as_the_api_user(site: Site) -> None:
+    # The one connection the API's rule admits is not exercised by the installer: it would send a
+    # server that may be down, or busy, a request nobody asked for, and that is no install fault.
+    _verify(site, embedding=True)
+    probes = [line for line in site.calls() if line.startswith("runuser -u wikimirror ")]
+    assert probes == [
+        "runuser -u wikimirror -- curl -sS --max-time 5 -o /dev/null https://github.com"
+    ]
+    assert not [line for line in site.calls() if HOST in line or PORT in line]
+
+
+def test_verify_still_warns_when_the_api_user_reaches_the_internet(site: Site) -> None:
+    result = _verify(site, embedding=True, STUB_API_REACHES="1")
+    assert "wikimirror REACHED the internet" in result.stdout
+    assert "is refused outbound connections" not in result.stdout
 
 
 # -- usage ------------------------------------------------------------------------------------

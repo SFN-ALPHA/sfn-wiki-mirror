@@ -6,10 +6,11 @@ the one secret the service itself holds, the primary bearer key, comes from the
 environment (`WIKI_MIRROR_API_KEY`, set by systemd from `/etc/wiki-mirror/mirror.env`,
 0600). The Wikimedia Enterprise sign-in is a separate file read only by the download stage
 (`enterprise_env_file`), so the API process never holds it. The embedding server's key
-(`EMBEDDING_API_KEY`) is likewise read from the environment, by the embed stage alone, from a
-file only its unit loads; the settings hold the server's URL and shape but never the key. Like
-every configuration in this repository it is validated at start and an invalid one is a hard
-failure.
+(`EMBEDDING_API_KEY`) is likewise read from the environment, never from the settings, which hold
+the server's URL and shape but not the key. Two processes read it, each from a file only its unit
+loads and each with a key of its own: the embed stage (`embedding.env`) and the API, which embeds
+each semantic question (`mirror.env`, docs/DECISIONS.md D10). Like every configuration in this
+repository it is validated at start and an invalid one is a hard failure.
 
 Non-obvious constraints:
 
@@ -119,7 +120,9 @@ class MirrorConfig(BaseModel):
     #: Base URL of an Ollama-compatible embedding server (`POST <url>/api/embed`), e.g.
     #: `http://192.168.1.60:8080`. Unset means the `embed` stage is off. Any host, unlike Qdrant:
     #: the server is another machine on the LAN. Its key is `EMBEDDING_API_KEY` in the
-    #: environment of the embed unit, never a setting (see `wiki_mirror.embed`).
+    #: environment of the embed unit and, a different key, of the API unit, which embeds each
+    #: semantic question; never a setting (see `wiki_mirror.embed`, `wiki_mirror.query_embed`).
+    #: Without it the API answers semantic and hybrid searches 503 `semantic_unavailable`.
     embedding_url: str | None = None
     #: The embedding model the server is asked for. Recorded in the semantic index's state, so a
     #: collection is never continued with another model's vectors.
@@ -135,6 +138,11 @@ class MirrorConfig(BaseModel):
     #: priority some routers honour so a bulk run yields to interactive callers. `Authorization`
     #: is refused: the key comes from the environment and is placed there by the client.
     embedding_headers: dict[str, str] = Field(default_factory=dict)
+    #: Extra request headers for the API's own query embedding (`query_embed`), validated like
+    #: `embedding_headers`. Separate on purpose: the bulk run's headers lower its priority
+    #: (`X-Priority: 3` on the reference box's router), and a person waiting on a search must
+    #: not get background priority. Empty by default, which is the server's normal priority.
+    query_embedding_headers: dict[str, str] = Field(default_factory=dict)
     #: The primary bearer key. Required by `serve`; the build stages never need it.
     api_key: SecretStr | None = None
 
@@ -189,7 +197,7 @@ class MirrorConfig(BaseModel):
             raise ValueError(msg)
         return value.rstrip("/")
 
-    @field_validator("embedding_headers")
+    @field_validator("embedding_headers", "query_embedding_headers")
     @classmethod
     def _embedding_headers_are_safe(cls, value: dict[str, str]) -> dict[str, str]:
         """Refuse credentials, a name that is not an HTTP token, and control characters in a value.

@@ -10,16 +10,18 @@
 # anything that still holds a placeholder. The rest of the file is the same everywhere. Do not
 # load this file with `nft -f` as it stands.
 #
-# **The embedding server is optional.** Its two `define` lines and its one egress rule sit between
-# a pair of marker comments ("embedding-server" with `>>>` to open and `<<<` to close). With a
-# server in site.env the markers stay, as comments, around the filled-in lines. Without one,
-# install.sh deletes everything between them, markers included, so the ruleset has neither the rule
-# nor the variables it would need (nft rejects a rule that names an undefined variable).
-# Anything that refers to the embedding server must stay between the markers.
+# **The embedding server is optional.** Its two `define` lines and its two egress rules (one for
+# the build user, one for the API user) sit in three blocks, each between a pair of marker comments
+# ("embedding-server" with `>>>` to open and `<<<` to close). With a server in site.env the markers
+# stay, as comments, around the filled-in lines. Without one, install.sh deletes everything between
+# each pair, markers included, so the ruleset has neither the rules nor the variables they would
+# need (nft rejects a rule that names an undefined variable). Anything that refers to the embedding
+# server must stay between the markers, comments about it included.
 #
 # This is the only box that downloads from Wikimedia, so unlike a client box's locked-down
 # baseline it must reach the internet - but only as the
-# two identities that need to, and never as the API. Default-deny both directions:
+# two identities that need to, and never as the API (which may open one connection, to the
+# embedding server, and only when there is one). Default-deny both directions:
 #
 #   INPUT   SSH and the API port (8300) from the LAN, loopback, replies, ICMP. Everything on
 #           8300 needs a bearer key (the primary key, and one per MCP agent), so the LAN is
@@ -40,10 +42,14 @@
 #                              Debian's stock sources use plain-http mirrors
 #                              (signature-verified; the transport is not what is trusted),
 #                              hence 80 as well as 443.
-#             wikimirror       nothing. The API serves reads from local disk and Qdrant on
-#                              loopback; if it ever tries to open a connection that is a
-#                              compromise, so it is counted and refused.
-#             qdrant           nothing, for the same reason.
+#             wikimirror       the embedding server's one host and port when site.env names
+#                              one, otherwise nothing: the API embeds the question of a
+#                              semantic or hybrid search itself (D10). Its reads are from local
+#                              disk and Qdrant on loopback, so any other connection it tries to
+#                              open is a compromise, and is counted and refused. That includes
+#                              name resolution: it cannot look anything up, so its
+#                              embedding_url must name the server by that IPv4 address and port.
+#             qdrant           nothing, with no exception.
 #             everyone         DNS/NTP to the LAN resolver, and nothing else.
 #
 #         **Refused, not dropped.** A connection nothing admits gets a TCP reset (or an ICMP
@@ -58,6 +64,14 @@
 # server, if there is one - beyond the DNS/NTP and ping to the LAN that every user is allowed - or
 # run as a user with the API key. Wikipedia text holds
 # nothing secret, and the Enterprise sign-in file is readable by wikimirror-sync alone.
+#
+# A compromised API process (the part of this box the LAN talks to) can, with an embedding server
+# in site.env, send requests to that one host and port, which it could not before D10. What bounds
+# it is the server's own authentication: the API holds an embedding key of its own (in mirror.env),
+# a different one from the build user's, so either can be revoked alone, and what that key lets it
+# do is the embedding server's concern, not this ruleset's. That is the accepted cost of embedding
+# the question in the API. It still cannot open a connection to any other host or port, nor look a
+# name up; each such attempt is counted in service_refused and logged.
 #
 # root and `_apt` keep tcp 80/443 to anywhere, private addresses included, on purpose: they never
 # parse attacker-editable content, and a site may legitimately reach an apt or PyPI mirror, or a
@@ -100,8 +114,8 @@ table inet wiki_mirror {
 
     # >>> embedding-server
     # The Ollama-compatible embedding server, for the planned semantic index (docs/DESIGN.md
-    # section 5). Present only when site.env names one (see the header); the egress rule that uses
-    # these is between the same markers in the output chain.
+    # section 5). Present only when site.env names one (see the header); the two egress rules that
+    # use these (the API's and the build user's) are between the same markers in the output chain.
     define EMBEDDING_V4 = @EMBEDDING_HOST@
     define EMBEDDING_PORT = @EMBEDDING_PORT@
     # <<< embedding-server
@@ -154,7 +168,7 @@ table inet wiki_mirror {
         comment "Outbound connections no rule admitted - a new egress need or a compromise"
     }
     counter service_refused {
-        comment "wikimirror (API) or qdrant tried to open an outbound connection - always an event"
+        comment "wikimirror (API) opened a connection other than to the embedding server, or qdrant opened any - always an event"
     }
 
     chain input {
@@ -191,11 +205,25 @@ table inet wiki_mirror {
         ct state established,related accept
         oifname "lo" accept
 
-        # The two services that must never dial out. Placed before every generic accept (DNS
-        # included) so no later rule can widen what they may do. Counted, then refused with a
-        # reset / admin-prohibited so the service sees the failure at once (header). Logged first
-        # (rate-limited, like the egress log below): the counter alone said 4 packets after the
-        # first build (2026-10-18) and nothing could say where they were going.
+        # >>> embedding-server
+        # The API's one permitted connection (docs/DECISIONS.md D10): the embedding server's host
+        # and port, because the API embeds the question of a semantic or hybrid search itself.
+        # Present only when site.env names an embedding server (see the header). Besides replies
+        # and loopback it is the only accept above the refusals below, and a single host and port
+        # is the most the API is given. The address is a literal on purpose: the API cannot
+        # resolve a name, because DNS comes after the refusals. Qdrant has no such rule and must
+        # never get one. The API's key for this server is its own, in mirror.env, not the build
+        # user's.
+        meta skuid "wikimirror" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept
+        # <<< embedding-server
+
+        # The two services that must not dial out: the API, except for the one connection
+        # admitted just above when there is an embedding server, and Qdrant, with no exception.
+        # Placed before every generic accept (DNS included) so no later rule can widen what they
+        # may do. Counted, then refused with a reset / admin-prohibited so the service sees the
+        # failure at once (header). Logged first (rate-limited, like the egress log below): the
+        # counter alone said 4 packets after the first build (2026-10-18) and nothing could say
+        # where they were going.
         meta skuid { "wikimirror", "qdrant" } limit rate 10/minute burst 5 packets log prefix "wiki-mirror-service-refused: " level warn
         meta skuid { "wikimirror", "qdrant" } meta l4proto tcp counter name "service_refused" reject with tcp reset
         meta skuid { "wikimirror", "qdrant" } counter name "service_refused" reject with icmpx type admin-prohibited

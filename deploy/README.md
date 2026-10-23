@@ -39,10 +39,11 @@ download, about 14 hours for the first build. You also need a free Wikimedia Ent
 3. Inside the container as root, write `/etc/wiki-mirror/enterprise.env` (docs/OPERATIONS.md has the `read -r -s`
    command).
 4. Write the site file `/etc/wiki-mirror/site.env`: copy `/root/site.env.example` there and edit it. `LAN_CIDR` is
-   required and ships commented out: remove the `# ` and write your own network. `EMBEDDING_HOST` and `EMBEDDING_PORT` are optional (both or neither): they only open one egress rule, to
-   the embedding server (an Ollama node or Ollama-compatible cluster) that `wiki-mirror embed-now` uses for the
-   semantic index; leave them out if you will not run it, or if Ollama runs on this box (docs/OPERATIONS.md, "The
-   embedding server"). The installer
+   required and ships commented out: remove the `# ` and write your own network. `EMBEDDING_HOST` and `EMBEDDING_PORT` are optional (both or neither): they open two egress rules, one for the build user and one for the
+   API user, each to that one embedding server (an Ollama node or Ollama-compatible cluster) and nothing else: the
+   build user's for the semantic index that `wiki-mirror embed-now` makes, the API's to embed the question of a
+   `semantic` or `hybrid` search (docs/OPERATIONS.md, "Turning on semantic and hybrid search"); leave them out if you
+   will not run either, or if Ollama runs on this box (docs/OPERATIONS.md, "The embedding server"). The installer
    refuses to go on while the file is missing or still the example, and stops on any value that is not a valid
    network, address or port. The file must be root-owned, 0644 and not a symbolic link, `LAN_CIDR` must be a private
    network of `/8` or longer (10/8, 172.16/12, 192.168/16 or 100.64/10), and both this box and your SSH session must
@@ -71,7 +72,7 @@ download, about 14 hours for the first build. You also need a free Wikimedia Ent
 | `mirror.yaml` | Settings template (every key commented at its default). Installed once, never overwritten. |
 | `qdrant.yaml` | Qdrant settings, each non-default justified. Installed once, never overwritten. |
 | `systemd/wiki-mirror-qdrant.service` | Qdrant, user `qdrant`, loopback only. |
-| `systemd/wiki-mirror.service` | The API, user `wikimirror`, read-only data, no egress. Python in isolated mode (`-I`), run from `/`. |
+| `systemd/wiki-mirror.service` | The API, user `wikimirror`, read-only data, no egress but the optional embedding server. Python in isolated mode (`-I`), run from `/`. |
 | `systemd/wiki-mirror-build.service` | One build, user `wikimirror-sync`, low priority, 5 GB cap, no start timeout. A failure is retried hourly, five times in a day, then it stays failed. |
 | `systemd/wiki-mirror-embed.service` | The semantic index's embedding run (W2), user `wikimirror-sync`, low priority, 2 GB cap, no start timeout, no timer: started by `wiki-mirror embed-now`. Reads `EMBEDDING_API_KEY` from `/etc/wiki-mirror/embedding.env` if present. A failure is retried every 15 minutes, five times in a day, then it stays failed; each start resumes from the checkpoint, after verifying it against Qdrant. A reboot does not restart it: run `wiki-mirror embed-now`. Installed, not enabled. |
 | `systemd/wiki-mirror-build.timer` | The 2nd of each month, 05:00 UTC (Enterprise publishes on the 1st). |
@@ -83,7 +84,7 @@ download, about 14 hours for the first build. You also need a free Wikimedia Ent
 
 | User | Runs | Network |
 |---|---|---|
-| `wikimirror` | the API | none out; :8300 in from the LAN |
+| `wikimirror` | the API | :8300 in from the LAN; out, only the optional embedding server (`site.env`), to embed a semantic question, and nothing else |
 | `wikimirror-sync` | download, parse, index | tcp 443 to the internet (private and shared ranges excluded), the optional embedding server (`site.env`); holds `enterprise.env` |
 | `qdrant` | Qdrant | none out; loopback only |
 | `root` | install, update | tcp 80/443 anywhere, git-over-SSH to GitHub, DHCP renewals to the LAN |

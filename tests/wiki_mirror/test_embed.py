@@ -1167,6 +1167,72 @@ def test_semantic_index_complete_for_a_name_this_stage_does_not_create_is_false(
     assert embed.semantic_index_complete(tmp_path / "data", name) is False
 
 
+# -- what a collection's state says about its vectors ------------------------------------------
+
+
+def test_semantic_index_info_after_a_finished_run_is_what_the_state_records(
+    tmp_path: Path,
+) -> None:
+    _run(_config(tmp_path), memory_client(), FakeSource(_articles(3)), _Embedder())
+    info = embed.semantic_index_info(tmp_path / "data", _COLLECTION)
+    assert info == embed.SemanticIndexInfo(
+        complete=True,
+        model="bge-m3",
+        dimensions=DIMS,
+        applied_snapshot="20261001",
+        chunker=index.chunker_fingerprint(),
+    )
+
+
+def test_semantic_index_info_while_a_run_is_still_loading_is_incomplete_with_no_snapshot(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, embedding_concurrency=1)
+    with pytest.raises(EmbedError, match="went away"):
+        _run(
+            config,
+            memory_client(),
+            FakeSource(_articles()),
+            _FailsAt(5),
+            window_articles=1,
+            windows_queued=2,
+        )
+    info = embed.semantic_index_info(tmp_path / "data", _COLLECTION)
+    assert info is not None
+    assert (info.complete, info.applied_snapshot) == (False, "")
+
+
+def test_semantic_index_info_without_a_state_file_is_none(tmp_path: Path) -> None:
+    assert embed.semantic_index_info(tmp_path / "data", _COLLECTION) is None
+
+
+def test_semantic_index_info_quiet_with_an_unreadable_state_is_none_and_logs_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _state_file(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG):
+        assert embed.semantic_index_info(tmp_path / "data", _COLLECTION, quiet=True) is None
+    assert caplog.text == ""
+
+
+def test_semantic_index_info_with_another_snapshots_state_is_none(tmp_path: Path) -> None:
+    _run(_config(tmp_path), memory_client(), FakeSource(_articles(3)), _Embedder())
+    state = _state(tmp_path)
+    state["born"] = "20260901"
+    _state_file(tmp_path).write_text(json.dumps(state), encoding="utf-8")
+    assert embed.semantic_index_info(tmp_path / "data", _COLLECTION) is None
+
+
+@pytest.mark.parametrize("name", ["wikipedia_lexical_20261001", "wikipedia_semantic_../x"])
+def test_semantic_index_info_for_a_name_this_stage_does_not_create_is_none(
+    tmp_path: Path, name: str
+) -> None:
+    _run(_config(tmp_path), memory_client(), FakeSource(_articles(3)), _Embedder())
+    assert embed.semantic_index_info(tmp_path / "data", name) is None
+
+
 def test_run_embed_a_complete_state_is_a_no_op(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

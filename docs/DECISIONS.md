@@ -19,6 +19,7 @@ only the conclusion, and say what was accepted as a cost.
 | [D7](#d7) | 2026-10-19 | The embedding run is its own stage, unit and key file |
 | [D8](#d8) | 2026-10-23 | The semantic index lives on disk, and a maintenance job keeps it healthy |
 | [D9](#d9) | 2026-10-23 | Fewer, larger semantic segments: the cap goes from 1 GB to 10 GB, and the maintenance job applies it |
+| [D10](#d10) | 2026-10-23 | Search modes: lexical, semantic and hybrid, one result shape; the API embeds the question, with its own key |
 
 <a id="d1"></a>
 ## D1 - 2026-10-16 - A local Wikipedia mirror
@@ -443,3 +444,111 @@ heap. The measured links file is about 251 bytes a point, so about 1.26 GB for a
   one (a vacuum after many deletions, or a graph rebuild) costs up to 12.1 GB of disk and about 1.26 GB of heap at a
   time, not the 1.2 GB of disk it did before. How much the monthly update ([D3](#d3)) rewrites on the new layout is
   not measured; it is looked at after the first update that follows this change.
+
+<a id="d10"></a>
+## D10 - 2026-10-23 - Search modes: lexical, semantic and hybrid, one result shape; the API embeds the question
+
+**Decision.** `POST /v1/wiki/search` and the MCP `wiki_search` tool take a `mode`: `lexical` (the default,
+unchanged), `semantic` or `hybrid`. Decided by the maintainer.
+
+1. **One result shape.** Every mode returns the same `SearchReply` and `SearchResult`: page id, revision id, title,
+   section, snippet, score, URL and the disambiguation flag. The reply's `mode` names the mode that answered, which is
+   always the one asked for. Only `score` differs in meaning (BM25, cosine similarity, RRF sum), and it is documented
+   per mode as not comparable across them. The two collections share point ids and payload fields
+   ([ARCHITECTURE.md](ARCHITECTURE.md)), so a semantic hit is the same kind of object as a keyword hit and passes
+   through the same fold to one result per article, the exact-title-first rule, the disambiguation ordering, the
+   store and `text_hash` checks, and the same snippet.
+2. **Hybrid is RRF with k=60, keyed on (point id, `text_hash`).** Each list is the best `limit x 4` passages; a
+   passage scores `weight / (60 + rank)` in each list it appears in, ranks from 1, and the scores add; the best fused
+   passage of each article is kept. A passage whose `text_hash` differs between the lists is two keys and is never
+   merged: that is the reason for the key ([ROADMAP.md](ROADMAP.md) W2 item 5, [DESIGN.md](DESIGN.md) section 12.6).
+   The two weights are named constants at 1.0 and 1.0 and are **not tuned**: on the evaluation sample equal-weight
+   fusion's hit@1 (0.713) trailed dense alone (0.823) with hard negatives, and W2 item 6 requires a weight check on
+   the golden set at full scale before hybrid becomes the default. With no searchable keyword term, hybrid is the
+   semantic list alone, and still says `hybrid`. The two lists are queried one after the other, not in a thread pool,
+   until a measurement says otherwise.
+3. **The default stays `lexical`.** W2 item 5 says hybrid becomes the default only after the golden set passes. That
+   rule stands. `semantic` and `hybrid` are opt-in.
+4. **The model is taken from the semantic index's state, not from the settings.** A question must be embedded by the
+   model the passages were: another model gives vectors of the right length and a similarity that is silently
+   meaningless. `embedding_model` in `mirror.yaml` is what the *next* embed run will use; the query side reads the
+   `model` and `dimensions` the last run recorded in `state/index_semantic_<born>.json`. The query is sent as plain
+   text, the form the evaluation measured (D5).
+5. **No silent fallback.** A `semantic` or `hybrid` request that cannot be served is `503 semantic_unavailable`
+   with a plain reason, and is never answered with keyword results under another mode's name. A Qdrant failure on the
+   dense query keeps the existing `503 index_unavailable`. The MCP tool gives a fixed sentence the model can act on.
+6. **The semantic index is paired with the served store, and is usable only for the same snapshot.** `serving`
+   follows the `wikipedia_semantic` alias on the lexical alias's cadence (`ALIAS_RECHECK_SECONDS`) and accepts it only
+   when: the alias exists; its state is readable and `complete`; its `applied_snapshot` equals the served lexical
+   store's; it was cut by this code's chunker; and `embedding_url` is set. Otherwise `semantic` and `hybrid` are
+   unavailable with one plain reason, and health reports it (`search_modes`, and `semantic.searchable_reason`). The
+   pairing reads local state and Qdrant only, never the embedding server. An unpaired semantic index does not make
+   health `degraded`: nothing depends on it by default.
+7. **After a monthly build the answer is a clear 503 until the catch-up.** The build of 2026-11-02 moves the served
+   snapshot, and the semantic index stays on 2026-10-01 until the semantic catch-up exists
+   ([ROADMAP.md](ROADMAP.md#the-semantic-catch-up)). During that time a semantic hit's passage number and section
+   would point into the wrong month's text. So `semantic` and `hybrid` answer 503 with, for example, *the semantic
+   index is of snapshot 20261001, the articles served are of 20261101; the semantic catch-up brings it up to date*,
+   and `lexical` carries on. This is the intended behaviour, not a fault.
+8. **The query embedding comes from the API process itself, and the API user gets one outbound connection.** The
+   API calls the embedding server's `/api/embed` with its own key: `EMBEDDING_API_KEY` in the API's environment, that
+   is in `/etc/wiki-mirror/mirror.env` (the API unit's `EnvironmentFile`), a different key from the embed run's
+   `embedding.env` (D7), so either can be rotated alone. Until now the API user had no outbound connections at all
+   (D2, D6). It may now connect to the embedding server's host and port and nothing else. This is a change to who may
+   open a connection, so it is a security change: the nftables rule, the installer and the operations and security
+   documents change in the same release. The rule is one line, `meta skuid "wikimirror" ip daddr $EMBEDDING_V4 tcp
+   dport $EMBEDDING_PORT accept`, in its own `embedding-server` marker block, so a site with no `EMBEDDING_HOST` and
+   `EMBEDDING_PORT` in `site.env` gets no such rule and the API user is refused everything, as before. It sits above
+   the `wikimirror`/`qdrant` refusals, which stay above every other accept (so no later rule can widen what the two may
+   do); it is the only accept above them besides the established flows and loopback. Qdrant gets no exception. DNS
+   comes after the refusals, so the API user cannot resolve a name: `embedding_url` must hold the server's IPv4
+   address and port, the same as `site.env`. A box applies the rule only when `install.sh` is run again (the update
+   path reports a changed firewall and never applies it). The installer prints one line, and still succeeds, when
+   `site.env` names a server and `mirror.yaml` an `embedding_url` but `mirror.env` has no `EMBEDDING_API_KEY` line (a
+   keyless Ollama is valid); it never writes, rewrites or prints that line, and keeps `mirror.env` root:root 0600.
+   Its check that the API user is refused outbound connections still probes a public host and never connects to the
+   embedding server as that user. The client is synchronous (the routes are plain `def`), has no retries (a
+   person is waiting; the caller can ask again) and a 15 s timeout (a cold model load, the slowest healthy answer,
+   took about 1.5 s on the reference box; a warm embedding 25-70 ms). A new setting, `query_embedding_headers`, is
+   separate from `embedding_headers` because the bulk run's headers lower its priority (`X-Priority: 3` on the
+   reference box's router) and a person waiting on a search should not get background priority.
+
+**Alternatives considered.**
+
+* **Make hybrid the default now.** Rejected: the golden set and the fusion-weight check (W2 items 5 and 6) have not
+  run on the full index, and equal weights trailed dense alone on the evaluation sample.
+* **Fall back to keyword results when the semantic side fails.** Rejected: the reply would say `semantic` over
+  results that are not, which is the silent fallback that hides a broken dependency. A client that wants keywords
+  can ask for them.
+* **Embed the question in another process (the build user's, or a small service), so the API keeps no egress.** Not
+  chosen: the maintainer decided that the API embeds the question itself, which is one more moving part fewer, at
+  the price of one narrow egress rule for the API user.
+* **Take the model from `mirror.yaml`.** Rejected for the reason in item 4: a changed setting would silently break
+  every semantic query until the next full embedding run.
+* **A thread pool for the two lists of a hybrid query.** Not done: the embedding is tens of milliseconds and
+  nothing yet says the two Qdrant queries are worth reasoning about concurrently. Revisit with a measurement.
+
+**Consequences.**
+
+* **Not measured yet:** the latency of a `semantic` or `hybrid` request through the API (the embedding is about
+  25-70 ms warm and about 1.5 s on the first request after the model is loaded; a semantic query to Qdrant took about
+  45 ms cached, D9), and the quality of equal-weight fusion at full scale. The first is read off the first real
+  requests; the second is W2 item 6.
+* **The embedding server becomes a dependency of two modes.** When it is down, `semantic` and `hybrid` fail with
+  `503 semantic_unavailable`, and `lexical` does not notice. Health does not call it, so it does not show there.
+* **A key in `mirror.env` that the embedding server must accept.** Without `EMBEDDING_API_KEY` the API sends no
+  `Authorization` header (right for a server that wants none, a 401 for one that does, which is reported as a refused
+  key, naming the variable but never the key).
+* **Accepted:** an attacker who takes over the API process can now send requests to the embedding server with the
+  API's key, limited to what that server lets the key do. It still cannot reach any other host or port or resolve a
+  name; each attempt is counted in `service_refused` and logged. The mitigations are the narrow rule, a key of its own
+  that may embed and nothing more, and a rotation that does not touch the bulk run's key. The operator procedure and
+  the failure sentences are in [OPERATIONS.md](OPERATIONS.md#turning-on-semantic-and-hybrid-search).
+* **The operator command shows the reason.** `wiki-mirror search --mode semantic|hybrid` prints a
+  `semantic_unavailable` reply's reason and exits 1, and `wiki-mirror status` shows `search_modes` and the reason. For
+  that its API calls use `curl --fail-with-body` (curl 7.76; Debian 12 ships 7.88) so an error status still hands
+  over the reply's body.
+* **The monthly cycle has a gap until the catch-up.** From each build until the catch-up completes, `semantic` and
+  `hybrid` are unavailable. The gap is the catch-up's to close; hybrid cannot become the default before it does.
+* **Accepted:** a semantic request that is paired at the moment of a snapshot swap may see the unpaired reason once,
+  for the few milliseconds between the swap and the next pairing look.

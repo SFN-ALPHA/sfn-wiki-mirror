@@ -28,9 +28,12 @@ constraints in CLAUDE.md.
    (`/etc/wiki-mirror/enterprise.env`, 0600, readable by the build user). Never put them, a key, a key hash or a
    presigned URL in code, a fixture, a log line, an error message or an issue. Fixtures are small hand-made or
    sampled records (`tests/fixtures/wme/`); the real snapshot is never a fixture.
-6. **The API user has no egress and no write access to the data.** Do not add a path that makes the serving process
-   open an outbound connection or write to the store or the index. A change to who may open what in the firewall, to
-   the guard in `api.py`, or to `keys.py` is a security change: say so in the pull request.
+6. **The API user's only egress is the embedding server's address and port, and it has no write access to the
+   data.** That one connection exists so the API can embed a semantic question
+   ([D10](docs/DECISIONS.md#d10)); the firewall admits it only when `site.env` names a server. Do not add a path that
+   makes the serving process open any other outbound connection or write to the store or the index. A change to who
+   may open what in the firewall, to the guard in `api.py`, or to `keys.py` is a security change: say so in the pull
+   request.
 7. **No real addresses.** Use the documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) or the
    guide's `192.168.1.x` examples in docs. Tests that need a private LAN use the shared address space (`100.64.x`),
    which the installer accepts and is nobody's own network. Never write your own LAN into the repository.

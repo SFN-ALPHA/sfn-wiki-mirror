@@ -31,6 +31,9 @@
 #   7. Qdrant         the pinned release, checksum-verified, and its config.
 #   8. Config         mirror.yaml, mirror.env with a generated API key (the primary key), and an
 #                     empty clients.json (the other agents' key hashes; `wiki-mirror key add`).
+#                     The API's own key for the embedding server (EMBEDDING_API_KEY in mirror.env)
+#                     is the operator's to add, never written or touched here; the installer only
+#                     says when an embedding server is named and that line is missing.
 #   9. Units          the systemd units installed; qdrant + API + the monthly build timer + the
 #                     15-minute maintenance timer enabled. The nightly update timer (02:20 local
 #                     time) is enabled only with --auto-update, or when it already is (a re-run
@@ -48,8 +51,9 @@
 # /etc/wiki-mirror/site.env (root:root 0644, no secrets; the template is deploy/site.env.example).
 # A first run installs the example there and STOPS; so does a file that still equals the example
 # or holds anything but a valid LAN_CIDR and either both embedding values or neither (the
-# embedding server is for the planned semantic index; without it the ruleset has no rule for it at
-# all). The file is parsed as data, never sourced, and each value must match a
+# embedding server serves the semantic index's embedding run and the API's semantic and hybrid
+# searches; without one the ruleset has no rule for it at all, for either user). The file is
+# parsed as data, never sourced, and each value must match a
 # strict IPv4 / CIDR / port pattern before it is substituted into a ruleset that loads as root.
 # The LAN must be /8 or longer and inside RFC 1918 or 100.64.0.0/10, since SSH and the API are
 # admitted from everything in it. The file must be root's and not writable by anyone else, and
@@ -71,6 +75,9 @@
 #   * The values in site.env. The example is installed; choosing your network is yours.
 #   * The Wikimedia Enterprise sign-in (/etc/wiki-mirror/enterprise.env). docs/OPERATIONS.md
 #     has the `read -r -s` command; the installer only fixes its owner and mode.
+#   * The API's key for the embedding server (EMBEDDING_API_KEY in mirror.env). The operator
+#     issues it on the embedding server, a separate one from the bulk run's, and adds the line;
+#     the installer never writes, rewrites or prints it.
 #   * The first build. `wiki-mirror build-now` is the operator's call: it downloads about 150 GB and runs
 #     for hours.
 #
@@ -443,10 +450,10 @@ embedding_port_problem() {
 # in SITE_PROBLEMS rather than stopping at the first, so one pass tells the operator all there is
 # to fix; if there is any, the three variables are left empty so nothing half-valid can be used.
 #
-# LAN_CIDR is required. The embedding server is optional (nothing in the service calls one yet; it
-# is for the planned semantic index), but its two values come as a pair: both given, or neither.
-# A key that is absent or has an empty value counts as not given; exactly one given is a problem,
-# because half an egress rule cannot be rendered. A given value is validated whether or not its
+# LAN_CIDR is required. The embedding server is optional (the semantic index's embedding run and
+# the API's semantic and hybrid searches call it; lexical search does not), but its two values
+# come as a pair: both given, or neither. A key that is absent or has an empty value counts as not
+# given; exactly one given is a problem, because half an egress rule cannot be rendered. A given value is validated whether or not its
 # partner is, so a typo is reported as a typo and not only as a missing half.
 #
 # The file is never sourced or evaluated. A line is accepted only if it is blank, a comment, or
@@ -607,8 +614,8 @@ check_site() {
 
       LAN_CIDR=192.168.1.0/24
 
-    and, only if you run an embedding server for the planned semantic index, these two as well
-    (both or neither):
+    and, only if you run an embedding server (for the semantic index and for semantic and
+    hybrid search), these two as well (both or neither):
 
       EMBEDDING_HOST=192.168.1.60
       EMBEDDING_PORT=8080
@@ -625,8 +632,8 @@ check_site() {
     It holds the values that differ between sites and that the firewall is built from, all of
     them commented out as shipped:
       LAN_CIDR         your IPv4 network, e.g. 192.168.1.0/24 (SSH, the API and DNS use it)
-      EMBEDDING_HOST   optional: IPv4 address of an embedding server the build user may reach,
-      EMBEDDING_PORT   and its TCP port. Both or neither.
+      EMBEDDING_HOST   optional: IPv4 address of an embedding server the build user and the
+      EMBEDDING_PORT   API may reach (that host and port only), and its TCP port. Both or neither.
     Remove the leading '# ' from the LAN_CIDR line and write your own network there, then run
     this installer again. Nothing else has been changed."
         return 0
@@ -666,9 +673,9 @@ $(site_problem_lines)
         return 0
     fi
     if [[ -n "$EMBEDDING_HOST" ]]; then
-        info "site file $SITE_FILE: LAN $LAN_CIDR, embedding server $EMBEDDING_HOST port $EMBEDDING_PORT"
+        info "site file $SITE_FILE: LAN $LAN_CIDR, embedding server $EMBEDDING_HOST port $EMBEDDING_PORT (the build user and the API user may connect to that address and port)"
     else
-        info "site file $SITE_FILE: LAN $LAN_CIDR, no embedding server (the ruleset gets no rule for one)"
+        info "site file $SITE_FILE: LAN $LAN_CIDR, no embedding server (the ruleset gets no rules for one)"
     fi
     check_lan_reach
 }
@@ -1351,6 +1358,18 @@ install_qdrant() {
 # 8. Configuration and the API key
 # ---------------------------------------------------------------------------
 
+# True when the installed mirror.yaml gives `embedding_url` a value: a top-level line whose value
+# is not empty, `null` or `~`. A line match, not a YAML parse, on purpose: the answer only decides
+# whether install_config prints one informational line, and a mirror.yaml the service cannot load
+# is stopped by the service at start (config validation), not here.
+mirror_yaml_sets_embedding_url() {
+    local value
+    value="$(sed -n 's/^embedding_url:[[:space:]]*//p' "$CONF_DIR/mirror.yaml" 2>/dev/null | head -1)" || true
+    value="${value%%#*}"
+    value="${value%"${value##*[![:space:]]}"}"
+    [[ -n "$value" && "$value" != null && "$value" != '~' ]]
+}
+
 install_config() {
     step "Configuration"
     # mirror.yaml: group wikimirror (both service users read it). qdrant.yaml: world-readable
@@ -1379,6 +1398,16 @@ install_config() {
         unset key
         ok "generated WIKI_MIRROR_API_KEY (not shown; docs/OPERATIONS.md has the copy-to-client command)"
         REMAINING+=("Give WIKI_MIRROR_API_KEY (the primary key) to the client that will call this API; docs/OPERATIONS.md section 6 covers clients and keys")
+    fi
+
+    # The API's own key for the embedding server (D10): the operator's to issue and add, so it is
+    # never written, rewritten or printed here, and only mentioned when it could matter: a server
+    # is named in site.env (the firewall admits the API to it) and mirror.yaml points at one. Only
+    # information, never a failure: an Ollama that wants no key is a valid setup, and a line that
+    # is present (even empty) is the operator's decision.
+    if [[ -n "$EMBEDDING_HOST" ]] && mirror_yaml_sets_embedding_url \
+        && ! grep -q '^EMBEDDING_API_KEY=' "$MIRROR_ENV" 2>/dev/null; then
+        info "semantic and hybrid search call the embedding server as the API user, and $MIRROR_ENV has no EMBEDDING_API_KEY line. A server that wants no key needs nothing; if it requires one, add the API's own key (docs/OPERATIONS.md, \"Turning on semantic and hybrid search\")"
     fi
 
     # The other agents' keys (Claude Code, ...), managed with `wiki-mirror key add|revoke`.
@@ -1473,21 +1502,24 @@ install_units() {
 # ---------------------------------------------------------------------------
 
 # The template puts everything that exists only because there is an embedding server - its two
-# `define` lines and its one egress rule - between these two comment lines. nft rejects a rule
-# that names an undefined variable, so a site without an embedding server cannot just leave the
-# values empty: render_firewall drops the bracketed lines, markers included, and keeps them
-# (as plain comments) when there is one.
+# `define` lines and its two egress rules (the API's, in the output chain above the service
+# refusals, and the build user's) - in three blocks, each between these two comment lines. nft
+# rejects a rule that names an undefined variable, so a site without an embedding server cannot
+# just leave the values empty: render_firewall drops every bracketed block, markers included, and
+# keeps them (as plain comments) when there is one. Any number of blocks works; they are paired
+# one at a time.
 EMBEDDING_BEGIN='# >>> embedding-server'
 EMBEDDING_END='# <<< embedding-server'
 
 # Print the firewall template $1 with the validated site values (LAN_CIDR and, if the site has an
 # embedding server, EMBEDDING_HOST and EMBEDDING_PORT) in place of its placeholders; with no
-# embedding server, the lines between the EMBEDDING_BEGIN and EMBEDDING_END markers are left out
-# instead. Returns 1, printing nothing to stdout, if the template is missing or empty, its
-# markers are not paired, the embedding server is half-set (read_site_file never lets that
-# through), the embedding rule is still referred to outside its markers, or any placeholder is
-# left afterwards (a template that gained one this script does not know would otherwise load as
-# a syntax error, or worse).
+# embedding server, the lines between each EMBEDDING_BEGIN and EMBEDDING_END pair are left out
+# instead, so the API user's one permitted connection (D10) exists only when a server is named.
+# Returns 1, printing nothing to stdout, if the template is missing or empty, its markers are not
+# paired, the embedding server is half-set (read_site_file never lets that through), an embedding
+# rule is still referred to outside its markers, or any placeholder is left afterwards (a
+# template that gained one this script does not know would otherwise load as a syntax error, or
+# worse).
 #
 # The substitution is plain parameter expansion, so nothing is evaluated; and the values are
 # digits, dots and one slash by construction (read_site_file), so none of them can carry
@@ -1663,7 +1695,7 @@ install_firewall() {
         render_firewall "$src" | grep -E '^[[:space:]]*define (LAN_V4|EMBEDDING_V4|EMBEDDING_PORT) ' \
             | sed 's/^[[:space:]]*/        /' || true
         if [[ -z "$EMBEDDING_HOST" ]]; then
-            info "        (no embedding server in $SITE_FILE: the ruleset would have no rule for one)"
+            info "        (no embedding server in $SITE_FILE: the ruleset would have no rules for one)"
         fi
         if [[ -f "$dst" ]] && render_firewall "$src" | cmp -s - "$dst"; then
             skip "$dst matches the rendered template"
@@ -1805,9 +1837,16 @@ verify() {
         warn "$SYNC_USER cannot reach api.enterprise.wikimedia.com - the first build would fail"
         REMAINING+=("$SYNC_USER has no route to Wikimedia Enterprise: check DNS and the firewall")
     fi
+    # The API user's probe goes to a public host, never to the embedding server: the one
+    # connection its rule admits (D10) is deliberately not exercised here, because the installer
+    # should send the embedding server nothing as that user, and a server that happens to be down
+    # is not an install fault. `wiki-mirror search --mode semantic` is the end-to-end check
+    # (docs/OPERATIONS.md). Every other destination stays refused, so the claim below is exact.
     if runuser -u "$API_USER" -- curl -sS --max-time 5 -o /dev/null https://github.com 2>/dev/null; then
         warn "$API_USER REACHED the internet - the egress rule for it is not in force"
         REMAINING+=("The API user can reach the internet: inspect 'nft list chain inet wiki_mirror output'")
+    elif [[ -n "$EMBEDDING_HOST" ]]; then
+        ok "$API_USER is refused outbound connections other than to the embedding server, as designed"
     else
         ok "$API_USER is refused outbound connections, as designed"
     fi

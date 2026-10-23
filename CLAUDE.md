@@ -47,8 +47,10 @@ Read these before any change. They are the ways this repository can lose data or
    by the build user alone). They are never in the repository, a fixture, a log, an error message or model context.
    The real snapshot is not a test fixture either; fixtures are small hand-made or sampled records
    (`tests/fixtures/wme/`).
-6. **The API user has no egress and no write access to the data.** Do not add a code path that makes the serving
-   process open an outbound connection or write to the store or the index. Network egress is per Unix user in
+6. **The API user has one egress, and no write access to the data.** Its only outbound connection is the query
+   embedding of a `semantic` or `hybrid` search, to the embedding server's host and port with its own key
+   (`query_embed`, [D10](docs/DECISIONS.md#d10)). Do not add any other code path that makes the serving process open
+   an outbound connection, or write to the store or the index. Network egress is per Unix user in
    nftables; a change to who may open what is a security change, reviewed as one. The ruleset is a template: the
    site's own addresses (LAN, embedding server) live in `/etc/wiki-mirror/site.env` and are validated by
    `deploy/install.sh` before they reach it. Never write a real address into the repository, in code, a doc or a test;

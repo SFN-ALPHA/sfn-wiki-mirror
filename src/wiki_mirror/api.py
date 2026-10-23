@@ -5,7 +5,8 @@ Called over the LAN with a bearer key: by the primary client (the one holding
 `/mcp` (`mcp_server`), each with a key of its own. Everything else, the download, parse and
 index stages, runs from the command line
 (`wiki_mirror.__main__`), never from a route: the API process runs as a user with no
-internet and no write access to the data.
+internet and no write access to the data, whose only outbound connection is the embedding of a
+semantic question (`query_embed`, docs/DECISIONS.md D10).
 
 Non-obvious constraints:
 
@@ -45,8 +46,16 @@ Non-obvious constraints:
   collection the `wikipedia_semantic` alias points at, asked live from Qdrant (status, optimizer,
   counts, whether its embedding run completed); `maintenance` is the record the maintenance job
   leaves (`maintenance_record`). Both are `null` when there is none, and neither changes the
-  status by itself: nothing searches the semantic collection yet. (The maintenance record's
-  *age*, a recent crash and memory pressure do, as above.)
+  status by itself: nothing depends on the semantic collection unless a search asks for it.
+  (The maintenance record's *age*, a recent crash and memory pressure do, as above.)
+* **Search has three modes, one result shape** (`search`): `lexical` (the default), `semantic` and
+  `hybrid`. A `semantic` or `hybrid` request that cannot be served is `503 semantic_unavailable`
+  with a plain reason (no semantic index for the snapshot served, or the embedding server did not
+  answer), never keyword results under another mode's name (docs/DECISIONS.md D10). The embedding
+  is the one outbound connection this process makes: to `embedding_url` only, with the API's own
+  `EMBEDDING_API_KEY`; the firewall allows nothing else.
+* **Health also lists `search_modes`**, the modes a search can use right now, and the reason
+  semantic is off in the `semantic` block (`searchable_reason`).
 * **Health also carries the last code update** (`update`: when, from and to which commit, and
   the outcome: `updated`, `current`, `deferred`, `held`, `failed` or `rolled_back`), read from the
   file `deploy/update.sh` leaves. It is `null` when there is none, and it never changes
@@ -93,7 +102,7 @@ from wiki_mirror.maintenance_record import (
 )
 from wiki_mirror.mcp_server import MCP_PATH, build_mcp_door
 from wiki_mirror.records import MAX_PAGE_ID
-from wiki_mirror.search import reply_as_dict
+from wiki_mirror.search import SearchMode, SemanticUnavailableError, reply_as_dict
 from wiki_mirror.serving import ServedSnapshot, Serving
 from wiki_mirror.update_record import read_update_record
 
@@ -143,6 +152,9 @@ class SearchBody(BaseModel):
     query: str = Field(min_length=1, max_length=500)
     #: Most articles to return.
     limit: int = Field(default=8, ge=1, le=20)
+    #: How to rank. `lexical` stays the default until the golden set and the fusion-weight check
+    #: pass (docs/ROADMAP.md W2 items 5 and 6); `semantic` and `hybrid` are opt-in.
+    mode: SearchMode = "lexical"
 
 
 class ServiceHealth:
@@ -157,11 +169,16 @@ class ServiceHealth:
     * `update`: the last run of `deploy/update.sh`, or null. Reported only.
     * `semantic`: the collection behind the `wikipedia_semantic` alias as Qdrant reports it now
       (`collection`, `status`, `optimizer_status`, `points`, `indexed_vectors`, `segments`, and
-      `complete`, whether its embedding run finished), or null when there is no such alias or
-      Qdrant could not be asked. It never changes `status`: nothing searches it yet.
+      `complete`, whether its embedding run finished, and `searchable_reason`, the plain reason
+      `semantic` and `hybrid` searches cannot be served now, or null when they can), or null
+      when there is no such alias or Qdrant could not be asked. It never changes `status`: an
+      unpaired semantic index is not a fault, because nothing depends on it by default.
     * `maintenance`: the maintenance job's last record (`maintenance_record`), or null when there
       is no trustworthy one (the normal state before the timer is first enabled). Its age, a
       recent Qdrant crash and Qdrant's memory against its cap can make `status` `degraded`.
+    * `search_modes`: the modes a search can use right now (`lexical`, and `semantic` and `hybrid`
+      when the semantic index is paired with the snapshot served), empty while nothing is served.
+      Read from the pairing `serving` keeps; the embedding server is never called.
     """
 
     def __init__(
@@ -232,6 +249,10 @@ class ServiceHealth:
                 else:
                     self._note_count(None)
             articles = self._article_count(serving)
+            # From the pairing `serving` keeps (local state and Qdrant): health never calls the
+            # embedding server, which a poll must not wait on.
+            modes = list(serving.search.modes) if serving is not None else []
+            searchable_reason = serving.search.semantic_reason if serving is not None else None
             snapshot = serving.store.snapshot.date if serving is not None else None
             applied = serving.applied_snapshot if serving is not None else None
             stale = self._is_stale(snapshot)
@@ -256,22 +277,26 @@ class ServiceHealth:
             # held or rolled-back update leaves the previous code serving, which is not a fault
             # of the mirror, and reading it can never fail health (update_record).
             "update": read_update_record(self._config.data_dir),
-            "semantic": self._semantic(counted),
+            "semantic": self._semantic(counted, searchable_reason),
             "maintenance": None if record is None else record_as_dict(record),
+            "search_modes": modes,
         }
 
-    def _semantic(self, counted: bool) -> dict[str, Any] | None:
+    def _semantic(self, counted: bool, searchable_reason: str | None) -> dict[str, Any] | None:
         """The collection the semantic alias points at, asked from Qdrant now.
 
         Args:
             counted: Whether the passage count succeeded this poll. When it did not, Qdrant is
                 down or hung and asking again would cost health a second and third timeout for
                 nothing, so the lookup is skipped.
+            searchable_reason: Why `semantic` and `hybrid` searches cannot be served now (the
+                holder's verdict, `WikiSearch.semantic_reason`), or None when they can.
 
         Returns:
-            Its status, optimizer status, counts and whether its embedding run completed; None
-            when the alias does not exist or Qdrant could not be asked (logged, never raised:
-            health must answer, and the semantic index is not yet on the serving path).
+            Its status, optimizer status, counts, whether its embedding run completed and
+            `searchable_reason`; None when the alias does not exist or Qdrant could not be asked
+            (logged, never raised: health must answer, and nothing depends on the semantic index
+            unless a search asks for it).
         """
         if not counted:
             return None
@@ -302,6 +327,7 @@ class ServiceHealth:
             "indexed_vectors": info.indexed_vectors_count,
             "segments": info.segments_count,
             "complete": self._embedding_complete(name),
+            "searchable_reason": searchable_reason,
         }
 
     def _note_semantic_lookup(self, error: str | None) -> None:
@@ -713,14 +739,37 @@ def create_app(
 
     @app.post("/v1/wiki/search")
     def search_route(body: SearchBody, request: Request) -> Response:
-        """Keyword search: one result per article, best first."""
+        """Search in the requested mode: one result per article, best first, one shape."""
         request_id: str = request.state.request_id
         client: str = request.state.client
         try:
             with served.lease() as serving:
                 if serving is None:
                     return _not_ready()
-                reply = serving.search.search(body.query, body.limit)
+                reply = serving.search.search(
+                    body.query, body.limit, body.mode, request_id=request_id
+                )
+        except SemanticUnavailableError as unavailable:
+            # Never keyword results under another mode's name: the caller asked for the meaning of
+            # the question and is told plainly that it cannot be had. The reason is one of
+            # `serving`'s or `query_embed`'s fixed sentences; the query is not in the log.
+            logger.warning(
+                "semantic search unavailable request=%s client=%s mode=%s kind=%s reason=%s",
+                request_id,
+                client,
+                body.mode,
+                unavailable.kind,
+                unavailable.reason,
+                extra={
+                    "component": "api",
+                    "event": "semantic_unavailable",
+                    "request_id": request_id,
+                    "client": client,
+                    "mode": body.mode,
+                    "kind": unavailable.kind,
+                },
+            )
+            return _error(503, "semantic_unavailable", unavailable.reason)
         except (UnexpectedResponse, ResponseHandlingException):
             logger.exception(
                 "the index refused the query request=%s client=%s",
@@ -735,9 +784,10 @@ def create_app(
             )
             return _error(503, "index_unavailable", "the passage index could not answer")
         logger.info(
-            "search request=%s client=%s query_chars=%d results=%d",
+            "search request=%s client=%s mode=%s query_chars=%d results=%d",
             request_id,
             client,
+            reply.mode,
             len(body.query),
             len(reply.results),
             extra={
@@ -745,6 +795,7 @@ def create_app(
                 "event": "search",
                 "request_id": request_id,
                 "client": client,
+                "mode": reply.mode,
                 "query_chars": len(body.query),
                 "results": len(reply.results),
             },

@@ -5,8 +5,9 @@ build has finished. It reads the article store that the live lexical collection 
 article into the same passages the lexical build cut (`index.indexable_chunks`), asks an
 Ollama-compatible embedding server for one vector per passage and upserts them into
 `wikipedia_semantic_<born>`, where `<born>` is the tag of that store's snapshot. When every passage
-is in, HNSW is switched on and the alias `wikipedia_semantic` is pointed at the collection. Nothing
-reads the collection yet: hybrid search is later work (docs/DESIGN.md section 12.5).
+is in, HNSW is switched on and the alias `wikipedia_semantic` is pointed at the collection. The
+API's semantic and hybrid search modes read it (`serving`, `search`, docs/DECISIONS.md D10), with a
+question embedded by `query_embed` using the model this stage recorded in the state.
 
 Non-obvious constraints:
 
@@ -102,7 +103,6 @@ from wiki_mirror.index import (
     passage_payload,
 )
 from wiki_mirror.records import Article, ArticleSource, passage_point_id
-from wiki_mirror.serving import open_store_for_snapshot
 from wiki_mirror.store import ArticleStore, StoreError
 from wiki_mirror.text.sanitize import Chunk
 
@@ -118,17 +118,20 @@ __all__ = [
     "EmbedError",
     "Embedder",
     "EmbeddingClient",
+    "SemanticIndexInfo",
+    "checked_vectors",
     "collection_name",
     "open_source_store",
     "passage_embedding_text",
     "run_embed",
     "semantic_index_complete",
+    "semantic_index_info",
     "semantic_state_file",
 ]
 
 logger = logging.getLogger("wiki_mirror.embed")
 
-#: The name a later hybrid search will follow. An alias, like the lexical one.
+#: The name semantic and hybrid search follow (`serving`). An alias, like the lexical one.
 ALIAS: Final = "wikipedia_semantic"
 
 #: `wikipedia_semantic_<born>`, where the group is the born tag (`collection_name`).
@@ -306,6 +309,58 @@ def semantic_index_complete(data_dir: Path, collection: str, *, quiet: bool = Fa
     return state is not None and state.complete
 
 
+@dataclass(frozen=True)
+class SemanticIndexInfo:
+    """What a semantic collection's state file says about the vectors in it.
+
+    The query side (`serving`, `query_embed`) needs these facts and no more: a question must be
+    embedded by the model and at the length the passages were, and the index must reflect the
+    snapshot being served.
+    """
+
+    #: The embedding run finished: every passage is in, HNSW is on, the alias points here.
+    complete: bool
+    #: The model the passages were embedded with (as the server named it, e.g. `bge-m3:latest`).
+    model: str
+    #: The length of every vector in the collection.
+    dimensions: int
+    #: The snapshot tag the vectors reflect; empty until the run completes.
+    applied_snapshot: str
+    #: `index.chunker_fingerprint()` of the code that cut the passages.
+    chunker: str
+
+
+def semantic_index_info(
+    data_dir: Path, collection: str, *, quiet: bool = False
+) -> SemanticIndexInfo | None:
+    """What the state file of semantic collection `collection` records, or None.
+
+    Args:
+        data_dir: The service's local data directory.
+        collection: A collection name, normally `wikipedia_semantic_<born>`.
+        quiet: Do not log an unreadable state file (serving looks again every few seconds).
+
+    Returns:
+        The recorded facts; None for a name this module does not create, an absent or unreadable
+        state, and another collection's state. The caller cannot tell those apart, and does not
+        need to: none of them is a state anyone can pair a query with.
+    """
+    found = _OWN_COLLECTION.fullmatch(collection)
+    if found is None:
+        return None
+    born = found[1]
+    state = _read_state(semantic_state_file(data_dir, born), born, quiet=quiet)
+    if state is None:
+        return None
+    return SemanticIndexInfo(
+        complete=state.complete,
+        model=state.model,
+        dimensions=state.dimensions,
+        applied_snapshot=state.applied_snapshot,
+        chunker=state.chunker,
+    )
+
+
 def passage_embedding_text(article: Article, chunk: Chunk) -> str:
     """The text a passage is embedded as: its article title, heading and body (`TEXT_FORM`).
 
@@ -433,7 +488,7 @@ class EmbeddingClient:
             msg = "the embedding server answered something that is not JSON"
             raise EmbedError(msg) from None
         vectors = reply.get("embeddings") if isinstance(reply, dict) else None
-        return _checked_vectors(vectors, len(texts), self._dimensions)
+        return checked_vectors(vectors, len(texts), self._dimensions)
 
     async def _post(self, body: dict[str, Any]) -> httpx.Response:
         """POST one request, retrying what is transient (the module docstring).
@@ -508,8 +563,12 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
     return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
-def _checked_vectors(vectors: object, count: int, dimensions: int) -> list[list[float]]:
+def checked_vectors(vectors: object, count: int, dimensions: int) -> list[list[float]]:
     """Return `vectors` as floats if there are exactly `count` of `dimensions` finite numbers.
+
+    The one definition of a valid `/api/embed` reply, shared by the bulk client above and the
+    API's query embedding (`query_embed`): a vector on the wrong point is as bad for a question
+    as for a passage.
 
     Raises:
         EmbedError: Anything else. The message holds counts only, never a value.
@@ -634,6 +693,10 @@ def open_source_store(config: MirrorConfig, client: QdrantClient) -> ArticleStor
             f"{chunker_fingerprint()!r}; the passages would not match, rebuild the index first"
         )
         raise EmbedError(msg)
+    # Imported here, not at the top, because `serving` follows the semantic alias and so imports
+    # this module: a top-level import in both directions cannot be resolved.
+    from wiki_mirror.serving import open_store_for_snapshot
+
     try:
         return open_store_for_snapshot(config, tag)
     except StoreError as exc:

@@ -3,7 +3,7 @@
 **Audience:** whoever writes a client for the mirror's HTTP API. For MCP clients (Claude Code and others) see
 [MCP.md](MCP.md); both doors run the same search code, so a query ranks identically through either.
 
-Everything here is read from the code (`src/wiki_mirror/api.py`, `search.py`, `keys.py`, `config.py`) and
+Everything here is read from the code (`src/wiki_mirror/api.py`, `search.py`, `query_embed.py`, `keys.py`, `config.py`) and
 checked by running the real application against a test index. Example content is made up. **The service publishes
 no OpenAPI document** (`/openapi.json`, `/docs` and `/redoc` are disabled and answer 401/404 like any unknown
 path), so this page is the complete contract.
@@ -13,7 +13,7 @@ request needs a key.
 
 | Method and path | Purpose |
 |---|---|
-| `POST /v1/wiki/search` | Keyword search, one result per article |
+| `POST /v1/wiki/search` | Search by keyword, by meaning or both (`mode`), one result per article |
 | `GET /v1/wiki/article` | One window of one article's text, by page id or title |
 | `GET /v1/wiki/health` | Snapshot, counts, build state, last update, and whether to trust the service |
 | `POST /mcp` | The MCP server ([MCP.md](MCP.md)) |
@@ -42,21 +42,46 @@ response header (on errors too) and appears in every log line for the request, t
 
 ## `POST /v1/wiki/search`
 
-Keyword search over the passage index, one result per article, best first.
+Search over the passage indexes, one result per article, best first, in one of three modes.
 
 Request body (JSON; `Content-Type: application/json`; unknown fields are rejected with 422):
 
 | Field | Type | Bounds | Default | Meaning |
 |---|---|---|---|---|
-| `query` | string | 1 to 500 characters | required | Keywords or a question. Stop-words are dropped, so distinctive names and phrases work better than whole sentences. |
+| `query` | string | 1 to 500 characters | required | Keywords or a question. In `lexical` mode stop-words are dropped, so distinctive names and phrases work better than whole sentences; `semantic` and `hybrid` take a question in plain words. |
 | `limit` | integer | 1 to 20 | 8 | Most articles to return. |
+| `mode` | string | `lexical`, `semantic` or `hybrid` | `lexical` | How to rank; see below. |
+
+**Modes.** Every mode returns the same reply and the same result fields (page id, title and the rest), so a client
+reads one shape whichever it asks for; the reply's `mode` names the one that answered, always the one you asked for.
+
+| `mode` | Ranks by | Good for |
+|---|---|---|
+| `lexical` (default) | Keywords (BM25-style) over the passage index | Names and exact terms |
+| `semantic` | Cosine similarity of the question's embedding to each passage's embedding | Questions in plain words, when you do not know the terms the article uses |
+| `hybrid` | Both rankings fused with reciprocal rank fusion (RRF, k=60, equal weights) | Both |
+
+`lexical` stays the default until the golden set and the fusion-weight check pass ([ROADMAP.md](ROADMAP.md) W2 items 5
+and 6); `semantic` and `hybrid` are opt-in. Hybrid fuses passages, keyed on (point id, `text_hash`), then keeps the
+best fused passage of each article. A `hybrid` query with no searchable term (`???`) is answered from the semantic
+ranking alone and still says `hybrid`.
+
+**A `semantic` or `hybrid` request that cannot be served fails; it is never answered with keyword results.** It gets
+`503 semantic_unavailable` with a plain reason in `detail`, when any of these holds: there is no semantic index; its
+embedding run is not complete; it was cut by another chunker than the running code's; it is of another snapshot than
+the articles being served (the month after a build, until the semantic catch-up, [ROADMAP.md](ROADMAP.md): its
+snippets would be cut from the wrong text); `embedding_url` is not set; or the embedding server did not answer the
+question (not reachable, timed out after 15 seconds, refused the API's key, answered another status, or answered
+something that is not one valid vector). `lexical` keeps working through all of these. Health says which modes are
+usable now (`search_modes`).
 
 Ranking:
 
 - An article whose **title or redirect alias equals the whole query** comes first regardless of score
-  (`Einstein` finds *Albert Einstein*).
+  (`Einstein` finds *Albert Einstein*), in every mode.
 - Then articles by their best passage's score, then **disambiguation pages** by score.
-- A query with no searchable term (`the`, `???`) returns an empty `results` array with status 200.
+- In `lexical` mode, a query with no searchable term (`the`, `???`) returns an empty `results` array with status
+  200. In `semantic` mode any non-blank text can be embedded, so there is no such case.
 - The array may hold fewer than `limit` entries: only the best `limit x 4` passages are fetched, and several
   passages of one long article can fill them.
 - A hit whose passage was cut from different text than the stored article is dropped (this only matters during an
@@ -86,13 +111,13 @@ Reply `200`:
 | Field | Type | Meaning |
 |---|---|---|
 | `snapshot` | string | Date of the snapshot served, `YYYY-MM-DD`: how old the answer can be (up to about a month, longer if monthly builds are failing). |
-| `mode` | string | The ranking mode that answered: `lexical` (keyword) today. The semantic build ([ROADMAP.md](ROADMAP.md)) will add `hybrid`. Read it rather than assume. |
+| `mode` | string | The ranking mode that answered: `lexical`, `semantic` or `hybrid`, the one the request asked for (`lexical` when it did not say). Read it to know which meaning `score` has. |
 | `results[].page_id` | integer | Wikipedia page id. Pass it to the article route. |
 | `results[].revision_id` | integer | The revision the mirror holds. |
 | `results[].title` | string | Display title. |
 | `results[].section` | string | Section path of the matching passage, empty before the first heading. |
 | `results[].snippet` | string | Up to 320 characters of the matching passage, whitespace collapsed, cut at a word boundary with `…`. It is the start of the passage, so it does not always contain the matched words. |
-| `results[].score` | number | The passage's keyword (BM25-style) score; `0.0` for a title match that no passage hit. Comparable within one reply only. |
+| `results[].score` | number | The best passage's score, in the reply's `mode`: the keyword (BM25-style) score for `lexical`, the cosine similarity (at most 1) for `semantic`, the RRF sum for `hybrid` (a passage first in both rankings scores 2/61, about 0.033). `0.0` for a title match that no passage hit. The three are not comparable with each other, and a score is comparable within one reply only. |
 | `results[].url` | string | Permanent link to the exact revision. What an answer cites. |
 | `results[].disambiguation` | boolean | True for a "may refer to" page. |
 
@@ -100,6 +125,11 @@ Reply `200`:
 curl -s -X POST http://<mirror-host>:8300/v1/wiki/search \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"query": "zeppelin rigid airship", "limit": 3}'
+
+# the same, ranked by meaning, then by both
+curl -s -X POST http://<mirror-host>:8300/v1/wiki/search \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"query": "which airship exploded over New Jersey", "mode": "hybrid"}'
 ```
 
 ```python
@@ -213,8 +243,10 @@ No parameters. Whether the service can be trusted, and what it is serving.
   },
   "semantic": {
     "collection": "wikipedia_semantic_20261001", "status": "green", "optimizer_status": "ok",
-    "points": 41590915, "indexed_vectors": 41590915, "segments": 85, "complete": true
+    "points": 41590915, "indexed_vectors": 41590915, "segments": 85, "complete": true,
+    "searchable_reason": null
   },
+  "search_modes": ["lexical", "semantic", "hybrid"],
   "maintenance": {
     "ran_at": "2026-10-23T18:30:04Z",
     "qdrant": {
@@ -253,7 +285,8 @@ The numbers in the `semantic` and `maintenance` blocks are an illustration of th
 | `collection` | string or null | The Qdrant collection served. |
 | `build` | object | The last or current build: `snapshot_date`, `phase` (`idle`, `downloading`, `parsing`, `indexing`, `serving`, `failed`), chunk counts, `passages_indexed`, `articles`, `error` (short, no secrets; empty unless failed), `updated_at`. If the state file is unreadable: `{"phase": "unknown", "error": "..."}`. |
 | `update` | object or null | The last code update: `at`, `from`, `to` (commit ids; `to` may be null), `outcome` (`updated`, `current`, `deferred`, `held`, `failed`, `rolled_back`), `detail`, `unattended`. `null` if none recorded. Reporting only; it never changes `status`. |
-| `semantic` | object or null | The collection behind the `wikipedia_semantic` alias, asked from Qdrant on every call: `collection`, `status` (Qdrant's: `green`, `yellow` while it builds the search graph, `grey` when its optimizations are paused, `red` when the optimizer failed), `optimizer_status` (`ok`, or `error: <Qdrant's text>`, cut to 300 characters), `points`, `indexed_vectors`, `segments`, and `complete` (whether its embedding run finished, from the run's state file). `null` when there is no such alias or Qdrant could not be asked (when the passage count failed, the lookup is skipped and `semantic` is `null` for that poll). Reporting only; it never changes `status`, because nothing searches this collection yet. |
+| `semantic` | object or null | The collection behind the `wikipedia_semantic` alias, asked from Qdrant on every call: `collection`, `status` (Qdrant's: `green`, `yellow` while it builds the search graph, `grey` when its optimizations are paused, `red` when the optimizer failed), `optimizer_status` (`ok`, or `error: <Qdrant's text>`, cut to 300 characters), `points`, `indexed_vectors`, `segments`, and `complete` (whether its embedding run finished, from the run's state file). `null` when there is no such alias or Qdrant could not be asked (when the passage count failed, the lookup is skipped and `semantic` is `null` for that poll). It also carries `searchable_reason`: why `semantic` and `hybrid` searches cannot be served now, one plain sentence (for example that the semantic index is of an earlier snapshot than the articles served), or `null` when they can. Reporting only; it never changes `status`, because nothing depends on this collection unless a search asks for it. |
+| `search_modes` | array of strings | The modes a search can use right now: `lexical`, and `semantic` and `hybrid` when the semantic index is usable with the snapshot served. Empty while nothing is served. Read from the pairing the service keeps with local state and Qdrant; a health poll never calls the embedding server, so a down embedding server shows only as a failed search (`503 semantic_unavailable`), not here. |
 | `maintenance` | object or null | The maintenance job's last record, as written ([OPERATIONS.md](OPERATIONS.md#the-maintenance-job)): `ran_at` (UTC), `qdrant` (the unit: `found`, `active`, `restarts` after a failure, `invocation_id`, `started_at`, `last_crash_at`, `anon_bytes` and `memory_max_bytes` of its cgroup; `found` is `true` when the unit exists, `false` when it is not installed and `null` when it could not be read), `collections` (each mirror collection as the job saw it: its status, counts and `held`, the reason the job is not touching it, or `null`; the list is empty when Qdrant did not answer, and a collection Qdrant would not describe appears only in `problems`; nothing is carried over from the previous record), `actions` (what this run did), `last_action` (the latest of any run), `problems` (what it saw and could not fix, one sentence each) and `schema`. `null` when there is no record that can be trusted, which is the normal state before the timer is first enabled. Its age, a recent Qdrant crash and Qdrant's memory can make `status` `degraded`, see below. |
 
 **`status` values.**
@@ -308,8 +341,10 @@ Every error is JSON, `{"error": "<code>", "detail": "<short sentence>"}`, and ne
 | 500 | `internal` | An unexpected error; the log has the traceback under your request id. |
 | 503 | `not_ready` | No snapshot is served yet. The service notices a finished first build by itself within 30 seconds. |
 | 503 | `index_unavailable` | Qdrant refused the query or could not be reached. Search only. |
+| 503 | `semantic_unavailable` | A `semantic` or `hybrid` search cannot be served: no usable semantic index for the snapshot served, or the question could not be embedded. `detail` is a plain reason (never a key, a response body or the query). Search only; `lexical` still works. Not answered with keyword results. |
 
-Every route is read-only, so retrying a `503` after a few seconds is safe.
+Every route is read-only, so retrying a `503` after a few seconds is safe. (A `semantic_unavailable` caused by an
+earlier snapshot or a missing index does not clear by retrying; one caused by the embedding server may.)
 
 ## Client keys
 
@@ -353,7 +388,8 @@ would print query strings):
 
 | Event | Fields |
 |---|---|
-| Search | request id, client name, `query_chars` (length only), result count |
+| Search | request id, client name, `mode`, `query_chars` (length only), result count |
+| Search that cannot be served (`semantic_unavailable`) | request id, client name, `mode`, the failure's kind (`unpaired`, `timeout`, `unreachable`, `rejected`, `status`, `bad_reply`) and its plain reason; never the query |
 | Article read | request id, client name, page id, offset |
 | MCP tool call | tool name, client name, request id, `query_chars` or page id, result count |
 | Unauthorized | request id only |
@@ -382,7 +418,7 @@ What limits concurrency, from the code and configuration:
   proceed at once. There is no tuning knob for this in the service's settings.
 - **Qdrant.** Every search is one loopback query to Qdrant, configured with `max_search_threads: 2` on a 6-vCPU box
   that also runs the API. A first-touch search is disk-bound until the relevant segments are in the page cache; a
-  cached one is CPU-bound. Qdrant's memory cap is set in its unit (24G; [D8](DECISIONS.md#d8)). The semantic index is not searched yet; measured directly, a query takes about 45 ms cached and about half a second the first time.
+  cached one is CPU-bound. Qdrant's memory cap is set in its unit (24G; [D8](DECISIONS.md#d8)). A `semantic` search also embeds the question (one request to the embedding server, about 25 to 70 ms warm, about 1.5 s when the model has to load first, measured on the reference box) and queries the semantic collection, which measured directly takes about 45 ms cached and about half a second the first time; `hybrid` does both, one after the other. Answers through the API have not been timed yet.
 - **Article reads** touch SQLite only (read-only) and are cheap.
 - **A build competes for the same box.** The build runs at low priority (`Nice=10`, idle I/O) so it does not
   make search slow in practice, but do not run heavy searches during a semantic bulk build.

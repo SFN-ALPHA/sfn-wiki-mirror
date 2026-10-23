@@ -63,7 +63,8 @@ A separate LXC on a Proxmox host (hostname `wikipedia-mirror`) so that:
   per Unix user (section 6): the build user may open HTTPS (tcp 443) to the internet but not to private or shared
   address ranges, because the Enterprise API and
   the S3 bucket its downloads redirect to cannot be named by address, and the one optional embedding server; root
-  gets what installs and updates need; the API user gets nothing. The template is
+  gets what installs and updates need; the API user gets nothing, except a connection to that same optional
+  embedding server (and no name lookup) to embed the question of a semantic search ([D10](DECISIONS.md#d10)). The template is
   [`deploy/nftables/wiki-mirror.nft`](../deploy/nftables/wiki-mirror.nft).
 - **Memory is its own.** Its Qdrant holds tens of millions of points.
 - **It is disposable.** A rebuild, a bad snapshot or a runaway embed job touches no other service. Clients reach it
@@ -97,14 +98,15 @@ because they are often the answer.
 **The index.** Qdrant collections whose points are passages:
 - A sparse `lexical` vector per passage: hashed BM25-style term weights (2^24 hashed dimensions) with Qdrant's IDF
   modifier. The semantic collection (W2) adds a dense `bge-m3` vector (1,024 dimensions, cosine). Results from the
-  two are fused with reciprocal rank fusion (RRF, k=60).
+  two are fused with reciprocal rank fusion (RRF, k=60) in the `hybrid` search mode ([D10](DECISIONS.md#d10)).
 - Payload: `page_id`, `revision_id`, `chunk`, `section`, `disambiguation`, `text_hash`. No text: the article store
   serves it, which saves tens of GB.
 - Point id = `page_id * 10000 + chunk`, in both collections.
 
 **The service** (FastAPI on the container, bearer keys and request ids):
-- `POST /v1/wiki/search {query, limit}` returns one result per article: title, section, a snippet, `page_id`,
-  `revision_id`, score, the revision permalink, and the snapshot date on the reply.
+- `POST /v1/wiki/search {query, limit, mode}` returns one result per article: title, section, a snippet, `page_id`,
+  `revision_id`, score, the revision permalink, and the snapshot date on the reply. `mode` is `lexical` (the
+  default), `semantic` or `hybrid`, and every mode returns this one shape ([D10](DECISIONS.md#d10)).
 - `GET /v1/wiki/article?page_id=|title=&offset=` returns the article in windows, so a long article reaches a
   client that cannot take 100K characters in one reply.
 - `GET /v1/wiki/health` reports the snapshot date, article and passage counts, build state and the last update.
@@ -135,7 +137,8 @@ build-beside path, which remains the route for rare full rebuilds (section 12.7)
   who can use the service and tells the logs who asked.
 - **Per-site settings, not per-site code.** Three values differ between networks: the LAN (`LAN_CIDR`), the
   embedding server's address (`EMBEDDING_HOST`) and its port (`EMBEDDING_PORT`); the last two are optional (both or
-  neither) and only open one egress rule for the planned semantic index (W2), which nothing uses yet. They live in
+  neither) and open two egress rules, each for that one address and port: the build user's, for the semantic
+  index's embedding run (W2), and the API user's, for semantic and hybrid search ([D10](DECISIONS.md#d10)). They live in
   `/etc/wiki-mirror/site.env`, not in the repository, and the firewall file in the repository is a template with a
   placeholder for each. The values reach a ruleset that loads as root, so the installer treats the file as data
   (it is never sourced), accepts only a dotted-quad network or address with every octet 0-255 and a port of 1-65535,
@@ -148,8 +151,9 @@ build-beside path, which remains the route for rare full rebuilds (section 12.7)
   fails, so a ruleset that failed its check is never left for the next boot to load ([D6](DECISIONS.md#d6)).
 - **Egress is per Unix user, not per address.** Downloads redirect (307) to presigned URLs on an S3 bucket whose
   addresses rotate, so an address allowlist cannot work. Only the build user (`wikimirror-sync`) may open HTTPS to the
-  internet; the API user (`wikimirror`) has no egress at all, so a flaw in the code that parses and serves untrusted
-  text cannot phone out. The access token is never sent to the presigned URL (S3 refuses it with a 400, observed
+  internet; the API user (`wikimirror`) may open one connection, to the optional embedding server's address and port
+  ([D10](DECISIONS.md#d10)), and nothing else, so a flaw in the code that serves untrusted text cannot phone out to
+  the internet, though it could now reach that one server with the API's own key. The access token is never sent to the presigned URL (S3 refuses it with a 400, observed
   2026-10-16), and the presigned URL is never logged: its query string is a credential.
 
 ## 7. Phases
@@ -243,7 +247,9 @@ estimate.
 1. **Two collections, one per index, sharing point ids and payload.**
    - `wikipedia_lexical` is the keyword index; `wikipedia_semantic` is W2's.
    - Point id stays `page_id x 10000 + chunk` in both.
-   - Search queries both and fuses the results with RRF (k=60).
+   - `hybrid` search queries both and fuses the results with RRF (k=60), keyed on (point id, `text_hash`);
+     `semantic` queries the dense collection alone; `lexical`, the default, the keyword one
+     ([D10](DECISIONS.md#d10)).
    - **Why not one collection holding both vectors:** W2 would have to rebuild the keyword index beside the live
      one, putting two keyword copies on a tight disk. And a future embedding model change would re-encode every
      keyword vector for nothing.
@@ -315,11 +321,13 @@ Each stage resumes after a crash. The first run measured the rates and sizes in 
    (`pct set <ctid> -memory <MB>` takes effect live on an LXC), then hand it back. With the graph on disk (D8) this
    is less likely to be needed; what a rebuild of the graphs needs is CPU time and free disk.
 4. **Switch hybrid on** when the semantic collection covers every page in `applied_snapshot` and the golden set
-   passes (at least 90% in the top 5). Until then, keyword search answers alone.
+   passes (at least 90% in the top 5). Until then, keyword search answers alone **by default**: `semantic` and
+   `hybrid` are built and opt-in (the `mode` of a search, [D10](DECISIONS.md#d10)), and the default stays `lexical`.
 
 **What is built** (`src/wiki_mirror/embed.py`; the operator's view is in [OPERATIONS.md](OPERATIONS.md#the-semantic-index-w2-the-first-embedding-run)).
-Step 2 is built, with the HNSW switch at the end. Step 3 is an operator action, not code, and step 4 (hybrid
-search) is not built: no query reads the semantic collection yet.
+Step 2 is built, with the HNSW switch at the end. Step 3 is an operator action, not code. Step 4 is half built: the
+`semantic` and `hybrid` search modes exist (`search.py`, `serving.py`, `query_embed.py`; D10) and are opt-in, but
+the golden set and the fusion-weight check that switch hybrid on have not been run on the full index.
 - **Windows.** Articles go through in page-id order in windows of 64 (about 400 passages). The requests of up to four
   windows are in flight together, `embedding_concurrency` at a time across them, so replies arrive in any order; a
   window is upserted only when it and every window before it is fully embedded.
@@ -375,8 +383,8 @@ bookkeeping (the remainder). Complete, it would have rested at about 22.7 GB.
 * **What it costs.** Measured on the box over loopback (`limit` 10): about 45 ms median once cached; about 0.5 to
   0.9 s the first time a query touches the files; 6 s median and 37 s worst for the first queries right after the
   rebuild. A first-time query reads about 290 MB from disk, because a search walks the graph of every one of the 85
-  segments; most of it is read amplification (the ZFS `recordsize` of the dataset was not checked). Nothing serves
-  semantic search yet, so this decides what to do before hybrid search is switched on (step 4). The levers, in order,
+  segments; most of it is read amplification (the ZFS `recordsize` of the dataset was not checked). Semantic search
+  is now an opt-in mode of the API (D10), and this decides what to do before hybrid becomes the default (step 4). The levers, in order,
   each still to be measured: fewer, larger segments (done, next paragraph); a smaller ZFS
   `recordsize` for Qdrant's dataset; lower rescoring and oversampling, if the golden set shows no recall loss;
   pre-warming the graph and binary files after Qdrant starts; and last, pinning the binary copy again (+5.3 GB, about

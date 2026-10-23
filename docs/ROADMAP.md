@@ -13,7 +13,7 @@
 | Nightly self-update | `update.sh` with deferral, format guard, rollback ([D4](DECISIONS.md#d4)) | Built 2026-10-17; opt-in for an installation (`--auto-update`), on for the maintainer's |
 | **Annotations** | What the parser drops today, kept beside the text: links, images, references, infobox fields, tables, math, quality signals and more; article reads return them | **Planned 2026-10-19**, [below](#article-annotations-and-the-reader); must be on the box before the 2026-11-02 build |
 | **Reader** | A thin web page on the LAN: search, results, article text with clickable links | **Planned 2026-10-19**, [below](#article-annotations-and-the-reader) |
-| **W2** | Semantic index, hybrid search, query-focused snippet | **In progress.** Cut decided 2026-10-19 ([D5](DECISIONS.md#d5)); the embedding run is built ([D7](DECISIONS.md#d7)); the first full run started 2026-10-20 and finished 2026-10-22; the index moved to disk and a maintenance job was added on 2026-10-23 ([D8](DECISIONS.md#d8)), with the memory (7.4-7.5 GB pinned) and semantic latency measured and the cap set to 24G; the [semantic catch-up](#the-semantic-catch-up) (needed after the 2026-11-02 build), hybrid search, the fusion-weight check and the focused snippet remain |
+| **W2** | Semantic index, hybrid search, query-focused snippet | **In progress.** Cut decided 2026-10-19 ([D5](DECISIONS.md#d5)); the embedding run is built ([D7](DECISIONS.md#d7)); the first full run started 2026-10-20 and finished 2026-10-22; the index moved to disk and a maintenance job was added on 2026-10-23 ([D8](DECISIONS.md#d8)), with the memory (7.4-7.5 GB pinned) and semantic latency measured and the cap set to 24G; `semantic` and `hybrid` search modes were built on 2026-10-23, opt-in, with the default still `lexical` ([D10](DECISIONS.md#d10)); the [semantic catch-up](#the-semantic-catch-up) (needed after the 2026-11-02 build; until it exists those modes answer 503 after each build), the fusion-weight check, making hybrid the default and the focused snippet remain |
 | **W3** | Monthly in-place updates | Designed ([DESIGN.md §12.6](DESIGN.md#126-the-monthly-update-w3)); not started; target the 2026-12-02 update |
 
 Until W3 lands the monthly timer runs a full keyword build beside the live collection and swaps the alias, which
@@ -266,11 +266,15 @@ with hybrid on.
    * show progress on `/v1/wiki/health` (built as the `semantic` block; the ETA stays in the log);
    * stay within the existing rules: one build at a time (the build lock), the disk-floor check before creating
      a collection, and no secrets in logs.
-5. **Hybrid search.** Query both collections and fuse with RRF (k=60). Fusion must key on (point id,
-   `text_hash`), so a passage already updated in one index is never merged with the other index's older version
-   of it. Switch hybrid on only when the semantic collection covers every page in `applied_snapshot` and the
-   golden set passes; until then keyword search answers alone and `mode` stays `lexical`. The reply's `mode`
-   becomes `hybrid` ([API.md](API.md#post-v1wikisearch)). **Semantic search latency on the on-disk layout
+5. **Hybrid search.** *Built 2026-10-23 ([D10](DECISIONS.md#d10)); not the default.* `POST /v1/wiki/search` and the
+   MCP tool take `mode`: `lexical` (the default), `semantic` or `hybrid`, all with one result shape. Hybrid queries
+   both collections and fuses with RRF (k=60) on (point id, `text_hash`), so a passage already updated in one index
+   is never merged with the other index's older version of it, with equal untuned weights (item 6). The semantic
+   index is used only when it covers the snapshot being served (`applied_snapshot`) and is complete; otherwise those
+   modes answer `503 semantic_unavailable`, never keyword results. **Making hybrid the default is still to do:**
+   do it only when the semantic collection covers every page in `applied_snapshot` and the golden set passes; until
+   then keyword search answers by default and `mode` is `lexical` unless asked otherwise
+   ([API.md](API.md#post-v1wikisearch)). **Semantic search latency on the on-disk layout
    was measured on 2026-10-23:** about 45 ms once cached, about half a second the first time, and seconds to tens
    of seconds right after a restart or a cold cache; a first-time query reads about 290 MB, because it walks all 85
    segments ([D8](DECISIONS.md#d8) has the table). Before hybrid search is switched on, try the levers, each still
@@ -281,7 +285,8 @@ with hybrid on.
 6. **A fusion-weight check.** On the evaluation sample, equal-weight fusion's hit@1 (0.713) trailed dense alone
    (0.823) with hard negatives. Before switching hybrid on, try weights on the golden set at full scale and keep
    equal weights only if they hold up. Run it alongside the latency measurement in the previous item, on the same
-   layout.
+   layout. *The weights are the named constants `_LEXICAL_WEIGHT` and `_SEMANTIC_WEIGHT` in `search.py`, at 1.0 and
+   1.0 and not tuned; this item is why hybrid is not the default yet.*
 7. **A query-focused snippet.** Show the best 320-character window of the matching passage, chosen by overlap
    with the query terms, instead of the start of the passage. It held the answer 8 to 12 points more often on
    the live cut ([EVALUATION.md](EVALUATION.md)). It is a change to the snippet alone and can ship before the

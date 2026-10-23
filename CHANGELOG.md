@@ -6,10 +6,47 @@ All notable changes are listed here, newest first. The format follows
 ## [Unreleased]
 
 The first full embedding run finished on 2026-10-22, and Qdrant was killed for memory the next night while building
-the semantic index's graphs. The index now lives on disk, and a maintenance job keeps it healthy. Search still
-answers from the keyword index alone.
+the semantic index's graphs. The index now lives on disk, and a maintenance job keeps it healthy. Search answers from
+the keyword index by default; semantic and hybrid search are now available as opt-in modes.
 
 ### Added
+
+- **Search modes** ([D10](docs/DECISIONS.md#d10), [docs/API.md](docs/API.md#post-v1wikisearch)):
+  `POST /v1/wiki/search` and the MCP `wiki_search` tool take `mode`: `lexical` (the default, unchanged), `semantic` or
+  `hybrid`. Every mode returns the same reply and result shape; the reply's `mode` names the one that answered, and
+  `score` is the mode's own (BM25, cosine similarity or the RRF sum). Hybrid fuses the two rankings with reciprocal
+  rank fusion (k=60, equal untuned weights) on (point id, `text_hash`). A semantic or hybrid request that cannot be
+  served is `503 semantic_unavailable` with a plain reason, never keyword results under another mode's name: this is
+  also what it answers after each monthly build until the semantic index is caught up to the new snapshot. The
+  MCP tool gives a fixed sentence the model can act on. The default stays `lexical` until the golden set and the
+  fusion-weight check pass.
+- **The API embeds each semantic question itself**, with a new synchronous client (`query_embed.py`): the model and
+  vector length come from the semantic index's state (not from `embedding_model`), no retries, a 15 s timeout, and the
+  API's own key, `EMBEDDING_API_KEY` in its environment (`mirror.env`), a different key from the embed run's. A new
+  setting, `query_embedding_headers`, is separate from `embedding_headers` so a person waiting on a search does not get
+  the bulk run's background priority. **This gives the API user its first outbound connection**, to the embedding
+  server's host and port only.
+- `/v1/wiki/health` gains `search_modes` (the modes a search can use now) and `semantic.searchable_reason` (why
+  semantic and hybrid are off, or `null`). An unpaired semantic index does not make the status `degraded`.
+- **Security: the firewall admits the API user to the embedding server, and to nothing else**
+  ([D10](docs/DECISIONS.md#d10), [SECURITY.md](SECURITY.md)). One new rule, `meta skuid "wikimirror" ip daddr
+  $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept`, sits in the output chain above the refusals that still cover the
+  API user and Qdrant, between the `embedding-server` markers, so a site with no `EMBEDDING_HOST` and `EMBEDDING_PORT`
+  in `site.env` gets no such rule and the API user stays refused everything, as before. Qdrant gets no exception.
+  Anything else the API user tries, DNS included, is still counted in `service_refused` and logged. **A box applies
+  the rule only when `install.sh` is run again** (the update path reports a changed firewall but never applies it).
+  The API's `embedding_url` must therefore name the server by its IPv4 address and port, as the site file does.
+- Turning semantic and hybrid search on is one documented procedure
+  ([docs/OPERATIONS.md](docs/OPERATIONS.md#turning-on-semantic-and-hybrid-search)): a key of its own on the embedding
+  server, `EMBEDDING_API_KEY=` in `mirror.env`, `install.sh`, a restart, then
+  `wiki-mirror search --mode semantic "<question>"` and `wiki-mirror status`. `install.sh` says once, and fails
+  nothing, when `site.env` names an embedding server and `mirror.yaml` an `embedding_url` but `mirror.env` has no
+  `EMBEDDING_API_KEY` line (a keyless local Ollama is valid); it never writes, rewrites or prints that line.
+  `query_embedding_headers` is in the example `mirror.yaml`, commented out, beside the `embedding_*` lines.
+- `wiki-mirror search "<query>" [limit] [--mode lexical|semantic|hybrid]`: the mode is checked before anything is
+  sent, a `503 semantic_unavailable` prints its reason and exits 1, and the score is printed with `%.4g` (a hybrid
+  RRF score of about 0.03 read as `0.03` for every hit at two decimals). `wiki-mirror status` shows `search_modes`
+  and, when a semantic index exists but cannot be searched, the reason.
 
 - A maintenance job ([D8](docs/DECISIONS.md#d8), [docs/OPERATIONS.md](docs/OPERATIONS.md#the-maintenance-job)):
   `python -m wiki_mirror maintain`, run every 15 minutes by `wiki-mirror-maintain.timer`. It resumes a mirror
@@ -37,6 +74,11 @@ answers from the keyword index alone.
 
 ### Changed
 
+- The operator command's API calls use `curl --fail-with-body` (curl 7.76 or newer; Debian 12 has 7.88) in place of
+  `-f`, so a command can show the service's own error reason (`semantic_unavailable`) instead of curl's bare status
+  line. `wiki-mirror status` still exits 1 when the API does not answer.
+- The installer's check of the API user says "refused outbound connections other than to the embedding server" on a
+  site that names one. It still probes a public host only and never connects to the embedding server as that user.
 - Fewer, larger semantic segments ([D9](docs/DECISIONS.md#d9)): the semantic collection's segment size cap goes from
   1 GB to 10 GB of vector data (`SEMANTIC_MAX_SEGMENT_KB` in `embed.py`, new), measured on 2026-10-23 as the cause of
   most of a first-time search's page faults (about 1,370 a query, about 1,230 of them from rescoring each of 85

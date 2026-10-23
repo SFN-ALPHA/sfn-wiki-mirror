@@ -261,6 +261,7 @@ def _health_body(**overrides: object) -> dict[str, object]:
         "update": None,
         "semantic": None,
         "maintenance": None,
+        "search_modes": ["lexical"],
     }
     return {**body, **overrides}
 
@@ -286,6 +287,7 @@ def _semantic(**fields: object) -> dict[str, object]:
         "indexed_vectors": 25855559,
         "segments": 85,
         "complete": True,
+        "searchable_reason": None,
     }
     return {**block, **fields}
 
@@ -384,6 +386,69 @@ def test_cli_status_semantic_optimizer_error_shows_qdrants_text(installed: Insta
 def test_cli_status_semantic_incomplete_run_is_said(installed: Installed) -> None:
     out = _status(installed, _health_body(semantic=_semantic(complete=False)))
     assert "embedding run not complete" in out
+
+
+# The reason health gives for a semantic index it cannot search (serving._semantic_for), verbatim.
+_CATCH_UP_REASON = (
+    "the semantic index is of snapshot 20261001, the articles served are of 20261101; "
+    "the semantic catch-up brings it up to date (docs/ROADMAP.md)"
+)
+
+
+def test_cli_status_shows_the_search_modes_a_search_can_use_now(installed: Installed) -> None:
+    modes = ["lexical", "semantic", "hybrid"]
+    out = _status(installed, _health_body(semantic=_semantic(), search_modes=modes))
+    assert "search modes: lexical, semantic, hybrid" in out
+    assert "search are off" not in out
+
+
+def test_cli_status_semantic_off_shows_the_modes_left_and_the_reason(installed: Installed) -> None:
+    health = _health_body(
+        semantic=_semantic(searchable_reason=_CATCH_UP_REASON), search_modes=["lexical"]
+    )
+    out = _status(installed, health)
+    assert "search modes: lexical" in out
+    assert f"semantic and hybrid search are off: {_CATCH_UP_REASON}" in out
+
+
+def test_cli_status_with_no_semantic_index_still_shows_the_search_modes(
+    installed: Installed,
+) -> None:
+    out = _status(installed, _health_body(semantic=None, search_modes=["lexical"]))
+    assert "no semantic index yet" in out
+    assert "search modes: lexical" in out
+
+
+def test_cli_status_while_nothing_is_served_says_no_search_modes(installed: Installed) -> None:
+    out = _status(installed, _health_body(status="empty", search_modes=[]))
+    assert "search modes: none" in out
+
+
+def test_cli_status_from_an_api_that_predates_search_modes_says_nothing_of_them(
+    installed: Installed,
+) -> None:
+    health = _health_body()
+    del health["search_modes"]
+    out = _status(installed, health)
+    assert "search modes" not in out
+    assert "no semantic index yet" in out
+
+
+def test_cli_status_when_the_api_answers_an_error_does_not_take_it_for_a_health_report(
+    installed: Installed,
+) -> None:
+    # The API call keeps an error reply's body (so search can show the reason); status must still
+    # say the API did not answer, and exit 1 as before, rather than print the error as health.
+    _status_box(installed, {"error": "unauthorized", "detail": "bad key"})
+    _executable(
+        installed.root / "stubs" / "curl",
+        '#!/bin/sh\ncat "$(dirname "$0")/health.json"\n'
+        'echo "curl: (22) The requested URL returned error: 401" >&2\nexit 22\n',
+    )
+    result = installed.run("status")
+    assert result.returncode == 1
+    assert "the API did not answer" in result.stdout
+    assert "unauthorized" not in result.stdout
 
 
 def test_cli_status_without_a_semantic_index_says_so(installed: Installed) -> None:
@@ -547,3 +612,208 @@ def test_cli_status_keeps_the_key_out_of_the_curl_arguments(installed: Installed
     _status(installed, _health_body())
     arguments = (installed.root / "stubs" / "curl.args").read_text(encoding="utf-8")
     assert _API_KEY not in arguments
+
+
+# -- `wiki-mirror search` ----------------------------------------------------------------------
+
+
+def _hit(score: float, title: str = "Albert Einstein") -> dict[str, object]:
+    """One result in the shape the API returns."""
+    return {
+        "page_id": 736,
+        "revision_id": 1,
+        "title": title,
+        "section": "Early life",
+        "snippet": "Einstein was born in Ulm.",
+        "score": score,
+        "url": "https://en.wikipedia.org/w/index.php?oldid=1",
+        "disambiguation": False,
+    }
+
+
+def _search_box(
+    installed: Installed, reply: dict[str, object], *, exit_code: int = 0, stderr: str = ""
+) -> None:
+    """Stub everything `search` reaches: a real Python, the key file and a recording curl.
+
+    The curl stub logs its arguments and the request body it is piped, prints `reply`, writes
+    `stderr` and exits `exit_code`: 22 with the service's error body is what curl
+    `--fail-with-body` does on a 503 (checked against curl 8.23 on a local server).
+    """
+    stubs = installed.root / "stubs"
+    _executable(
+        installed.app / ".venv" / "bin" / "python", f'#!/bin/sh\nexec "{sys.executable}" "$@"\n'
+    )
+    (installed.root / "conf" / "mirror.env").write_text(
+        f"WIKI_MIRROR_API_KEY={_API_KEY}\n", encoding="utf-8"
+    )
+    body = stubs / "reply.json"
+    body.parent.mkdir(parents=True, exist_ok=True)
+    body.write_text(json.dumps(reply), encoding="utf-8")
+    _executable(
+        stubs / "curl",
+        '#!/bin/sh\necho "$*" >> "$(dirname "$0")/curl.args"\ncat > "$(dirname "$0")/curl.body"\n'
+        f'cat "{body}"\n'
+        + (f'echo "{stderr}" >&2\n' if stderr else "")
+        + f"exit {exit_code}\n",
+    )
+
+
+def _sent(installed: Installed) -> dict[str, object]:
+    """The JSON body the curl stub was piped."""
+    sent = json.loads((installed.root / "stubs" / "curl.body").read_text(encoding="utf-8"))
+    assert isinstance(sent, dict)
+    return sent
+
+
+def _search_reply(mode: str, *hits: dict[str, object]) -> dict[str, object]:
+    return {"snapshot": "2026-10-01", "mode": mode, "results": list(hits)}
+
+
+def test_cli_search_mode_semantic_sends_the_mode_in_the_request_body(installed: Installed) -> None:
+    _search_box(installed, _search_reply("semantic", _hit(0.8234)))
+    result = installed.run("search", "who was einstein", "--mode", "semantic")
+    assert result.returncode == 0, result.stderr
+    assert _sent(installed) == {"query": "who was einstein", "limit": 5, "mode": "semantic"}
+    assert "mode semantic, 1 result(s)" in result.stdout
+
+
+def test_cli_search_without_a_mode_sends_none_so_the_services_default_applies(
+    installed: Installed,
+) -> None:
+    _search_box(installed, _search_reply("lexical", _hit(12.3456)))
+    result = installed.run("search", "einstein")
+    assert result.returncode == 0, result.stderr
+    assert _sent(installed) == {"query": "einstein", "limit": 5}
+
+
+@pytest.mark.parametrize(
+    ("args", "limit", "mode"),
+    [
+        (("einstein", "--mode=hybrid"), 5, "hybrid"),
+        (("einstein", "3", "--mode", "hybrid"), 3, "hybrid"),
+        (("--mode", "lexical", "einstein", "7"), 7, "lexical"),
+    ],
+    ids=["equals-form", "after-the-limit", "before-the-query"],
+)
+def test_cli_search_mode_is_accepted_wherever_it_stands(
+    installed: Installed, args: tuple[str, ...], limit: int, mode: str
+) -> None:
+    _search_box(installed, _search_reply(mode, _hit(0.0328)))
+    result = installed.run("search", *args)
+    assert result.returncode == 0, result.stderr
+    assert _sent(installed) == {"query": "einstein", "limit": limit, "mode": mode}
+
+
+@pytest.mark.parametrize("mode", ["fuzzy", "SEMANTIC", "", "semantic,hybrid"])
+def test_cli_search_an_unknown_mode_is_a_usage_error_and_sends_nothing(
+    installed: Installed, mode: str
+) -> None:
+    _search_box(installed, _search_reply("lexical"))
+    result = installed.run("search", "einstein", "--mode", mode)
+    assert result.returncode == 1
+    assert "unknown mode" in result.stderr
+    assert "lexical|semantic|hybrid" in result.stderr
+    assert result.stdout == ""
+    assert not (installed.root / "stubs" / "curl.args").exists(), "no request was made"
+
+
+def test_cli_search_mode_without_a_value_is_a_usage_error(installed: Installed) -> None:
+    _search_box(installed, _search_reply("lexical"))
+    result = installed.run("search", "einstein", "--mode")
+    assert result.returncode == 1
+    assert "--mode needs a value" in result.stderr
+    assert not (installed.root / "stubs" / "curl.args").exists()
+
+
+def test_cli_search_an_unknown_option_is_a_usage_error(installed: Installed) -> None:
+    _search_box(installed, _search_reply("lexical"))
+    result = installed.run("search", "einstein", "--semantic")
+    assert result.returncode == 1
+    assert "unknown option '--semantic'" in result.stderr
+    assert "usage: wiki-mirror search" in result.stderr
+
+
+@pytest.mark.parametrize("args", [(), ("",), ("a", "5", "extra"), ("a", "many")])
+def test_cli_search_without_a_query_or_with_a_bad_limit_is_a_usage_error(
+    installed: Installed, args: tuple[str, ...]
+) -> None:
+    _search_box(installed, _search_reply("lexical"))
+    result = installed.run("search", *args)
+    assert result.returncode == 1
+    assert "usage: wiki-mirror search" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_cli_search_semantic_unavailable_reply_prints_its_reason_and_fails(
+    installed: Installed,
+) -> None:
+    error = {"error": "semantic_unavailable", "detail": _CATCH_UP_REASON}
+    _search_box(
+        installed,
+        error,
+        exit_code=22,
+        stderr="curl: (22) The requested URL returned error: 503",
+    )
+    result = installed.run("search", "einstein", "--mode", "semantic")
+    assert result.returncode == 1
+    assert f"error: semantic_unavailable: {_CATCH_UP_REASON}" in result.stderr
+    assert "lexical search still works" in result.stderr
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
+
+
+def test_cli_search_another_error_reply_prints_its_code_and_detail(installed: Installed) -> None:
+    _search_box(
+        installed,
+        {"error": "unauthorized", "detail": "missing or invalid key"},
+        exit_code=22,
+        stderr="curl: (22) The requested URL returned error: 401",
+    )
+    result = installed.run("search", "einstein")
+    assert result.returncode == 1
+    assert "error: unauthorized: missing or invalid key" in result.stderr
+    assert "lexical search still works" not in result.stderr
+
+
+def test_cli_search_when_the_api_cannot_be_reached_fails_without_a_traceback(
+    installed: Installed,
+) -> None:
+    _search_box(installed, {}, exit_code=7, stderr="curl: (7) Failed to connect to 127.0.0.1")
+    (installed.root / "stubs" / "reply.json").write_text("", encoding="utf-8")
+    result = installed.run("search", "einstein")
+    assert result.returncode == 1
+    assert "Failed to connect" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert result.stdout == ""
+
+
+def test_cli_search_keeps_a_hybrid_score_readable_where_two_decimals_would_not(
+    installed: Installed,
+) -> None:
+    # A reciprocal-rank-fusion sum is about 0.03; "%.2f" printed it as 0.03 for every hit.
+    hits = [_hit(0.03278688524590164), _hit(0.03226406298), _hit(12.3456), _hit(0.8234)]
+    _search_box(installed, _search_reply("hybrid", *hits))
+    out = installed.run("search", "einstein", "--mode", "hybrid").stdout
+    assert [line.rsplit("score ", 1)[1] for line in out.splitlines() if " score " in line] == [
+        "0.03279",
+        "0.03226",
+        "12.35",
+        "0.8234",
+    ]
+
+
+def test_cli_search_keeps_the_key_out_of_the_curl_arguments_and_fails_on_http_errors(
+    installed: Installed,
+) -> None:
+    _search_box(installed, _search_reply("lexical", _hit(1.0)))
+    installed.run("search", "einstein")
+    arguments = (installed.root / "stubs" / "curl.args").read_text(encoding="utf-8")
+    assert _API_KEY not in arguments
+    # --fail-with-body: an error status fails the call but keeps the reply's body to show.
+    assert "--fail-with-body" in arguments
+
+
+def test_cli_help_lists_the_search_mode_flag(installed: Installed) -> None:
+    result = installed.run("--help", uid="1000")
+    assert "--mode lexical|semantic|hybrid" in result.stdout

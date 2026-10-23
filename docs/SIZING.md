@@ -177,8 +177,9 @@ is cached and about 240 ms on first touch (measured 2026-10-18). Once the semant
 embeds the query text once (one short request to the embedding server). A semantic query on the on-disk layout
 was measured on the finished rebuild (2026-10-23, over loopback, `limit` 10): about 45 ms median once cached, about
 0.5 to 0.9 s the first time a query touches the files, and 6 s median (37 s worst) for the first queries right after
-the rebuild. A first-time query reads about 290 MB from disk. Nothing serves semantic search yet, so this decides
-what to do before hybrid search ships ([D8](DECISIONS.md#d8) has the table and the levers). See
+the rebuild. A first-time query reads about 290 MB from disk. Semantic and hybrid search are opt-in modes of the API
+([D10](DECISIONS.md#d10)) and these figures have not been repeated through it; they decide what to do before hybrid
+becomes the default ([D8](DECISIONS.md#d8) has the table and the levers). See
 [API.md](API.md#performance-and-capacity) for what limits concurrency.
 
 ## Minimum hardware, by stage

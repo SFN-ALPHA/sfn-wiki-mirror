@@ -3,10 +3,11 @@
 What these guard is the set of decisions a reviewer would otherwise have to re-read the files to
 find again: the services run Python in isolated mode from a directory nobody can write; a build
 that fails is retried a bounded number of times and then stops; the firewall refuses what it does
-not admit instead of dropping it, admits apt's real user, and names only users the installer
-checks for; the dependencies are pinned, complete against pyproject.toml, and installed from
-wheels; the nightly update timer is at 02:20 local time (no zone is written, so the container's
-own decides) and the installer enables it only on request; the
+not admit instead of dropping it, admits apt's real user, gives the API user one embedding-server
+host and port above the refusals that otherwise cover it and Qdrant (and Qdrant nothing), and
+names only users the installer checks for; the dependencies are pinned, complete against
+pyproject.toml, and installed from wheels; the nightly update timer is at 02:20 local time (no zone
+is written, so the container's own decides) and the installer enables it only on request; the
 FORMAT file `update.sh` compares across commits equals the line the code builds, so it can never
 drift from the constants it names; the firewall file is a template whose only placeholders sit in
 its `define` lines and match the keys of `site.env.example`, whose embedding-server lines are
@@ -332,7 +333,9 @@ def test_the_embedding_accept_comes_before_the_build_users_443_rule() -> None:
     # The embedding server is on the LAN, which the 443 rule excludes, so it needs its own accept
     # first; if the order flipped, an embedding server on port 443 would be refused.
     output = _chain("output")
-    embedding = [i for i, line in enumerate(output) if "$EMBEDDING_V4" in line]
+    embedding = [
+        i for i, line in enumerate(output) if "$EMBEDDING_V4" in line and "wikimirror-sync" in line
+    ]
     assert embedding == [output.index(_build_user_443_rule()) - 1]
 
 
@@ -399,12 +402,23 @@ def _outside_and_inside_the_embedding_markers() -> tuple[list[str], list[str]]:
     return outside, inside
 
 
-def test_the_embedding_defines_and_rule_are_the_only_lines_between_the_markers() -> None:
+#: The API user's one permitted connection (D10): one host, one TCP port, nothing else.
+API_EMBEDDING_RULE = (
+    'meta skuid "wikimirror" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept'
+)
+#: The build user's, for the embedding run.
+BUILD_EMBEDDING_RULE = (
+    'meta skuid "wikimirror-sync" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept'
+)
+
+
+def test_the_embedding_defines_and_rules_are_the_only_lines_between_the_markers() -> None:
     _, inside = _outside_and_inside_the_embedding_markers()
     assert _uncommented("\n".join(inside)) == [
         "define EMBEDDING_V4 = @EMBEDDING_HOST@",
         "define EMBEDDING_PORT = @EMBEDDING_PORT@",
-        'meta skuid "wikimirror-sync" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept',
+        API_EMBEDDING_RULE,
+        BUILD_EMBEDDING_RULE,
     ]
 
 
@@ -415,11 +429,59 @@ def test_nothing_outside_the_embedding_markers_names_the_embedding_values() -> N
     assert not [line for line in outside if "EMBEDDING_" in line]
 
 
-def test_the_embedding_server_rule_uses_the_site_defines_for_address_and_port() -> None:
+def test_the_embedding_server_rules_use_the_site_defines_for_address_and_port() -> None:
     rules = [line for line in _chain("output") if "$EMBEDDING_" in line]
-    assert rules == [
-        'meta skuid "wikimirror-sync" ip daddr $EMBEDDING_V4 tcp dport $EMBEDDING_PORT accept'
+    assert rules == [API_EMBEDDING_RULE, BUILD_EMBEDDING_RULE]
+
+
+def _service_refusals(output: list[str]) -> list[int]:
+    """Indexes of the three lines that refuse the API and Qdrant (the log, then two rejects)."""
+    return [i for i, line in enumerate(output) if '"wikimirror", "qdrant"' in line]
+
+
+def test_the_api_embedding_accept_comes_before_the_service_refusals() -> None:
+    # The refusals match the whole user, so an accept below them would never be reached: the rule
+    # only works above. And no accept may sit below them for the API to be widened by.
+    output = _chain("output")
+    assert len(_service_refusals(output)) == 3
+    assert output.index(API_EMBEDDING_RULE) < min(_service_refusals(output))
+
+
+def test_only_the_api_embedding_rule_is_admitted_above_the_service_refusals() -> None:
+    # Before the refusals come only the replies to connections already open, loopback (Qdrant and
+    # a local Ollama), and the API's one embedding rule. Every other accept, DNS included, comes
+    # after them, so none can widen what the API or Qdrant may do.
+    output = _chain("output")
+    above = output[: min(_service_refusals(output))]
+    assert [line for line in above if line.endswith("accept")] == [
+        "ct state established,related accept",
+        'oifname "lo" accept',
+        API_EMBEDDING_RULE,
     ]
+
+
+def test_the_api_embedding_rule_admits_one_host_and_one_tcp_port_and_nothing_wider() -> None:
+    # A set, a negation, a range or a missing protocol would widen the one connection the API is
+    # given; the rule is exactly the user, the defined host, the defined port and TCP.
+    (rule,) = [line for line in _chain("output") if API_EMBEDDING_RULE in line]
+    assert rule == API_EMBEDDING_RULE
+    assert not any(token in rule for token in ("{", "!=", "-", "/", "udp", "icmp"))
+
+
+def test_the_api_user_is_admitted_by_its_embedding_rule_alone_and_refused_otherwise() -> None:
+    output = _chain("output")
+    assert [line for line in output if 'skuid "wikimirror"' in line] == [API_EMBEDDING_RULE]
+    refused = [line for line in output if '"wikimirror", "qdrant"' in line]
+    assert len(refused) == 3
+    assert all("accept" not in line for line in refused)
+
+
+def test_qdrant_is_admitted_nowhere_in_the_ruleset() -> None:
+    # No exception for Qdrant, ever: it is reached over loopback and dials nothing.
+    rules = [line for line in _uncommented(NFT) if "skuid" in line and "qdrant" in line]
+    assert len(rules) == 3, "the three refusals name it"
+    assert all(line.startswith('meta skuid { "wikimirror", "qdrant" }') for line in rules)
+    assert not [line for line in rules if "accept" in line]
 
 
 def test_the_firewall_is_checked_as_a_whole_before_it_is_applied() -> None:

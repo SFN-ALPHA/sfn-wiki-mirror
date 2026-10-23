@@ -9,7 +9,9 @@ ranking. Any MCP-capable agent can then search and read all of Wikipedia locally
 the exact revision it read.
 
 > **Status, October 2026.** Keyword search is live over 41.6 million passages from 7.2 million articles. The semantic
-> index and hybrid ranking are designed, measured on samples, and next on the [roadmap](docs/ROADMAP.md) (phase W2).
+> index is built, and `semantic` and `hybrid` search are available as opt-in modes (`mode` in the search request,
+> [docs/API.md](docs/API.md#post-v1wikisearch)); keyword stays the default until the golden set and the
+> fusion-weight check pass ([roadmap](docs/ROADMAP.md), phase W2).
 
 ## What sets it apart
 
@@ -18,7 +20,8 @@ the exact revision it read.
   read, rather than a list of page titles.
 - **Hybrid retrieval.** Keyword search (BM25-style sparse vectors) finds exact names, numbers and rare terms.
   Semantic search (bge-m3 embeddings) finds passages that answer a question in other words. Both indexes live in
-  Qdrant and are fused with reciprocal rank fusion. *Keyword is live; semantic arrives with W2.*
+  Qdrant and are fused with reciprocal rank fusion. A search asks for `lexical` (the default), `semantic` or `hybrid`,
+  and every mode returns the same result shape. *The default stays keyword until the golden set passes.*
 - **A fully automated pipeline.** One monthly job downloads the snapshot, parses it, builds the article store and
   generates the keyword vectors; from W2 it also generates embeddings on an Ollama-compatible server you point it at.
   The new index is built beside the live one, so search keeps serving throughout.
@@ -29,7 +32,8 @@ the exact revision it read.
 - **Local and fast.** About 27 ms per search and 1-2 ms per article read on the local network, with no rate limit.
   Wikipedia is contacted once a month, for one bulk download, and queries never leave your network.
 - **Secure by default.** The builder and the server run as separate users: the builder can reach the internet but
-  listens on no port; the server listens but cannot reach the internet. The box has a default-deny firewall, the
+  listens on no port; the server listens but cannot reach the internet (its one outbound connection is the embedding of
+  a semantic question, to your embedding server only). The box has a default-deny firewall, the
   Python and Qdrant builds are pinned by hash, and the updater rolls itself back if a new version starts unhealthy.
 
 ## How it works
@@ -57,8 +61,8 @@ flowchart LR
 3. **Cut.** The sections are cut into passages: 41.6 million of them for 7.2 million articles.
 4. **Index.** Each passage gets a keyword vector and, from W2, an embedding. Both are stored in Qdrant, in a new
    collection built beside the one being served.
-5. **Serve.** A search queries the keyword index (from W2, both indexes, fusing their rankings), keeps the best
-   passage per article and returns it with its section and citation. `wiki_read` then pages through the full article in windows a model can take.
+5. **Serve.** A search queries the keyword index (or, in `semantic` or `hybrid` mode, the semantic index or both,
+   fusing their rankings), keeps the best passage per article and returns it with its section and citation. `wiki_read` then pages through the full article in windows a model can take.
 
 Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the measurements behind each choice in
 [docs/DESIGN.md](docs/DESIGN.md).
@@ -167,8 +171,11 @@ recovery: [docs/OPERATIONS.md](docs/OPERATIONS.md).
 passages, passages per second and the time left. It takes about two days. It needs a finished keyword build,
 `embedding_url` in `mirror.yaml`, the embedding pair in `site.env` so the firewall admits the server, and a 32 GB box.
 The index (vectors, binary copy and search graph) is kept on disk and cached by the kernel in spare RAM, so Qdrant's
-pinned memory stays small; its memory cap is to be set from the measured figure after the rebuild. Search does not use
-the collection yet.
+pinned memory stays small; its memory cap is to be set from the measured figure after the rebuild. The API's
+`semantic` and `hybrid` search modes read the collection once the run is complete and the index is of the snapshot
+being served (after each monthly build they answer `503 semantic_unavailable` until the semantic catch-up). Each
+such search sends the question to your embedding server, which the API holds its own key for
+(`EMBEDDING_API_KEY` in its `mirror.env`) and is allowed to reach by the firewall's embedding pair.
 
 The run is built to be interrupted. It works through the articles in order, in windows of 64, and moves a checkpoint
 only after Qdrant has confirmed a window. After a crash, a server error, a stop or a reboot, `embed-now` resumes: it

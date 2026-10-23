@@ -39,10 +39,11 @@ flowchart LR
 | Parse | `parse.py`, `build.run_parse` | Turns each chunk's Parsoid HTML into plain text with section headings, infobox key-value blocks and category lists; drops reference lists, navigation boxes and "See also" link farms. Workers are spawned processes, one chunk each, streaming to a zstd spool; the parent is the single SQLite writer. |
 | Article store | `store.py`, `records.py` | One SQLite file per snapshot, `articles/<identifier>_<yyyymmdd>.db`. Compressed text, title and redirect-alias indexes, a per-article `text_hash`. Highest revision wins on duplicates. A finished store is immutable and opened read-only. |
 | Keyword index | `index.py`, `passages.py` | Cuts every article into passages with the vendored chunker and encodes each with the vendored hashed-BM25 sparse encoder, then upserts them into Qdrant. Checkpointed; ends by pointing the alias at the new collection. |
-| Semantic index (embedding run) | `embed.py` | Cuts the same passages as the keyword index, asks an Ollama-compatible embedding server for a vector each, and upserts them into `wikipedia_semantic_<born>` in windows of 64 articles with a checkpoint (`state/index_semantic_<born>.json`). Resumable, and a resume verifies the checkpoint against Qdrant. Started by hand (`wiki-mirror embed-now`) as `wiki-mirror-embed.service`; no query reads the result yet. The collection's layout (graph and binary copy on disk, optimizer threads, segment size cap) is the constants `SEMANTIC_HNSW`, `SEMANTIC_QUANTIZATION`, `SEMANTIC_OPTIMIZATION_THREADS` ([D8](DECISIONS.md#d8)) and `SEMANTIC_MAX_SEGMENT_KB` ([D9](DECISIONS.md#d9)). |
+| Semantic index (embedding run) | `embed.py` | Cuts the same passages as the keyword index, asks an Ollama-compatible embedding server for a vector each, and upserts them into `wikipedia_semantic_<born>` in windows of 64 articles with a checkpoint (`state/index_semantic_<born>.json`). Resumable, and a resume verifies the checkpoint against Qdrant. Started by hand (`wiki-mirror embed-now`) as `wiki-mirror-embed.service`. The API's `semantic` and `hybrid` search modes read the result ([D10](DECISIONS.md#d10)). The collection's layout (graph and binary copy on disk, optimizer threads, segment size cap) is the constants `SEMANTIC_HNSW`, `SEMANTIC_QUANTIZATION`, `SEMANTIC_OPTIMIZATION_THREADS` ([D8](DECISIONS.md#d8)) and `SEMANTIC_MAX_SEGMENT_KB` ([D9](DECISIONS.md#d9)). |
 | Maintenance job | `maintain.py`, `maintenance_record.py`, `wiki-mirror-maintain.{service,timer}` | Every 15 minutes, as `wikimirror-sync`: reads Qdrant's systemd unit and memory, resumes a paused (`grey`) mirror collection, keeps the semantic collection's live settings equal to the constants in `embed.py`, and writes `state/maintenance.json` for health and `wiki-mirror status`. |
-| Serving | `serving.py` | Holds the (collection, store) pair currently served, follows the alias and the index state, and hands requests a lease so a swap never closes a store under a reader. |
-| Search | `search.py` | Query encoding, article folding, exact-title priority, snippets cut from the store, windowed article reads. |
+| Serving | `serving.py` | Holds the (collection, store) pair currently served, follows the alias and the index state, and hands requests a lease so a swap never closes a store under a reader. It also pairs the semantic index with the served store (usable only for the same snapshot) and keeps the plain reason when it is not. |
+| Search | `search.py` | The three search modes (`lexical`, `semantic`, `hybrid`) behind one result shape: query encoding, passage ranking from one or both collections, reciprocal rank fusion keyed on (point id, `text_hash`), article folding, exact-title priority, snippets cut from the store, windowed article reads. |
+| Query embedding | `query_embed.py` | A synchronous client that embeds one question through the embedding server, with the model and vector length the semantic index recorded in its state. One typed error, no retries, a 15 s timeout, the API's own key from `EMBEDDING_API_KEY`. |
 | API and MCP door | `api.py`, `mcp_server.py`, `keys.py` | FastAPI app with a pure-ASGI guard in front: authentication, request ids, JSON errors. `/mcp` is the MCP SDK's Streamable HTTP endpoint behind the same guard. |
 | CLI | `__main__.py`, `deploy/wiki-mirror` | `python -m wiki_mirror <download|parse|index|build|embed|maintain|serve|status|key>`; `wiki-mirror` is the operator wrapper. |
 | Update path | `deploy/update.sh`, `update_record.py` | Self-update from `main` (nightly, if the operator opted in) with a format guard and rollback; writes `state/update.json`. |
@@ -83,7 +84,8 @@ HNSW on and moves the alias `wikipedia_semantic`. It is not part of `build`.
   after a power loss) steps the checkpoint back and rewrites the state before embedding resumes.
 * **No state, no deletion.** A collection without a usable state file is refused, never deleted. A state file
   without its collection starts over.
-* **Not built:** catching up after a monthly rebuild by embedding only changed articles (W3), and hybrid search.
+* **Not built:** catching up after a monthly rebuild by embedding only changed articles (W3). Hybrid search is
+  built, but is not the default (see "Search modes" below).
 
 The operator's view is in [OPERATIONS.md](OPERATIONS.md#the-semantic-index-w2-the-first-embedding-run); the design in
 [DESIGN.md §12.5](DESIGN.md#125-first-semantic-build-w2).
@@ -144,8 +146,8 @@ holds the snapshot description, the schema version (2) and `parser_version`. The
 ## The index: two collections, shared point ids
 
 The keyword index is a Qdrant collection `wikipedia_lexical_<born>`, where `<born>` is the date of the snapshot
-it was first built from, behind the alias `wikipedia_lexical`. The semantic index (W2; the embedding run is built,
-search does not use it yet) is a second collection, `wikipedia_semantic_<born>`, behind `wikipedia_semantic`. Reasons for two collections
+it was first built from, behind the alias `wikipedia_lexical`. The semantic index (W2) is a second collection,
+`wikipedia_semantic_<born>`, behind `wikipedia_semantic`, which the `semantic` and `hybrid` search modes read. Reasons for two collections
 rather than one with both vectors are in [DESIGN.md §12.2](DESIGN.md#122-the-four-decisions-in-this-plan).
 
 * **Point id** = `page_id * 10000 + chunk`, the same in both collections (`records.passage_point_id`). Re-running
@@ -183,6 +185,27 @@ index state, the old pair keeps serving and health says `degraded`.
 A search never mixes snapshots. It queries the concrete collection it was paired with, not the alias, and drops
 a hit whose `text_hash` differs from the stored article's (logged with the page id only).
 
+The semantic index is paired with the served store in the same looks, and never raises. It is usable only when its
+alias exists, its state is readable and `complete`, its `applied_snapshot` is the served store's, it was cut by this
+code's chunker and `embedding_url` is set. Otherwise `semantic` and `hybrid` are unavailable with one plain reason
+(health shows it), and `lexical` carries on. After a monthly build this is the normal state until the semantic
+catch-up ([ROADMAP.md](ROADMAP.md#the-semantic-catch-up)): the lexical index moves to the new snapshot at once, and
+the semantic one stays on the old.
+
+### Search modes
+
+`POST /v1/wiki/search` and the `wiki_search` tool take `mode` ([D10](DECISIONS.md#d10)): `lexical` (the default),
+`semantic` or `hybrid`. All three go through one path in `WikiSearch.search`: get ranked passages (the keyword query,
+the dense query for the embedded question, or both), turn them into one best passage per article, then apply the
+same exact-title-first rule, disambiguation ordering, store and `text_hash` check, and snippet. So the reply has one
+shape in every mode, and only `score` differs in meaning. `hybrid` fuses passages with reciprocal rank fusion (k=60,
+equal weights, untuned) keyed on (point id, `text_hash`) before folding. A mode that cannot be served raises, and the
+API answers `503 semantic_unavailable`; there is no fallback to keyword results.
+
+The question is embedded by the API process itself (`query_embed.py`): the model and length come from the semantic
+index's state, the key is the API's own (`EMBEDDING_API_KEY` in `mirror.env`), and the request goes to
+`embedding_url` only.
+
 ### What forces a rebuild
 
 The chunker, the store schema, the index format and the parser version are all part of the stored data's
@@ -210,8 +233,8 @@ wire contract is in [API.md](API.md) and [MCP.md](MCP.md).
   a snapshot older than 40 days, a differently-chunked index, no usable index state, an unopenable store,
   Qdrant not answering, or one of the three causes the maintenance record adds (a record more than 60 minutes old, a
   Qdrant restart after a failure within 24 hours, Qdrant above 90% of its memory cap). `reasons` lists them. The
-  report also carries `semantic` (the semantic collection as Qdrant reports it now) and `maintenance` (the record);
-  neither changes the status by itself.
+  report also carries `semantic` (the semantic collection as Qdrant reports it now, with `searchable_reason`),
+  `search_modes` (the modes a search can use now) and `maintenance` (the record); none changes the status by itself.
 
 ## The update path
 
@@ -231,8 +254,11 @@ Details and the reasoning are in [DESIGN.md §6](DESIGN.md#6-security).
 * **Egress is per Unix user, not per address.** Enterprise downloads redirect (307) to presigned S3 URLs whose
   addresses rotate, so an address allowlist cannot work. nftables (`deploy/nftables/`) lets only
   `wikimirror-sync` open HTTPS to the internet, plus, when set, the optional embedding server (its address and port come from
-  `/etc/wiki-mirror/site.env`) for the semantic index's embedding job (W2). `wikimirror` (the
-  API) and `qdrant` get nothing: a flaw in the code that parses and serves untrusted text cannot phone out.
+  `/etc/wiki-mirror/site.env`) for the semantic index's embedding job (W2). `qdrant` gets nothing. `wikimirror` (the
+  API) gets one connection and no more: to that embedding server's host and port, to embed a semantic question
+  ([D10](DECISIONS.md#d10)). It still cannot reach the internet, but a flaw in the code that serves untrusted text
+  could now reach that one server, which is why the rule is narrow, the key is the API's own and the reply is
+  validated (length, finite numbers).
   `root` gets 80/443 and git-over-SSH to GitHub for installs and updates, `_apt` gets 80/443 over IPv4 for
   package fetches, and DNS goes to the LAN resolver only. Refused egress is rejected (fails at once, counted in
   `service_refused` / `out_refused`) rather than dropped, so a block is a fast error, not a hang.

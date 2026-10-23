@@ -7,7 +7,9 @@ negotiation). The index is Qdrant's in-memory mode over a real finalized article
 paths named here: no key, a wrong key and a revoked key (401 at HTTP level), both or neither of
 title and page id, an unknown article, arguments out of range, no snapshot yet, the index
 refusing, an unexpected crash (its text must not reach the client), a GET (405, never a standing
-stream), and a snapshot swap seen through MCP.
+stream), and a snapshot swap seen through MCP. Also the search `mode`: the schema and description,
+the same JSON as the REST route in every mode, and a `semantic` or `hybrid` search that cannot be
+served (a fixed tool error that hides the reason, never keyword results).
 
 Each test opens the app itself (`async with _door(...)`) instead of through a fixture: the
 session manager lives in an anyio task group, which must be entered and left by the same task,
@@ -27,6 +29,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import httpx2
 import pytest
 from fastapi import FastAPI
@@ -37,6 +40,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from tests.fixtures.clock import FrozenClock
 from tests.fixtures.wiki_mirror_fakes import (
     API_KEY,
+    FakeEmbeddingServer,
     FakeStateStore,
     StubServed,
     build_snapshot,
@@ -50,7 +54,7 @@ from wiki_mirror.api import ServiceHealth, create_app
 from wiki_mirror.config import MirrorConfig
 from wiki_mirror.keys import RECHECK_SECONDS, ClientKeys, add_client, revoke_client
 from wiki_mirror.records import MAX_PAGE_ID, Article
-from wiki_mirror.search import SearchReply
+from wiki_mirror.search import SearchReply, SemanticUnavailableError
 from wiki_mirror.serving import ALIAS_RECHECK_SECONDS, ServedSnapshot
 
 pytestmark = [pytest.mark.contract, pytest.mark.asyncio]
@@ -126,15 +130,23 @@ async def _serve(
 
 
 @asynccontextmanager
-async def _door(tmp_path: Path, clock: FrozenClock, **settings: object) -> AsyncIterator[Door]:
+async def _door(
+    tmp_path: Path,
+    clock: FrozenClock,
+    *,
+    semantic: FakeEmbeddingServer | None = None,
+    **settings: object,
+) -> AsyncIterator[Door]:
     """The door over a real index of `_articles`, with a clients file in `tmp_path`.
 
-    `settings` are `MirrorConfig` overrides.
+    `semantic`, when given, adds a semantic index paired with the snapshot, with that fake server
+    embedding the questions. `settings` are `MirrorConfig` overrides.
     """
     served, qdrant, config = served_over(
         tmp_path,
         _articles(),
         clock=clock.monotonic,
+        semantic=semantic,
         clients_file=tmp_path / "clients.json",
         **settings,
     )
@@ -158,7 +170,9 @@ class _StubSearch:
     def __init__(self, error: Exception) -> None:
         self._error = error
 
-    def search(self, query: str, limit: int) -> SearchReply:
+    def search(
+        self, query: str, limit: int, mode: str = "lexical", *, request_id: str | None = None
+    ) -> SearchReply:
         raise self._error
 
 
@@ -381,6 +395,144 @@ async def test_mcp_search_follows_the_alias_to_a_new_snapshot(
     finally:
         served.close()
     assert (before["snapshot"], after["snapshot"]) == ("2026-10-01", "2026-11-01")
+
+
+# -- search modes -----------------------------------------------------------------------------
+
+
+async def test_mcp_search_tool_takes_a_mode_that_defaults_to_lexical(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    async with _door(tmp_path, frozen_clock) as door, door.client() as client:
+        tool = (await client.list_tools()).tools[0]
+    mode = tool.input_schema["properties"]["mode"]
+    assert mode["default"] == "lexical"
+    assert mode["enum"] == ["lexical", "semantic", "hybrid"]
+    assert "mode" not in tool.input_schema.get("required", [])
+
+
+async def test_mcp_search_description_says_when_each_mode_helps_and_that_the_shape_is_one(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    async with _door(tmp_path, frozen_clock) as door, door.client() as client:
+        tool = (await client.list_tools()).tools[0]
+    text = tool.description or ""
+    for needed in ("'lexical'", "'semantic'", "'hybrid'", "same shape", "names and exact terms"):
+        assert needed in text
+
+
+@pytest.mark.parametrize("mode", ["lexical", "semantic", "hybrid"])
+async def test_mcp_wiki_search_in_every_mode_returns_the_same_json_as_the_rest_route(
+    tmp_path: Path, frozen_clock: FrozenClock, mode: str
+) -> None:
+    search = {"query": "mercury planet", "limit": 3, "mode": mode}
+    async with _door(tmp_path, frozen_clock, semantic=FakeEmbeddingServer()) as door:
+        async with door.client() as client:
+            result = await client.call_tool("wiki_search", search)
+        async with door.http() as http:
+            rest = await http.post("/v1/wiki/search", json=search)
+    assert result.is_error is False
+    assert _text(result) == rest.text
+    assert json.loads(_text(result))["mode"] == mode
+    assert json.loads(_text(result))["results"][0]["title"] == "Mercury"
+
+
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+async def test_mcp_semantic_search_without_a_semantic_index_is_a_tool_error_with_a_fixed_sentence(
+    tmp_path: Path, frozen_clock: FrozenClock, mode: str
+) -> None:
+    async with _door(tmp_path, frozen_clock) as door, door.client() as client:
+        result = await client.call_tool(
+            "wiki_search", {"query": "mercury planet", "mode": mode}
+        )
+    assert result.is_error is True
+    assert "semantic search is not available just now" in _text(result)
+    assert "mode='lexical'" in _text(result)
+    assert "Mercury" not in _text(result)
+
+
+async def test_mcp_semantic_search_when_the_embedding_server_fails_gives_the_same_fixed_sentence(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    server = FakeEmbeddingServer()
+    server.reply = httpx.Response(500, text="the router's own error page")
+    async with _door(tmp_path, frozen_clock, semantic=server) as door, door.client() as client:
+        result = await client.call_tool(
+            "wiki_search", {"query": "mercury planet", "mode": "semantic"}
+        )
+    assert result.is_error is True
+    assert "semantic search is not available just now" in _text(result)
+    assert "500" not in _text(result)
+    assert "router" not in _text(result)
+
+
+async def test_mcp_semantic_search_forwards_the_request_id_to_the_embedding_server(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    server = FakeEmbeddingServer()
+    async with _door(tmp_path, frozen_clock, semantic=server) as door:
+        headers = {"Authorization": f"Bearer {API_KEY}", "X-Request-ID": "agent-7:turn-3"}
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=door.app),
+            headers=headers,
+            base_url="http://testserver",
+        ) as http:
+            transport = streamable_http_client("http://testserver/mcp", http_client=http)
+            async with Client(transport) as client:
+                result = await client.call_tool(
+                    "wiki_search", {"query": "mercury planet", "mode": "semantic"}
+                )
+    assert result.is_error is False
+    (request,) = server.requests
+    assert request.headers["x-request-id"] == "agent-7:turn-3"
+
+
+async def test_mcp_semantic_search_unavailable_is_logged_with_its_kind_and_never_the_query(
+    tmp_path: Path, frozen_clock: FrozenClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    server = FakeEmbeddingServer()
+    server.reply = httpx.Response(401, text="no")
+    async with _door(tmp_path, frozen_clock, semantic=server) as door, door.client() as client:
+        with caplog.at_level(logging.WARNING, logger="wiki_mirror.mcp"):
+            await client.call_tool("wiki_search", {"query": "my private matter", "mode": "hybrid"})
+    assert "kind=rejected" in caplog.text
+    assert "mode=hybrid" in caplog.text
+    assert "private" not in caplog.text
+
+
+async def test_mcp_semantic_search_when_the_index_refuses_is_the_index_error_not_the_semantic_one(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    error = UnexpectedResponse(404, "Not Found", b"collection missing", {})  # type: ignore[arg-type]
+    served = StubServed(_StubSearch(error))
+    async with (
+        _serve(served, make_config(tmp_path), frozen_clock) as door,
+        door.client() as client,
+    ):
+        result = await client.call_tool("wiki_search", {"query": "mercury", "mode": "semantic"})
+    assert result.is_error is True
+    assert "passage index could not answer" in _text(result)
+
+
+async def test_mcp_semantic_unavailable_from_the_search_hides_its_reason_from_the_client(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served = StubServed(_StubSearch(SemanticUnavailableError("a reason with 100.64.0.9", "x")))
+    async with (
+        _serve(served, make_config(tmp_path), frozen_clock) as door,
+        door.client() as client,
+    ):
+        result = await client.call_tool("wiki_search", {"query": "mercury", "mode": "hybrid"})
+    assert result.is_error is True
+    assert "100.64.0.9" not in _text(result)
+
+
+async def test_mcp_search_with_an_unknown_mode_is_a_tool_error(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    async with _door(tmp_path, frozen_clock) as door, door.client() as client:
+        result = await client.call_tool("wiki_search", {"query": "mercury", "mode": "fuzzy"})
+    assert result.is_error is True
 
 
 # -- authentication and logging ---------------------------------------------------------------
