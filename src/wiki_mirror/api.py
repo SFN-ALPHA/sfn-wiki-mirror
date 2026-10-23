@@ -34,7 +34,19 @@ Non-obvious constraints:
 * **A mirror that stops refreshing shows on health.** `degraded` also means the snapshot being
   served is more than `STALE_AFTER_DAYS` old (a monthly build that has been failing quietly), its
   last build failed, or its index was cut by a different chunker than this code's. The body keeps
-  its shape; the reason for `degraded` is in the log, once per change.
+  its shape; the reason for `degraded` is in the log, once per change, and in `reasons`.
+* **Health says why it is `degraded`.** `reasons` is a list of short plain sentences, empty when
+  the status is anything else. Besides the causes above it names the three that the maintenance
+  job's record adds: the job has not run for `MAINTENANCE_STALE_MINUTES` (its timer or the job has
+  stopped), Qdrant was restarted after a failure within `QDRANT_CRASH_REPORT_HOURS`, and its
+  memory is above `QDRANT_MEMORY_WARN_FRACTION` of its cap. A reason never carries a key, a
+  query or article text.
+* **Health also shows the semantic collection and the maintenance record.** `semantic` is the
+  collection the `wikipedia_semantic` alias points at, asked live from Qdrant (status, optimizer,
+  counts, whether its embedding run completed); `maintenance` is the record the maintenance job
+  leaves (`maintenance_record`). Both are `null` when there is none, and neither changes the
+  status by itself: nothing searches the semantic collection yet. (The maintenance record's
+  *age*, a recent crash and memory pressure do, as above.)
 * **Health also carries the last code update** (`update`: when, from and to which commit, and
   the outcome: `updated`, `current`, `deferred`, `held`, `failed` or `rolled_back`), read from the
   file `deploy/update.sh` leaves. It is `null` when there is none, and it never changes
@@ -49,11 +61,12 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Final
 
 from fastapi import FastAPI, Query, Request, Response
@@ -69,7 +82,15 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from wiki_mirror.build import read_build_state
 from wiki_mirror.config import MirrorConfig
+from wiki_mirror.embed import ALIAS as SEMANTIC_ALIAS
+from wiki_mirror.embed import semantic_index_complete
 from wiki_mirror.keys import ClientKeys
+from wiki_mirror.maintenance_record import (
+    MAX_TEXT_CHARS,
+    MaintenanceRecord,
+    read_maintenance_record,
+    record_as_dict,
+)
 from wiki_mirror.mcp_server import MCP_PATH, build_mcp_door
 from wiki_mirror.records import MAX_PAGE_ID
 from wiki_mirror.search import reply_as_dict
@@ -91,6 +112,24 @@ _BUILDING_PHASES: Final = frozenset({"downloading", "parsing", "indexing"})
 #: late or retried build, but not for a build that has been failing for a whole cycle.
 STALE_AFTER_DAYS: Final = 40
 
+#: Minutes past the maintenance record's `ran_at` after which health calls the mirror `degraded`.
+#: The timer fires every 15 minutes, so 60 is four missed runs in a row: the timer is off or the
+#: job is failing before it can write, not one slow or skipped run.
+MAINTENANCE_STALE_MINUTES: Final = 60
+
+#: Hours after a Qdrant restart following a failure during which health stays `degraded`.
+#: systemd brings Qdrant back in seconds, so the crash would otherwise vanish from health at once;
+#: a day is long enough for the operator to see it on the next look and read why.
+QDRANT_CRASH_REPORT_HOURS: Final = 24
+
+#: Fraction of Qdrant's memory cap (anonymous memory, which cannot be given back) above which
+#: health is `degraded`. The kernel's OOM kill comes at the cap itself; 90% leaves a margin to act
+#: in, as the 2026-10-23 kill (HNSW graphs built in RAM) showed there was none to spare.
+QDRANT_MEMORY_WARN_FRACTION: Final = 0.9
+
+#: The time format of the maintenance record (`maintenance_record`): UTC, second resolution.
+_RECORD_TIME_FORMAT: Final = "%Y-%m-%dT%H:%M:%SZ"
+
 #: Produces the body of `GET /v1/wiki/health`.
 HealthSource = Callable[[], dict[str, Any]]
 
@@ -107,7 +146,23 @@ class SearchBody(BaseModel):
 
 
 class ServiceHealth:
-    """Works out the health report from the build state, the alias and the snapshot served."""
+    """Works out the health report from the build state, the alias and the snapshot served.
+
+    The report keeps its shape from release to release; new keys are added, none renamed:
+
+    * `status`: `ok`, `degraded`, `building` or `empty`; `reasons` says why it is `degraded`.
+    * `reasons`: short plain sentences, empty unless `status` is `degraded`.
+    * `snapshot`, `applied_snapshot`, `articles`, `passages`, `collection`, `build`: the lexical
+      index being served and the build state.
+    * `update`: the last run of `deploy/update.sh`, or null. Reported only.
+    * `semantic`: the collection behind the `wikipedia_semantic` alias as Qdrant reports it now
+      (`collection`, `status`, `optimizer_status`, `points`, `indexed_vectors`, `segments`, and
+      `complete`, whether its embedding run finished), or null when there is no such alias or
+      Qdrant could not be asked. It never changes `status`: nothing searches it yet.
+    * `maintenance`: the maintenance job's last record (`maintenance_record`), or null when there
+      is no trustworthy one (the normal state before the timer is first enabled). Its age, a
+      recent Qdrant crash and Qdrant's memory against its cap can make `status` `degraded`.
+    """
 
     def __init__(
         self,
@@ -138,6 +193,16 @@ class ServiceHealth:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._stale_after = stale_after_days
         self._stale_logged = False
+        self._stale_reason = ""
+        # Which of the maintenance-record causes are currently raised, so each is logged once when
+        # it starts and once when it clears (see `_track`).
+        self._raised: set[str] = set()
+        self._semantic_failing = False
+        self._count_failing = False
+        # The route is a plain `def`, so FastAPI runs overlapping polls in a thread pool, and they
+        # share the "logged once" state above and the staleness flag. One lock guards all of it
+        # (never held across a call to Qdrant, and never taken twice by one call: not reentrant).
+        self._lock = threading.Lock()
         # Counting a 7M-row table on every health poll would be wasteful, and a store never
         # changes while it is open. Keyed by (collection, applied snapshot): one entry per store
         # ever served. The collection alone would go stale when an in-place update (W3) opens
@@ -157,19 +222,30 @@ class ServiceHealth:
                     passages = int(
                         self._client.count(collection_name=collection, exact=False).count
                     )
-                except Exception:
+                except Exception as exc:
                     # Deliberately broad: the client raises its own family of errors for a
                     # server that is down, restarting or refusing, and health must still
-                    # answer, as "degraded".
-                    logger.warning("health: Qdrant could not be asked", exc_info=True)
+                    # answer, as "degraded". Only the type is logged, once per outage: a
+                    # traceback on every poll would drown the log while Qdrant is down.
+                    self._note_count(type(exc).__name__)
                     counted = False
+                else:
+                    self._note_count(None)
             articles = self._article_count(serving)
             snapshot = serving.store.snapshot.date if serving is not None else None
             applied = serving.applied_snapshot if serving is not None else None
             stale = self._is_stale(snapshot)
-            status = self._status(build, collection, serving, problem, counted, stale)
+            status, reasons = self._status(build, collection, serving, problem, counted, stale)
+        record = read_maintenance_record(self._config.data_dir)
+        # These causes only turn a serving mirror `degraded`; while a build runs or nothing is
+        # built yet, `building` and `empty` say more than a stale timer would. They are still
+        # tracked in that case so their log lines stay paired.
+        extra = self._maintenance_reasons(record)
+        if status in ("ok", "degraded") and extra:
+            status, reasons = "degraded", [*reasons, *extra]
         return {
             "status": status,
+            "reasons": reasons,
             "snapshot": snapshot,
             "applied_snapshot": applied,
             "articles": articles,
@@ -180,7 +256,188 @@ class ServiceHealth:
             # held or rolled-back update leaves the previous code serving, which is not a fault
             # of the mirror, and reading it can never fail health (update_record).
             "update": read_update_record(self._config.data_dir),
+            "semantic": self._semantic(counted),
+            "maintenance": None if record is None else record_as_dict(record),
         }
+
+    def _semantic(self, counted: bool) -> dict[str, Any] | None:
+        """The collection the semantic alias points at, asked from Qdrant now.
+
+        Args:
+            counted: Whether the passage count succeeded this poll. When it did not, Qdrant is
+                down or hung and asking again would cost health a second and third timeout for
+                nothing, so the lookup is skipped.
+
+        Returns:
+            Its status, optimizer status, counts and whether its embedding run completed; None
+            when the alias does not exist or Qdrant could not be asked (logged, never raised:
+            health must answer, and the semantic index is not yet on the serving path).
+        """
+        if not counted:
+            return None
+        try:
+            aliases = self._client.get_aliases().aliases
+            name = next(
+                (a.collection_name for a in aliases if a.alias_name == SEMANTIC_ALIAS), None
+            )
+            if name is None:
+                self._note_semantic_lookup(None)
+                return None
+            info = self._client.get_collection(name)
+        except Exception as exc:
+            # Deliberately broad, as for the count above: a Qdrant that is down, restarting or
+            # refusing must not stop health from answering. Only the exception's type is logged,
+            # and only when the lookup starts failing: a response body could carry anything, and
+            # health is polled often.
+            self._note_semantic_lookup(type(exc).__name__)
+            return None
+        self._note_semantic_lookup(None)
+        failure = getattr(info.optimizer_status, "error", None)
+        return {
+            "collection": name,
+            "status": info.status.value,
+            # Qdrant's own error text, cut as the maintenance record cuts it.
+            "optimizer_status": "ok" if failure is None else f"error: {failure}"[:MAX_TEXT_CHARS],
+            "points": info.points_count,
+            "indexed_vectors": info.indexed_vectors_count,
+            "segments": info.segments_count,
+            "complete": self._embedding_complete(name),
+        }
+
+    def _note_semantic_lookup(self, error: str | None) -> None:
+        """Log once when the semantic lookup starts failing and once when it recovers.
+
+        Args:
+            error: The failure's exception type name, or None when the lookup worked.
+        """
+        with self._lock:
+            if error is not None and not self._semantic_failing:
+                logger.warning(
+                    "health: the semantic collection could not be asked (%s)",
+                    error,
+                    extra={"component": "api", "event": "semantic_lookup_failed"},
+                )
+            elif error is None and self._semantic_failing:
+                logger.info(
+                    "health: the semantic collection can be asked again",
+                    extra={"component": "api", "event": "semantic_lookup_recovered"},
+                )
+            self._semantic_failing = error is not None
+
+    def _note_count(self, error: str | None) -> None:
+        """Log once when the passage count starts failing and once when it recovers.
+
+        Args:
+            error: The failure's exception type name, or None when the count worked.
+        """
+        with self._lock:
+            if error is not None and not self._count_failing:
+                logger.warning(
+                    "health: Qdrant could not be asked (%s)",
+                    error,
+                    extra={"component": "api", "event": "count_failed"},
+                )
+            elif error is None and self._count_failing:
+                logger.info(
+                    "health: Qdrant can be asked again",
+                    extra={"component": "api", "event": "count_recovered"},
+                )
+            self._count_failing = error is not None
+
+    def _embedding_complete(self, name: str) -> bool:
+        """Whether the index state file of semantic collection `name` says its run completed.
+
+        An absent, unreadable or malformed file is False: a run nobody can vouch for is not
+        complete.
+        """
+        # Quiet: health polls this, and the reader would otherwise log an unreadable state on
+        # every poll.
+        return semantic_index_complete(self._config.data_dir, name, quiet=True)
+
+    def _maintenance_reasons(self, record: MaintenanceRecord | None) -> list[str]:
+        """The `degraded` causes the maintenance record brings, as plain sentences.
+
+        Each cause is logged once when it starts and once when it clears. No record is not a
+        cause: the timer may simply not be enabled yet.
+
+        Args:
+            record: The maintenance record, or None when there is none that can be trusted.
+        """
+        now = self._clock()
+        reasons: list[str] = []
+        stale = crash = pressure = unreadable = None
+        held: dict[str, str] = {}
+        if record is not None:
+            ran = _record_time(record.ran_at)
+            if ran is None:
+                stale = "the maintenance job's last run time is unreadable"
+            elif now - ran > timedelta(minutes=MAINTENANCE_STALE_MINUTES):
+                minutes = int((now - ran).total_seconds() // 60)
+                stale = (
+                    f"the maintenance job last ran at {record.ran_at}, {minutes} minutes ago; "
+                    "its timer or the job has stopped"
+                )
+            unit = record.qdrant
+            crashed = _record_time(unit.last_crash_at) if unit.last_crash_at else None
+            if crashed is not None and now - crashed < timedelta(hours=QDRANT_CRASH_REPORT_HOURS):
+                crash = f"Qdrant was restarted after a failure at {unit.last_crash_at}"
+            if (
+                unit.anon_bytes is not None
+                and unit.memory_max_bytes
+                and unit.anon_bytes > QDRANT_MEMORY_WARN_FRACTION * unit.memory_max_bytes
+            ):
+                percent = round(100 * unit.anon_bytes / unit.memory_max_bytes)
+                pressure = f"Qdrant holds {percent}% of its memory cap and is close to being killed"
+            if unit.found is None:
+                unreadable = (
+                    "the maintenance job could not read Qdrant's unit, so crashes and memory "
+                    "are not watched"
+                )
+            elif unit.found is False:
+                unreadable = (
+                    "Qdrant's unit is not installed, so the maintenance job does not watch "
+                    "crashes and memory"
+                )
+            for collection in record.collections:
+                if collection.held:
+                    held[collection.name] = (
+                        f"{collection.name} is held by the maintenance job: {collection.held}"
+                    )
+        # A hold for a collection that has since left the record clears like any other cause, so
+        # every hold raised before starts as None and is overwritten by the ones still in force.
+        with self._lock:
+            causes: dict[str, str | None] = {
+                k: None for k in self._raised if k.startswith("held:")
+            }
+            causes.update({f"held:{name}": reason for name, reason in held.items()})
+            causes.update(
+                {"maintenance": stale, "crash": crash, "memory": pressure, "unit": unreadable}
+            )
+            for key, reason in causes.items():
+                self._track(key, reason)
+                if reason is not None:
+                    reasons.append(reason)
+        return reasons
+
+    def _track(self, key: str, reason: str | None) -> None:
+        """Log cause `key` once when `reason` first appears and once when it clears.
+
+        The caller holds `self._lock`.
+        """
+        if reason is not None and key not in self._raised:
+            self._raised.add(key)
+            logger.warning(
+                "health: degraded: %s",
+                reason,
+                extra={"component": "api", "event": f"degraded_{key}"},
+            )
+        elif reason is None and key in self._raised:
+            self._raised.discard(key)
+            logger.info(
+                "health: the %s cause of degraded has cleared",
+                key,
+                extra={"component": "api", "event": f"cleared_{key}"},
+            )
 
     def _article_count(self, serving: Serving | None) -> int:
         """Articles in the open store, counted once per store."""
@@ -208,18 +465,31 @@ class ServiceHealth:
         problem: str | None,
         counted: bool,
         stale: bool,
-    ) -> str:
-        """`ok`, `degraded`, `building` or `empty`; the reason for `degraded` is in the log."""
+    ) -> tuple[str, list[str]]:
+        """`ok`, `degraded`, `building` or `empty`, and why it is `degraded` (else empty).
+
+        The reasons are fixed sentences: the serving holder's own summary, never an exception's
+        text, which could carry a path or an address.
+        """
         phase = build.get("phase")
-        if problem is not None or not counted:
-            return "degraded"
+        reasons: list[str] = []
+        if problem is not None:
+            reasons.append(f"serving has a problem: {problem}")
+        if not counted:
+            reasons.append("Qdrant could not be asked")
+        if reasons:
+            return "degraded", reasons
         if collection is None:
-            return "building" if phase in _BUILDING_PHASES else "empty"
+            return ("building" if phase in _BUILDING_PHASES else "empty"), []
         if serving is None or serving.collection != collection:
             # The holder recorded no problem yet is not serving what the alias names: the alias
             # moved a moment ago and the next look will catch up.
-            return "degraded"
-        return "degraded" if phase == "failed" or stale else "ok"
+            return "degraded", ["the alias moved and serving has not caught up with it yet"]
+        if phase == "failed":
+            reasons.append("the last build failed")
+        if stale:
+            reasons.append(self._stale_reason)
+        return ("degraded" if reasons else "ok"), reasons
 
     def _is_stale(self, snapshot: str | None) -> bool:
         """Whether the snapshot being served is older than `stale_after_days`.
@@ -228,6 +498,11 @@ class ServiceHealth:
         on every poll. A date that cannot be read counts as stale: a store whose own record is
         garbled is not one to call healthy.
         """
+        with self._lock:
+            return self._is_stale_locked(snapshot)
+
+    def _is_stale_locked(self, snapshot: str | None) -> bool:
+        """`_is_stale` with `self._lock` already held (it guards the logged-once flag)."""
         if snapshot is None:
             self._stale_logged = False
             return False
@@ -237,6 +512,11 @@ class ServiceHealth:
         except ValueError:
             age = None
         stale = age is None or age > self._stale_after
+        self._stale_reason = (
+            "the date of the snapshot served is unreadable"
+            if age is None
+            else f"the snapshot served is {age} days old, past the {self._stale_after}-day limit"
+        )
         if stale and not self._stale_logged:
             logger.warning(
                 "health: the snapshot served (%s) is %s days old, past the %d-day limit; "
@@ -250,6 +530,16 @@ class ServiceHealth:
             logger.info("health: the snapshot served is fresh again", extra={"component": "api"})
         self._stale_logged = stale
         return stale
+
+
+def _record_time(text: str | None) -> datetime | None:
+    """A maintenance-record time (`YYYY-MM-DDTHH:MM:SSZ`, UTC) as an aware datetime, or None."""
+    if text is None:
+        return None
+    try:
+        return datetime.strptime(text, _RECORD_TIME_FORMAT).replace(tzinfo=UTC)
+    except ValueError:
+        return None
 
 
 class _Guard:

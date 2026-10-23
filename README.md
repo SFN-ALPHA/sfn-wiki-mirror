@@ -93,7 +93,7 @@ with `wiki-mirror key add <name>`.
 | Freshness | Live, every language | A new file when Kiwix publishes one (English: every few months) | Rebuilt monthly; English only today |
 | Citations | Today's revision, which may change | The article as packed in that file | Revision id and `?oldid=` permalink on every reply |
 | Content | Article text | Rendered pages, with images in the large builds | Plain text for models; no images |
-| Footprint | None | One file: 13 GB (intros) to 119 GB (with images) | 62 GB today, about 160 GB with the semantic index |
+| Footprint | None | One file: 13 GB (intros) to 119 GB (with images) | 62 GB with the keyword index, about 165 GB with the semantic index |
 | Setup | A minute | A file and a command | A dedicated container, a free Enterprise account, a 14-hour first build |
 
 For occasional lookups, a live-API server such as [wikipedia-mcp](https://github.com/Rudra-ravi/wikipedia-mcp) is
@@ -106,7 +106,7 @@ passage matters and so does citing exactly what was read.
 
 ZIM sizes are from [Kiwix's download index](https://download.kiwix.org/zim/wikipedia/) in October 2026.
 
-## Status (2026-10-19)
+## Status (2026-10-23)
 
 Phase names used in these docs: **W2** is the semantic index and hybrid search; **W3** is the in-place monthly
 update. Both are defined in [docs/DESIGN.md §7](docs/DESIGN.md#7-phases). The embedding run of W2 is built; hybrid
@@ -117,9 +117,9 @@ search and W3 are not.
 | Snapshot served | 2026-10-01 (`enwiki_namespace_0`, English Wikipedia articles only) |
 | Articles | 7,245,149 |
 | Passages in the keyword index | 41,590,915 |
-| Search mode | Keyword (BM25-style sparse vectors in Qdrant). The embedding run for the semantic index (bge-m3) is built and resumable; hybrid search over it is next (W2) |
+| Search mode | Keyword (BM25-style sparse vectors in Qdrant). The embedding run for the semantic index (bge-m3) is built and resumable, and its first full run finished on 2026-10-22; Qdrant is rebuilding the search graphs on disk, and hybrid search over it is next (W2) |
 | Latency | About 27 ms per search with the index cached, 241 ms (p50) on first touch; article reads 1-2 ms (measured over the API, 2026-10-18) |
-| Disk and memory | Article store 25 GB; keyword index 37 GB on disk and 4-5 GB of RAM; semantic index about 95 GB and 10 GB of RAM (estimate) |
+| Disk and memory | Article store 25 GB; keyword index 37 GB on disk and 4-5 GB of RAM; semantic index about 102 GB, all on disk, so 7.4-7.5 GB of pinned RAM for Qdrant in all (measured), with the rest of the 32 GB as page cache (Qdrant's cap is 24G, which also bounds its cache). Semantic search measures about 45 ms cached and about half a second the first time |
 | Embedding the corpus | About 45 hours at 29 effective TFLOPS (estimate from measured rates) |
 | Updates | A new snapshot is built monthly beside the live index (scheduled; the first unattended run is 2026-11-02, so that is not yet proven). Code updates are by hand (`wiki-mirror update`), or nightly with a guard and rollback if you opt in with `--auto-update`. |
 
@@ -154,7 +154,10 @@ firewall (a template: your network goes in `/etc/wiki-mirror/site.env`, where `L
 `EMBEDDING_HOST` and `EMBEDDING_PORT` are optional, see [`deploy/site.env.example`](deploy/site.env.example)).
 The installer clones this repository over anonymous HTTPS; no deploy key is needed. The nightly self-update is opt-in:
 `install.sh --auto-update` turns it on, and it means your box runs whatever lands on `main` as root; without it, update
-by hand with `wiki-mirror update`. Install, operation, the update, memory and disk guidance, uninstalling and failure
+by hand with `wiki-mirror update`. A maintenance job (`wiki-mirror-maintain.timer`, every 15 minutes) resumes a
+Qdrant collection left paused after a restart and records what it saw for `wiki-mirror status` and the health route;
+the installer enables it, and a box that updates itself enables it once with `systemctl enable --now
+wiki-mirror-maintain.timer`. Install, operation, the update, memory and disk guidance, uninstalling and failure
 recovery: [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ### The semantic index (embedding run)
@@ -162,8 +165,10 @@ recovery: [docs/OPERATIONS.md](docs/OPERATIONS.md).
 `wiki-mirror embed-now` (as root) embeds every passage through your embedding server into a second Qdrant collection,
 `wikipedia_semantic_<born>`, and `wiki-mirror logs embed` follows it with a progress line each minute: articles,
 passages, passages per second and the time left. It takes about two days. It needs a finished keyword build,
-`embedding_url` in `mirror.yaml`, the embedding pair in `site.env` so the firewall admits the server, and a 32 GB box
-with Qdrant restarted under its 20G cap. Search does not use the collection yet.
+`embedding_url` in `mirror.yaml`, the embedding pair in `site.env` so the firewall admits the server, and a 32 GB box.
+The index (vectors, binary copy and search graph) is kept on disk and cached by the kernel in spare RAM, so Qdrant's
+pinned memory stays small; its memory cap is to be set from the measured figure after the rebuild. Search does not use
+the collection yet.
 
 The run is built to be interrupted. It works through the articles in order, in windows of 64, and moves a checkpoint
 only after Qdrant has confirmed a window. After a crash, a server error, a stop or a reboot, `embed-now` resumes: it

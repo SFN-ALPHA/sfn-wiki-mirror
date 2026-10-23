@@ -30,13 +30,37 @@
 # anonymous memory peaking at 5.1 GB during the last merges (one optimization at a time,
 # 400 MB segments) and 4.3 GB at rest.
 #
-# MemoryMax is 20G for the semantic index (W2, docs/DESIGN.md section 12.5): its binary-quantized
-# vectors are held in RAM (about 5.3 GB at 41.6M passages) and the HNSW graphs built after the
-# load sit in RAM too, on top of the lexical index's 4.3 GB at rest. The box needs 32 GB of RAM
-# for this: the cap, the API (1.5 G cap) and a build or embed run (5 G or 2 G caps) must all fit,
-# with page cache left over for the memory-mapped segments. An operator with less RAM can keep
-# the HNSW graphs on disk instead (`on_disk` in the collection's HNSW config), at the price of
-# slower dense search; there is no setting for it.
+# MemoryMax was raised to 20G for the semantic index (W2) when it was to be held in RAM. That did
+# not fit: on 2026-10-23, 4 h 38 min into the graph build with 62% of 41.6M passages indexed,
+# Qdrant was OOM-killed at 20G. Its anonymous memory had been 19.2 GB at rest: graph links
+# 6.87 GB (about 10.4 GB when complete), the pinned binary copy 5.32 GB, the keyword index 4.3 GB
+# and about 2.7 GB of other per-point bookkeeping; finished it would have rested at about 22.7 GB.
+#
+# The rationale now (docs/DECISIONS.md D8): the semantic index lives entirely on disk - float16
+# vectors, HNSW graph (`hnsw_config.on_disk`) and binary-quantized copy (`always_ram: false`) -
+# memory-mapped, with the kernel's page cache keeping the hot parts in spare RAM and giving them
+# back under pressure. Only anonymous memory can be OOM-killed. After the rebuild finished
+# (2026-10-23) it rests at 7.4-7.5 GB (7.52 GB in the cgroup), under the goal of 10 GB pinned for
+# the whole mirror.
+#
+# MemoryMax is 24G, and the reason is not the pinned memory. Under cgroup v2 the page cache that
+# Qdrant's memory-mapped files bring in is charged to this cgroup, so the cap is also Qdrant's
+# cache budget. Measured with a 26G runtime cap: memory.current sat at the cap (7.52 GB anonymous
+# plus 19.93 GB file cache), memory.events showed `max` 13693 (cache reclaimed at the cap) and
+# `oom_kill` 0. Reclaiming cache never kills, but a small cap means a small cache and slower
+# semantic search; a 14G cap would leave about 6.5 GB of cache against about 10.4 GB of graph and
+# 5.3 GB of binary copy that a search walks. The cap's job is to stop a runaway Qdrant before the
+# container runs out of memory. On a 32 GB box, 24G is what the other units' caps leave: API 1.5G,
+# build 5G, maintenance job 256M (the 2G embedding run never runs beside a build: they share the
+# build lock) and about 1.25 GB for the system. A box with less RAM lowers the cap by the
+# difference and pays in cache. The anonymous peak during a monthly build, when two keyword
+# indexes exist side by side, is an estimate (12 GB) and still to be measured. A cap set at runtime
+# with `systemctl set-property --runtime` lasts until reboot; this value applies after the next
+# install.sh run or reboot.
+#
+# The maintenance job (wiki-mirror-maintain.timer) resumes a collection left paused by a restart,
+# unless its crash-loop guard holds it, and wiki-mirror status and /v1/wiki/health show Qdrant's
+# memory against this cap and say `degraded` above 90%.
 #
 # Install: install.sh does it. By hand:
 #   cp wiki-mirror-qdrant.service /etc/systemd/system/ && systemctl daemon-reload
@@ -63,7 +87,7 @@ RestartSec=5s
 # Let it flush its WAL; a hard kill mid-write costs an index repair on the next start.
 TimeoutStopSec=120
 
-MemoryMax=20G
+MemoryMax=24G
 # Memory-mapped segments: the default file limit is far too low for a corpus this size.
 LimitNOFILE=65536
 

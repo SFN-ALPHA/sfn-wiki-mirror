@@ -8,12 +8,16 @@ without the key (2), with a malformed clients file (2) or without Qdrant (1), a 
 be opened (served `not_ready`, `degraded`), a failing stage (1), a parse with nothing downloaded
 (1), the Enterprise client being closed when a download fails, and the `key` command's refusals:
 `primary`, a bad name, a name already taken, a non-root caller, an unknown name, a malformed file.
+`maintain` runs against a fake Qdrant and a fake unit reader: it exits 0 whenever its record was
+written (Qdrant down included), takes no build lock and leaves the build state alone, and exits 1
+when the record cannot be written or the run raises.
 
 See docs/DESIGN.md section 6.
 """
 
 from __future__ import annotations
 
+import functools
 import io
 import json
 import sqlite3
@@ -26,7 +30,9 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import ResponseHandlingException
 
+from tests.fixtures.qdrant_fakes import LEXICAL, SEMANTIC, FakeQdrant, lexical_info, semantic_info
 from tests.fixtures.wiki_mirror_fakes import (
     API_KEY,
     FakeState,
@@ -49,6 +55,8 @@ from wiki_mirror.build import (
 )
 from wiki_mirror.embed import EmbedError
 from wiki_mirror.keys import hash_key
+from wiki_mirror.maintain import QDRANT_TIMEOUT_SECONDS, UnitReading, run_maintenance
+from wiki_mirror.maintenance_record import QdrantUnitReport, read_maintenance_record
 from wiki_mirror.records import SnapshotMeta
 from wiki_mirror.serving import ServedSnapshot
 
@@ -662,6 +670,115 @@ def test_a_second_build_while_one_is_running_exits_1_and_changes_nothing(
     assert called == []
     # Not recorded as a failure: that would overwrite the running build's progress.
     assert _state(tmp_path) == before
+
+
+# -- maintain: heals Qdrant beside a running build, and never touches the build state ----------
+
+
+def _maintain_against(monkeypatch: pytest.MonkeyPatch, qdrant: FakeQdrant) -> None:
+    """Point `maintain` at a fake Qdrant and a running unit, so no socket and no systemd is used."""
+    running = UnitReading(QdrantUnitReport(found=True, active=True, restarts=0))
+    monkeypatch.setattr(cli, "QdrantClient", lambda **_: qdrant)
+    monkeypatch.setattr(
+        cli, "run_maintenance", functools.partial(run_maintenance, unit_reader=lambda: running)
+    )
+
+
+def _maintain(tmp_path: Path) -> tuple[int, str, str]:
+    """Run `maintain` with the test's settings."""
+    return _run(["--config", str(_settings(tmp_path)), "maintain"])
+
+
+def test_maintain_resumes_a_paused_collection_writes_the_record_and_exits_0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    qdrant = FakeQdrant({SEMANTIC: semantic_info(status="grey"), LEXICAL: lexical_info()})
+    _maintain_against(monkeypatch, qdrant)
+    code, out, err = _maintain(tmp_path)
+    record = read_maintenance_record(tmp_path / "data")
+    assert (code, out, err) == (0, "", "")
+    assert [update["collection_name"] for update in qdrant.updates] == [SEMANTIC]
+    assert record is not None
+    assert [action.action for action in record.actions] == ["resumed"]
+
+
+def test_maintain_with_qdrant_down_exits_0_because_the_record_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    down = ResponseHandlingException(OSError("connection refused"))
+    _maintain_against(monkeypatch, FakeQdrant({}, errors={"get_aliases": down}))
+    code, _, _ = _maintain(tmp_path)
+    record = read_maintenance_record(tmp_path / "data")
+    assert code == 0
+    assert record is not None
+    assert record.problems == ("Qdrant did not answer: ResponseHandlingException",)
+
+
+def test_maintain_while_a_build_holds_the_lock_still_runs_and_leaves_the_build_state_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    qdrant = FakeQdrant({SEMANTIC: semantic_info(status="grey"), LEXICAL: lexical_info()})
+    _maintain_against(monkeypatch, qdrant)
+    write_build_state(tmp_path / "data", BuildState(phase="parsing", chunks_parsed=120))
+    before = _state(tmp_path)
+    with build_lock(tmp_path / "data"):
+        code, _, err = _maintain(tmp_path)
+    assert code == 0
+    assert "already running" not in err
+    assert len(qdrant.updates) == 1
+    assert _state(tmp_path) == before
+
+
+def test_maintain_does_not_create_a_build_state_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _maintain_against(monkeypatch, FakeQdrant({}))
+    assert _maintain(tmp_path)[0] == 0
+    assert not (tmp_path / "data" / "state" / "build.json").exists()
+
+
+def test_maintain_with_a_record_that_cannot_be_written_exits_1_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _maintain_against(monkeypatch, FakeQdrant({}))
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "state").write_text("a file where the state directory should be")
+    code, _, err = _maintain(tmp_path)
+    assert code == 1
+    assert "cannot write the record" in err
+    assert "the record could not be written" in caplog.text
+
+
+def test_maintain_an_unexpected_exception_exits_1_with_its_type_and_a_logged_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cli, "QdrantClient", lambda **_: FakeQdrant({}))
+    monkeypatch.setattr(cli, "run_maintenance", broken)
+    code, _, err = _maintain(tmp_path)
+    assert code == 1
+    assert "RuntimeError: boom" in err
+    assert "maintain failed" in caplog.text
+
+
+def test_maintain_gives_the_qdrant_client_a_short_timeout_and_closes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+    qdrant = FakeQdrant({})
+
+    def client(**kwargs: Any) -> FakeQdrant:
+        seen.update(kwargs)
+        return qdrant
+
+    _maintain_against(monkeypatch, qdrant)
+    monkeypatch.setattr(cli, "QdrantClient", client)
+    assert _maintain(tmp_path)[0] == 0
+    # A 15-minute job: Qdrant not answering within a minute is the finding, not a wait.
+    assert seen == {"url": "http://127.0.0.1:6333", "timeout": QDRANT_TIMEOUT_SECONDS}
+    assert qdrant.closed is True
 
 
 @pytest.mark.parametrize("command", ["download", "parse", "index", "build"])

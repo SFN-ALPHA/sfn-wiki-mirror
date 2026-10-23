@@ -149,8 +149,64 @@ def test_the_embed_unit_has_no_timer_and_the_installer_does_not_enable_it() -> N
     assert EMBED_UNIT in installer
 
 
-def test_qdrant_is_capped_at_20g_for_the_semantic_index() -> None:
-    assert _unit("wiki-mirror-qdrant.service")["Service"]["MemoryMax"] == ["20G"]
+MAINTAIN_UNIT = "wiki-mirror-maintain.service"
+MAINTAIN_TIMER = "wiki-mirror-maintain.timer"
+
+
+def test_the_maintain_unit_runs_the_job_as_the_build_user_with_group_readable_output() -> None:
+    service = _unit(MAINTAIN_UNIT)["Service"]
+    assert service["Type"] == ["oneshot"]
+    assert service["User"] == ["wikimirror-sync"]
+    assert service["Group"] == ["wikimirror"]
+    assert service["ExecStart"] == ["/opt/wiki-mirror/.venv/bin/python -I -m wiki_mirror maintain"]
+    # The API user, in group wikimirror, reads the record the job writes.
+    assert service["UMask"] == ["0027"]
+
+
+def test_the_maintain_unit_is_ordered_after_qdrant_but_does_not_require_it() -> None:
+    unit = _unit(MAINTAIN_UNIT)
+    assert unit["Unit"]["After"] == ["wiki-mirror-qdrant.service"]
+    # With Qdrant down the job must still run and say so.
+    assert "Requires" not in unit["Unit"]
+    assert "BindsTo" not in unit["Unit"]
+
+
+def test_the_maintain_unit_is_retried_by_its_timer_not_by_systemd() -> None:
+    service = _unit(MAINTAIN_UNIT)["Service"]
+    assert "Restart" not in service
+    assert service["TimeoutStartSec"] == ["5min"]
+    assert service["MemoryMax"] == ["256M"]
+    assert service["Nice"] == ["10"]
+    assert service["IOSchedulingClass"] == ["idle"]
+
+
+def test_the_maintain_unit_writes_only_local_data_and_can_still_ask_systemd() -> None:
+    service = _unit(MAINTAIN_UNIT)["Service"]
+    assert service["ReadWritePaths"] == ["/var/lib/wiki-mirror"]
+    assert service["ProtectSystem"] == ["strict"]
+    # `systemctl show` talks to systemd over a Unix socket, and Qdrant is on loopback.
+    families = service["RestrictAddressFamilies"][0].split()
+    assert {"AF_UNIX", "AF_INET"} <= set(families)
+    assert "EnvironmentFile" not in service  # it holds no credentials
+
+
+def test_the_maintain_timer_fires_every_15_minutes_with_a_small_spread() -> None:
+    timer = _unit(MAINTAIN_TIMER)["Timer"]
+    assert timer["OnBootSec"] == ["5min"]
+    assert timer["OnUnitActiveSec"] == ["15min"]
+    assert timer["Unit"] == [MAINTAIN_UNIT]
+    assert timer["RandomizedDelaySec"] == ["30s"]
+    assert _unit(MAINTAIN_TIMER)["Install"]["WantedBy"] == ["timers.target"]
+
+
+def test_the_maintain_unit_may_reach_qdrant_on_loopback_in_the_firewall() -> None:
+    # Output on loopback is accepted before any per-user rule, so wikimirror-sync needs no rule of
+    # its own to reach Qdrant (the embed unit relies on the same).
+    assert 'oifname "lo" accept' in NFT
+
+
+def test_qdrant_is_capped_at_24g_for_the_semantic_index() -> None:
+    assert _unit("wiki-mirror-qdrant.service")["Service"]["MemoryMax"] == ["24G"]
 
 
 # -- the firewall -----------------------------------------------------------------------------
@@ -525,15 +581,16 @@ def test_every_shipped_unit_is_installed_and_the_update_timer_is_opt_in() -> Non
     assert declared is not None, "the installer's UNITS array moved"
     installed = set(declared.group(1).split())
     assert installed == {unit.name for unit in UNITS.glob("wiki-mirror*")}
-    # What is always enabled and started: the services and the monthly build timer, not the update
-    # timer, which is added only on --auto-update or when it is already enabled
-    # (test_install_repo_and_updates.py runs both ways).
+    # What is always enabled and started: the services and the monthly build and maintenance
+    # timers, not the update timer, which is added only on --auto-update or when it is already
+    # enabled (test_install_repo_and_updates.py runs both ways).
     always = re.search(r"local to_enable=\((.*?)\)", installer)
     assert always is not None, "the installer's enable list moved"
     assert set(always.group(1).split()) == {
         "wiki-mirror-qdrant.service",
         "wiki-mirror.service",
         "wiki-mirror-build.timer",
+        "wiki-mirror-maintain.timer",
     }
     assert f"to_enable+=({UPDATE_TIMER})" in installer
     assert 'run systemctl enable "${to_enable[@]}"' in installer

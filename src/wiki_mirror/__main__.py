@@ -4,15 +4,22 @@ The one entry point on the mirror's container. The monthly job runs `build` (dow
 as the `wikimirror-sync` user, which has internet but never serves; the systemd unit runs `serve` as
 `wikimirror`, which serves but has no internet. `download`, `parse` and `index` run one stage by
 hand, for resuming a stage that failed, `embed` (W2) embeds every passage into the semantic
-collection, run by `wiki-mirror-embed.service` once a build has finished, `status` shows where a
-build stands, and `key` manages the API keys of the other agents (reached as
-`wiki-mirror key add|list|revoke`).
+collection, run by `wiki-mirror-embed.service` once a build has finished, `maintain` heals Qdrant
+(resumes paused collections, keeps the semantic collection's settings) and records what it saw,
+run every 15 minutes by `wiki-mirror-maintain.timer`, `status` shows where a build stands, and
+`key` manages the API keys of the other agents (reached as `wiki-mirror key add|list|revoke`).
 
 Non-obvious constraints:
 
 * **Exit codes.** 0 success, 1 a stage failed (the log has the cause), 2 the configuration or
   the command line is wrong. systemd treats 2 as "do not retry": an unfixable start. `embed`
-  without `embedding_url` is such a case.
+  without `embedding_url` is such a case. `maintain` exits 0 whenever it wrote its record,
+  whatever problems the record holds (they are for health to show), and 1 only when the record
+  could not be written or the run raised.
+* **`maintain` takes no build lock and never touches the build state.** It must run while a build
+  or an embedding run does (that is when Qdrant most needs it), and a failed maintenance run says
+  nothing about the index being served. It only probes the lock before it changes a collection's
+  settings (`maintain`).
 * **One build at a time, and a failure always shows.** `download`, `parse`, `index`, `build` and
   `embed` hold `build.build_lock` while they run; a second one exits 1 with "a build is already
   running" and touches nothing. Any exception a stage raises ends with `phase="failed"` and a
@@ -84,6 +91,7 @@ from wiki_mirror.keys import (
     list_clients,
     revoke_client,
 )
+from wiki_mirror.maintain import QDRANT_TIMEOUT_SECONDS, run_maintenance
 from wiki_mirror.records import SnapshotMeta
 from wiki_mirror.serving import ServedSnapshot, open_store_for_snapshot
 from wiki_mirror.store import ArticleStore, StoreError
@@ -112,6 +120,7 @@ _COMMANDS = {
     "index": "load the article store's passages into Qdrant and swap the alias",
     "build": "download, parse and index: the monthly job",
     "embed": "embed every passage into the semantic collection (W2); resumable",
+    "maintain": "heal Qdrant (resume paused collections, keep settings) and record its state",
     "serve": "run the HTTP API",
     "status": "show where the build stands and what is being served",
 }
@@ -173,6 +182,9 @@ def main(
         return _status(config, out)
     if args.command == "serve":
         return _serve(config, err)
+    if args.command == "maintain":
+        # Before the build lock, like `status` and `serve`: see the module docstring.
+        return _maintain(config, err)
     if args.command == "key":
         return _key(config, args, out, err, euid)
     if args.command == "embed" and config.embedding_url is None:
@@ -365,6 +377,38 @@ def _serve(config: MirrorConfig, err: TextIO) -> int:
         )
     finally:
         served.close()
+        client.close()
+    return 0
+
+
+def _maintain(config: MirrorConfig, err: TextIO) -> int:
+    """Run one maintenance pass (`maintain.run_maintenance`); exit 1 only if it did not finish.
+
+    Qdrant not answering is not a failure of the run: it is a problem in the record, which was
+    written, and the exit code is 0. A record that cannot be written (the state directory is not
+    writable) or an unexpected exception exits 1 so systemd shows the failed run.
+
+    Args:
+        config: Service settings (`qdrant_url`, `data_dir`, `min_free_disk_gb`).
+        err: Where the failure is printed.
+
+    Returns:
+        0 when the record was written, 1 otherwise.
+    """
+    client = QdrantClient(url=config.qdrant_url, timeout=QDRANT_TIMEOUT_SECONDS)
+    try:
+        run_maintenance(config, client)
+    except OSError as exc:
+        logger.exception("maintain: the record could not be written")
+        err.write(f"wiki-mirror: maintain: cannot write the record: {exc}\n")
+        return 1
+    except Exception as exc:
+        # The command line is the boundary, as for the stages: a logged traceback and an exit
+        # code, not a Python crash.
+        logger.exception("maintain failed")
+        err.write(f"wiki-mirror: maintain failed: {type(exc).__name__}: {exc}\n")
+        return 1
+    finally:
         client.close()
     return 0
 

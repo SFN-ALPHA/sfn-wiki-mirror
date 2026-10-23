@@ -7,17 +7,24 @@ once and silently passes every test that only parses the file, which is how it h
 the deploy files moved up a directory. So the file is copied into a fake checkout
 (`app/deploy/wiki-mirror`, a stub `app/.venv/bin/python`, a stub `app/deploy/update.sh`), run
 through a symlink in a separate `bin/`, and each verb is asked which stub it reached. `id` is
-stubbed, since the command checks for root with `id -u`.
+stubbed, since the command checks for root with `id -u`. `status` is run over stubbed `curl`
+(the health reply), `systemctl` and `nft` (real `nft list counters` output from
+`tests/fixtures/deploy/`), with the real interpreter standing in for the virtualenv's, and its
+output is read: the semantic index, the maintenance record, the schedule and the firewall counters.
+The only wall clock is the child process's own, in "minutes ago".
 
 See deploy/README.md and docs/OPERATIONS.md ("The `wiki-mirror` commands").
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -214,3 +221,268 @@ def test_cli_app_dir_override_still_wins_over_the_location_it_was_found_at(
         check=False,
     )
     assert result.stdout.strip() == "other-stub"
+
+
+def test_cli_logs_maintain_shows_the_maintain_units_journal(installed: Installed) -> None:
+    _systemd_stubs(installed)
+    result = installed.run("logs", "maintain")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "journalctl -u wiki-mirror-maintain.service -n 100 --no-pager"
+
+
+def test_cli_logs_names_maintain_among_the_logs_it_knows(installed: Installed) -> None:
+    result = installed.run("logs", "frobnicate")
+    assert result.returncode == 1
+    assert "maintain" in result.stderr
+
+
+def test_cli_help_lists_the_maintain_log(installed: Installed) -> None:
+    result = installed.run("--help", uid="1000")
+    assert "maintain" in result.stdout
+
+
+# -- `wiki-mirror status` ----------------------------------------------------------------------
+
+_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
+_API_KEY = "k" * 40
+
+
+def _health_body(**overrides: object) -> dict[str, object]:
+    """A health reply in the shape the API returns, healthy, with no semantic index."""
+    body: dict[str, object] = {
+        "status": "ok",
+        "reasons": [],
+        "snapshot": "2026-10-01",
+        "applied_snapshot": "20261001",
+        "articles": 7000000,
+        "passages": 41590915,
+        "collection": "wikipedia_lexical_20261001",
+        "build": {"phase": "serving"},
+        "update": None,
+        "semantic": None,
+        "maintenance": None,
+    }
+    return {**body, **overrides}
+
+
+def _fresh_record(**unit: object) -> dict[str, object]:
+    """The fixture maintenance record, run just now (the CLI measures its age on the real clock)."""
+    record = json.loads(
+        (_FIXTURES / "maintenance" / "maintenance_after_crash.json").read_text(encoding="utf-8")
+    )
+    record["ran_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    record["qdrant"].update(unit)
+    assert isinstance(record, dict)
+    return record
+
+
+def _semantic(**fields: object) -> dict[str, object]:
+    """A `semantic` block as the API returns it for the recorded yellow collection."""
+    block: dict[str, object] = {
+        "collection": "wikipedia_semantic_20261001",
+        "status": "yellow",
+        "optimizer_status": "ok",
+        "points": 41590915,
+        "indexed_vectors": 25855559,
+        "segments": 85,
+        "complete": True,
+    }
+    return {**block, **fields}
+
+
+def _status_box(installed: Installed, health: dict[str, object], *, enabled: str = "") -> None:
+    """Stub everything `status` reaches: a real Python, the key file, curl, systemctl, nft.
+
+    Args:
+        installed: The scratch box.
+        health: What the API's health route answers.
+        enabled: Space-separated unit names `systemctl is-enabled` reports enabled.
+    """
+    stubs = installed.root / "stubs"
+    # `status` parses the health JSON with the venv's Python; the default stub only echoes.
+    _executable(
+        installed.app / ".venv" / "bin" / "python", f'#!/bin/sh\nexec "{sys.executable}" "$@"\n'
+    )
+    (installed.root / "conf" / "mirror.env").write_text(
+        f"WIKI_MIRROR_API_KEY={_API_KEY}\n", encoding="utf-8"
+    )
+    body = stubs / "health.json"
+    body.parent.mkdir(parents=True, exist_ok=True)
+    body.write_text(json.dumps(health), encoding="utf-8")
+    _executable(
+        stubs / "curl",
+        f'#!/bin/sh\necho "$*" >> "$(dirname "$0")/curl.args"\ncat "{body}"\n',
+    )
+    _executable(
+        stubs / "systemctl",
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        "  is-active) echo active ;;\n"
+        f'  is-enabled) case " {enabled} " in *" $2 "*) echo enabled ;;'
+        " *) echo disabled ;; esac ;;\n"
+        "  show) echo ;;\n"
+        "esac\n",
+    )
+    _executable(
+        stubs / "nft",
+        f'#!/bin/sh\ncat "{_FIXTURES / "deploy" / "nft_list_counters.txt"}"\n',
+    )
+
+
+def _status(installed: Installed, health: dict[str, object], **kwargs: str) -> str:
+    """Run `status` over a box whose API answers `health`; return stdout."""
+    _status_box(installed, health, **kwargs)
+    result = installed.run("status")
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_cli_status_semantic_green_is_ready_with_its_passage_count(installed: Installed) -> None:
+    out = _status(installed, _health_body(semantic=_semantic(status="green")))
+    assert "ready (41,590,915 passages)" in out
+
+
+def test_cli_status_semantic_yellow_shows_how_far_the_graph_is(installed: Installed) -> None:
+    out = _status(installed, _health_body(semantic=_semantic()))
+    assert "building its search graph (25,855,559 of 41,590,915 indexed)" in out
+    assert "embedding run complete" in out
+
+
+def test_cli_status_semantic_grey_says_the_maintenance_job_resumes_it(installed: Installed) -> None:
+    out = _status(installed, _health_body(semantic=_semantic(status="grey")))
+    assert "paused - the maintenance job resumes it within 15 minutes" in out
+
+
+def test_cli_status_semantic_optimizer_error_shows_qdrants_text(installed: Installed) -> None:
+    out = _status(
+        installed,
+        _health_body(
+            semantic=_semantic(status="red", optimizer_status="error: no space left on device")
+        ),
+    )
+    assert "optimizer failed: no space left on device" in out
+
+
+def test_cli_status_semantic_incomplete_run_is_said(installed: Installed) -> None:
+    out = _status(installed, _health_body(semantic=_semantic(complete=False)))
+    assert "embedding run not complete" in out
+
+
+def test_cli_status_without_a_semantic_index_says_so(installed: Installed) -> None:
+    out = _status(installed, _health_body())
+    assert "no semantic index yet" in out
+
+
+def test_cli_status_without_a_maintenance_record_says_how_to_enable_the_timer(
+    installed: Installed,
+) -> None:
+    out = _status(installed, _health_body())
+    assert "no maintenance record - enable the timer once: " in out
+    assert "systemctl enable --now wiki-mirror-maintain.timer" in out
+
+
+def test_cli_status_maintenance_shows_run_restarts_memory_and_last_action(
+    installed: Installed,
+) -> None:
+    out = _status(installed, _health_body(maintenance=_fresh_record()))
+    assert "last run " in out
+    assert " minutes ago)" in out
+    assert "Qdrant restarts after a failure: 1, last at 2026-10-23T07:12:23Z" in out
+    assert "Qdrant memory 16.9 GB of 27.9 GB (61%)" in out
+    assert "last action 2026-10-23T12:30:04Z on wikipedia_semantic_20261001: status was grey" in out
+
+
+def test_cli_status_maintenance_without_a_memory_cap_says_no_cap(installed: Installed) -> None:
+    out = _status(installed, _health_body(maintenance=_fresh_record(memory_max_bytes=None)))
+    assert "Qdrant memory 16.9 GB (no cap)" in out
+
+
+def test_cli_status_maintenance_record_from_long_ago_says_the_job_has_stopped(
+    installed: Installed,
+) -> None:
+    # The fixture's own run time is 2026-10-23: long past by the time the CLI reads the real clock.
+    record = json.loads(
+        (_FIXTURES / "maintenance" / "maintenance_after_crash.json").read_text(encoding="utf-8")
+    )
+    record["ran_at"] = "2026-01-01T00:00:00Z"
+    out = _status(installed, _health_body(maintenance=record))
+    assert "the timer or the job has stopped: wiki-mirror logs maintain" in out
+
+
+def test_cli_status_maintenance_problems_are_listed(installed: Installed) -> None:
+    record = _fresh_record()
+    record["problems"] = ["wikipedia_semantic_20261001 stayed grey after a resume"]
+    out = _status(installed, _health_body(maintenance=record))
+    assert "wikipedia_semantic_20261001 stayed grey after a resume" in out
+
+
+def test_cli_status_unreadable_unit_is_not_called_not_installed(installed: Installed) -> None:
+    out = _status(installed, _health_body(maintenance=_fresh_record(found=None)))
+    assert "the Qdrant unit could not be read" in out
+    assert "not installed" not in out
+
+
+def test_cli_status_unit_systemd_says_is_missing_is_called_not_installed(
+    installed: Installed,
+) -> None:
+    out = _status(installed, _health_body(maintenance=_fresh_record(found=False)))
+    assert "the Qdrant unit is not installed" in out
+
+
+def test_cli_status_a_held_collection_shows_its_reason(installed: Installed) -> None:
+    record = _fresh_record()
+    record["collections"][1]["held"] = "Qdrant holds 95% of its memory cap"  # type: ignore[index]
+    out = _status(installed, _health_body(maintenance=record))
+    assert "wikipedia_semantic_20261001 is held: Qdrant holds 95% of its memory cap" in out
+
+
+def test_cli_status_no_longer_prints_a_healing_since_line(installed: Installed) -> None:
+    out = _status(installed, _health_body(maintenance=_fresh_record()))
+    assert "healing since" not in out
+
+
+def test_cli_status_prints_every_reason_degraded_gives(installed: Installed) -> None:
+    out = _status(
+        installed,
+        _health_body(
+            status="degraded",
+            reasons=[
+                "Qdrant was restarted after a failure at 2026-10-23T07:12:23Z",
+                "the last build failed",
+            ],
+        ),
+    )
+    assert "Qdrant was restarted after a failure at 2026-10-23T07:12:23Z" in out
+    assert "the last build failed" in out
+
+
+def test_cli_status_warns_when_the_maintain_timer_is_not_enabled(installed: Installed) -> None:
+    out = _status(installed, _health_body())
+    assert "wiki-mirror-maintain.timer is not enabled" in out
+    assert "systemctl enable --now wiki-mirror-maintain.timer" in out
+
+
+def test_cli_status_shows_the_maintain_timer_when_it_is_enabled(installed: Installed) -> None:
+    out = _status(installed, _health_body(), enabled="wiki-mirror-maintain.timer")
+    assert "wiki-mirror-maintain.timer is not enabled" not in out
+    assert "wiki-mirror-maintain.timer     " in out
+
+
+def test_cli_status_firewall_shows_exactly_the_four_counters_with_their_packets(
+    installed: Installed,
+) -> None:
+    out = _status(installed, _health_body())
+    counters = out.split("Firewall", 1)[1].splitlines()[1:]
+    shown = [line.split() for line in counters if line.strip()]
+    assert shown == [
+        ["in_refused", "165446", "packets"],
+        ["in_invalid", "923", "packets"],
+        ["out_refused", "1", "packets"],
+        ["service_refused", "4", "packets"],
+    ]
+
+
+def test_cli_status_keeps_the_key_out_of_the_curl_arguments(installed: Installed) -> None:
+    _status(installed, _health_body())
+    arguments = (installed.root / "stubs" / "curl.args").read_text(encoding="utf-8")
+    assert _API_KEY not in arguments

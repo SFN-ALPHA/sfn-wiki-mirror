@@ -39,11 +39,12 @@ flowchart LR
 | Parse | `parse.py`, `build.run_parse` | Turns each chunk's Parsoid HTML into plain text with section headings, infobox key-value blocks and category lists; drops reference lists, navigation boxes and "See also" link farms. Workers are spawned processes, one chunk each, streaming to a zstd spool; the parent is the single SQLite writer. |
 | Article store | `store.py`, `records.py` | One SQLite file per snapshot, `articles/<identifier>_<yyyymmdd>.db`. Compressed text, title and redirect-alias indexes, a per-article `text_hash`. Highest revision wins on duplicates. A finished store is immutable and opened read-only. |
 | Keyword index | `index.py`, `passages.py` | Cuts every article into passages with the vendored chunker and encodes each with the vendored hashed-BM25 sparse encoder, then upserts them into Qdrant. Checkpointed; ends by pointing the alias at the new collection. |
-| Semantic index (embedding run) | `embed.py` | Cuts the same passages as the keyword index, asks an Ollama-compatible embedding server for a vector each, and upserts them into `wikipedia_semantic_<born>` in windows of 64 articles with a checkpoint (`state/index_semantic_<born>.json`). Resumable, and a resume verifies the checkpoint against Qdrant. Started by hand (`wiki-mirror embed-now`) as `wiki-mirror-embed.service`; no query reads the result yet. |
+| Semantic index (embedding run) | `embed.py` | Cuts the same passages as the keyword index, asks an Ollama-compatible embedding server for a vector each, and upserts them into `wikipedia_semantic_<born>` in windows of 64 articles with a checkpoint (`state/index_semantic_<born>.json`). Resumable, and a resume verifies the checkpoint against Qdrant. Started by hand (`wiki-mirror embed-now`) as `wiki-mirror-embed.service`; no query reads the result yet. The collection's layout (graph and binary copy on disk, optimizer threads) is the constants `SEMANTIC_HNSW`, `SEMANTIC_QUANTIZATION` and `SEMANTIC_OPTIMIZATION_THREADS` ([D8](DECISIONS.md#d8)). |
+| Maintenance job | `maintain.py`, `maintenance_record.py`, `wiki-mirror-maintain.{service,timer}` | Every 15 minutes, as `wikimirror-sync`: reads Qdrant's systemd unit and memory, resumes a paused (`grey`) mirror collection, keeps the semantic collection's live settings equal to the constants in `embed.py`, and writes `state/maintenance.json` for health and `wiki-mirror status`. |
 | Serving | `serving.py` | Holds the (collection, store) pair currently served, follows the alias and the index state, and hands requests a lease so a swap never closes a store under a reader. |
 | Search | `search.py` | Query encoding, article folding, exact-title priority, snippets cut from the store, windowed article reads. |
 | API and MCP door | `api.py`, `mcp_server.py`, `keys.py` | FastAPI app with a pure-ASGI guard in front: authentication, request ids, JSON errors. `/mcp` is the MCP SDK's Streamable HTTP endpoint behind the same guard. |
-| CLI | `__main__.py`, `deploy/wiki-mirror` | `python -m wiki_mirror <download|parse|index|build|embed|serve|status|key>`; `wiki-mirror` is the operator wrapper. |
+| CLI | `__main__.py`, `deploy/wiki-mirror` | `python -m wiki_mirror <download|parse|index|build|embed|maintain|serve|status|key>`; `wiki-mirror` is the operator wrapper. |
 | Update path | `deploy/update.sh`, `update_record.py` | Self-update from `main` (nightly, if the operator opted in) with a format guard and rollback; writes `state/update.json`. |
 
 DESIGN.md sections: the article store and index in [§5](DESIGN.md#5-the-design), the Enterprise snapshot in
@@ -87,6 +88,31 @@ HNSW on and moves the alias `wikipedia_semantic`. It is not part of `build`.
 The operator's view is in [OPERATIONS.md](OPERATIONS.md#the-semantic-index-w2-the-first-embedding-run); the design in
 [DESIGN.md §12.5](DESIGN.md#125-first-semantic-build-w2).
 
+### The maintenance job
+
+`python -m wiki_mirror maintain`, run every 15 minutes by `wiki-mirror-maintain.timer` as the oneshot
+`wiki-mirror-maintain.service` (user `wikimirror-sync`, `MemoryMax=256M`, ordered after Qdrant but not requiring it,
+no `Restart=`: the timer is the retry). It was added with [D8](DECISIONS.md#d8), after Qdrant was restarted from an
+out-of-memory kill and its semantic collection sat paused unnoticed.
+
+* **What a run does.** Reads the previous record and Qdrant's unit (`systemctl show`, and `anon` and `max` from the
+  unit's cgroup `memory.stat` and `memory.max`); lists the `wikipedia_lexical_*` and `wikipedia_semantic_*`
+  collections; resumes any that is `grey` with an empty optimizers update; reconciles the collection behind the
+  `wikipedia_semantic` alias to `embed`'s constants, sending only what differs; writes the record.
+* **The record.** `state/maintenance.json` (`maintenance_record.py`, schema 1), written atomically, group-readable.
+  Reading never fails and never guesses: a missing, malformed or other-schema file reads as no record. Health returns
+  it as `maintenance` and turns `degraded` when it is more than 60 minutes old, when Qdrant was restarted after a
+  failure within 24 hours, or when Qdrant's anonymous memory is above 90% of its cap.
+* **Settings wait for a safe moment.** A graph or binary-copy placement change makes Qdrant rebuild every segment's
+  graph, so it is sent only when the collection's embedding run is complete, the collection is not `red`, the build
+  lock is free (probed, never held) and the disk has its floor. Otherwise the record's problems say what it waits for.
+* **The code is the truth** for the semantic settings: a hand change is put back on the next run.
+* **It never stops the record.** A source it cannot read becomes an empty field and a problem sentence; exit 1 only
+  when the record cannot be written. It starts no embedding run, build or update.
+
+The operator's view is in [OPERATIONS.md](OPERATIONS.md#the-maintenance-job); the design in
+[DESIGN.md §12.5](DESIGN.md#125-first-semantic-build-w2).
+
 ## Data layout
 
 Paths are inside the container. The defaults are in `config.py` and can be changed in `mirror.yaml`.
@@ -96,7 +122,7 @@ Paths are inside the container. The defaults are in `config.py` and can be chang
 | `/mnt/wikipedia/snapshots/<identifier>_<yyyymmdd>/` | Downloaded Enterprise chunks (`.tar.gz`, about 151 GB), `.etag` sidecars, `snapshot.json`. Two kept (`retain_snapshots`). | Bulk storage mounted at `/mnt/wikipedia` (NFS from a NAS, bind-mounted by the Proxmox host, or a bind-mounted local directory) | No: re-downloadable |
 | `/var/lib/wiki-mirror/articles/<identifier>_<yyyymmdd>.db` | The article store, 25 GB for the 2026-10-01 snapshot | Local (NVMe) | No: rebuildable from the snapshot |
 | `/var/lib/wiki-mirror/qdrant/` | Qdrant storage (37 GB for the keyword index) | Local | No: rebuildable |
-| `/var/lib/wiki-mirror/state/` | `build.json`, `build.lock`, `index_lexical_<born>.json` (index state and checkpoint), `index_semantic_<born>.json` (the embedding run's state and checkpoint), `enterprise_budget.json`, `update.json` | Local | Should be: losing an index state file takes search down until it is restored (DESIGN.md §12.8) |
+| `/var/lib/wiki-mirror/state/` | `build.json`, `build.lock`, `index_lexical_<born>.json` (index state and checkpoint), `index_semantic_<born>.json` (the embedding run's state and checkpoint), `enterprise_budget.json`, `update.json`, `maintenance.json` (the maintenance job's last record) | Local | Should be: losing an index state file takes search down until it is restored (DESIGN.md §12.8) |
 | `/var/lib/wiki-mirror/tmp/` | The parse spool | Local | No |
 | `/etc/wiki-mirror/` | `mirror.yaml`, `mirror.env` (the primary key), `enterprise.env` (Enterprise sign-in), `clients.json` (key hashes), `qdrant.yaml` | Local | Config only; never in git |
 | `/opt/wiki-mirror/` | The git checkout and its venv, root-owned | Local | No |
@@ -127,11 +153,13 @@ rather than one with both vectors are in [DESIGN.md §12.2](DESIGN.md#122-the-fo
   with the same chunker and taking chunk `n`, so the index and the store must describe the same text.
 * **Vectors.** The keyword collection has one sparse vector, `lexical`, 2^24 hashed dimensions, with Qdrant's IDF
   modifier. The semantic collection holds bge-m3 vectors (1,024 dimensions, cosine), float16 on disk with
-  binary quantization in RAM and rescoring ([D1](DECISIONS.md#d1), [D5](DECISIONS.md#d5)). Its `born` is the tag of
+  a binary-quantized copy and rescoring ([D1](DECISIONS.md#d1), [D5](DECISIONS.md#d5)); the copy and the HNSW graph
+  are on disk too, not pinned in RAM ([D8](DECISIONS.md#d8)). Its `born` is the tag of
   the store it was embedded from, and its on-disk integer payload index on `page_id` serves both the resume check and
   W3's per-article selection.
 * **Segments are capped** at 400,000 KB with one optimization at a time, so a merge fits in memory and a rewrite
-  never needs a third of the disk free. Both came from OOM kills during the first build (DESIGN.md §12.8).
+  never needs a third of the disk free. Both came from OOM kills during the first build (DESIGN.md §12.8). (The
+  semantic collection has its own: about 1 GB segments and two optimizations at a time, DESIGN.md §12.5.)
 * **The index state file** `state/index_lexical_<born>.json` records the build checkpoint, the chunker
   fingerprint (`v1:512/50`) and `applied_snapshot`: the snapshot whose store the passages were cut from. Serving
   pairs the collection with that snapshot's store. Today `applied_snapshot` equals `<born>`; the planned monthly
@@ -176,8 +204,11 @@ wire contract is in [API.md](API.md) and [MCP.md](MCP.md).
   switched off on purpose: this service trusts only the key, and a host list would reject legitimate callers
   using a name or address not on it.
 * **Health** is computed from the build state, the alias and the open store. `degraded` means a failed last build,
-  a snapshot older than 40 days, a differently-chunked index, no usable index state, an unopenable store, or
-  Qdrant not answering.
+  a snapshot older than 40 days, a differently-chunked index, no usable index state, an unopenable store,
+  Qdrant not answering, or one of the three causes the maintenance record adds (a record more than 60 minutes old, a
+  Qdrant restart after a failure within 24 hours, Qdrant above 90% of its memory cap). `reasons` lists them. The
+  report also carries `semantic` (the semantic collection as Qdrant reports it now) and `maintenance` (the record);
+  neither changes the status by itself.
 
 ## The update path
 

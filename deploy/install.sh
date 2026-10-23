@@ -31,9 +31,10 @@
 #   7. Qdrant         the pinned release, checksum-verified, and its config.
 #   8. Config         mirror.yaml, mirror.env with a generated API key (the primary key), and an
 #                     empty clients.json (the other agents' key hashes; `wiki-mirror key add`).
-#   9. Units          the six systemd units installed; qdrant + API + the monthly build timer
-#                     enabled. The nightly update timer (02:20 local time) is enabled only with
-#                     --auto-update, or when it already is (a re-run never turns it off).
+#   9. Units          the systemd units installed; qdrant + API + the monthly build timer + the
+#                     15-minute maintenance timer enabled. The nightly update timer (02:20 local
+#                     time) is enabled only with --auto-update, or when it already is (a re-run
+#                     never turns it off).
 #  10. Firewall       nftables per-user egress, rendered from the template and the site file,
 #                     checked with `nft -c` before it is applied. Transactional: the file it
 #                     replaces is kept until the whole ruleset checks clean, and put back (or the
@@ -1405,6 +1406,7 @@ install_config() {
 UNITS=(wiki-mirror-qdrant.service wiki-mirror.service
        wiki-mirror-build.service wiki-mirror-build.timer
        wiki-mirror-embed.service
+       wiki-mirror-maintain.service wiki-mirror-maintain.timer
        wiki-mirror-update.service wiki-mirror-update.timer)
 
 install_units() {
@@ -1428,9 +1430,15 @@ install_units() {
         skip "units"
     fi
 
-    # Qdrant, the API and the monthly build timer, always. NOT the build, embed or update
-    # services: they are started by their timers (or by the operator: `wiki-mirror build-now`,
-    # `wiki-mirror embed-now`, `wiki-mirror update`), never by this installer.
+    # Qdrant, the API, the monthly build timer and the maintenance timer, always. NOT the build,
+    # embed, maintain or update services: they are started by their timers (or by the operator:
+    # `wiki-mirror build-now`, `wiki-mirror embed-now`, `wiki-mirror update`), never by this
+    # installer.
+    #
+    # The maintenance timer is on everywhere, unlike the update timer: the job only reads, resumes
+    # a paused collection and applies the code's own settings, so it is safe on any box, and
+    # without it a Qdrant that failed and restarted goes unnoticed (health calls a record more than
+    # an hour old degraded, and says nothing at all about a box that never had one).
     #
     # The nightly update timer is opt-in. Its unit is always installed (above), but it is enabled
     # only on --auto-update, or when it is already enabled: update.sh pulls the repository's main
@@ -1440,8 +1448,8 @@ install_units() {
     # is the state `enabled` exactly, as `wiki-mirror status` reads it: `is-enabled` also exits 0
     # for enabled-runtime, static, indirect and alias, none of which is an operator's decision to
     # follow upstream (and an enabled-runtime timer would not survive a reboot).
-    local to_enable=(wiki-mirror-qdrant.service wiki-mirror.service wiki-mirror-build.timer)
-    local what="qdrant, the API and the monthly build timer"
+    local to_enable=(wiki-mirror-qdrant.service wiki-mirror.service wiki-mirror-build.timer wiki-mirror-maintain.timer)
+    local what="qdrant, the API and the monthly build and maintenance timers"
     if $AUTO_UPDATE || [[ "$(systemctl is-enabled wiki-mirror-update.timer 2>/dev/null || true)" == enabled ]]; then
         to_enable+=(wiki-mirror-update.timer)
         what+=" and the nightly update timer"

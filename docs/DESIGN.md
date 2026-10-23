@@ -75,15 +75,17 @@ A separate LXC on a Proxmox host (hostname `wikipedia-mirror`) so that:
 |---|---|---|---|
 | Downloaded snapshots (current and previous) | 2 x 151 GB | NAS (NFS dataset bind-mounted at `/mnt/wikipedia`) | No (re-downloadable) |
 | Article store: clean text per article, zstd, SQLite | 25 GB measured | Local disk (NVMe) | No (rebuildable from the snapshot) |
-| Qdrant: sparse keyword vectors, and later dense vectors and the HNSW graph | 37 GB measured for keywords | Local disk | No (rebuildable) |
+| Qdrant: sparse keyword vectors, and the semantic index's dense vectors, binary copy and HNSW graph | 37 GB measured for keywords; about 100 GB for the semantic index (section 12.1) | Local disk | No (rebuildable) |
 | Index state and build state | small | Local disk | Should be: losing an index state file takes search down until it is restored |
 
 - Qdrant must not run on NFS: it memory-maps its files, and a network filesystem makes every search a network round
   trip. SQLite's locking misbehaves on NFS too. The NAS holds only the large, rarely read snapshots.
-- **Memory.** The container started with 8 GB and has 32 GB since 2026-10-17. Qdrant is capped at 20G since D7 (the first
-  keyword build peaked at 5.1 GB of anonymous memory and rests at 4.3 GB, under the earlier 12G cap; the semantic
-  index's binary vectors and HNSW graphs add about 10-11 GB, section 12.5). Decision D1 chose binary quantization (about 2 GB per 13M vectors) with
-  full-precision rescoring from disk, so the searchable vectors stay small in RAM.
+- **Memory.** The container started with 8 GB and has 32 GB since 2026-10-17. The first keyword build peaked at
+  5.1 GB of anonymous memory and rests at 4.3 GB. D7 raised Qdrant's cap from 12G to 20G for a semantic index held in
+  RAM; that layout needed about 22.7 GB and Qdrant was killed at the cap on 2026-10-23, so D8 moved the semantic
+  index's graph and binary copy to disk (section 12.1). Measured after that rebuild, the pinned memory rests at 7.4-7.5
+  GB, and the cap is now 24G because under cgroup v2 it is also Qdrant's page-cache budget (D8). Decision D1 chose binary quantization (about 2 GB per 13M vectors) with full-precision rescoring from disk,
+  which keeps the searchable vectors small; they are now read from the page cache rather than pinned.
 
 ## 5. The design
 
@@ -219,12 +221,18 @@ estimate.
   | Article store | 25 GB measured, doubled for a few hours during a monthly update |
   | Keyword index | 37 GB measured |
   | Semantic index, float16 originals | about 85 GB (41.5M x 1,024 x 2 B) |
-  | Semantic index, binary vectors in RAM | about 5.3 GB |
-  | HNSW graph | a few GB |
+  | Semantic index, binary-quantized copy, on disk | 5.3 GB (measured 5.32 GB) |
+  | HNSW graph links, on disk | about 10.4 GB (measured 6.87 GB with 62% built, about 250 B per passage) |
 
   One copy of everything fits on the NVMe pool (206 GB free after the first build); two full copies of both indexes
   side by side do not, which is why monthly updates change the collections in place.
-- **RAM.** Qdrant is capped at 20G (D7). Only the binary vectors stay resident; the rest is memory-mapped.
+- **RAM.** The goal is a mirror whose pinned (anonymous) memory stays under 10 GB. All three files of the semantic
+  index are on disk and memory-mapped (D8): the kernel's page cache holds the parts in use in spare RAM and gives
+  them back under pressure, so a Qdrant heavy on cache is not killed for it. Pinned memory at rest, measured after the
+  rebuild finished on 2026-10-23, is 7.4-7.5 GB for Qdrant (the estimate had been 7.0 GB) and 0.14 GB for the API. The
+  earlier layout, with the graph and the binary copy pinned, was
+  measured at 19.2 GB with 62% of the graph built and would have rested at about 22.7 GB. Section 12.5 has the
+  incident and the trade-off.
 - **The free tier.** It gives one full snapshot a month and no change feed. Downloading the whole 151 GB takes about
   45 minutes (435 chunks at about 6 s each), so the download is not worth optimising. Working out what changed is
   our job.
@@ -254,7 +262,8 @@ estimate.
      score higher on public benchmarks and would build in about the same time. The maintainer kept bge-m3, since it
      serves the need and the priority is the work the mirror serves rather than a perfect Wikipedia lookup. A model change
      stays possible at any later full rebuild (section 12.7);
-   - float16 originals on disk, binary quantization in RAM, and rescoring with oversampling (D1);
+   - float16 originals on disk, the binary-quantized copy on disk too (D8; it was in RAM until 2026-10-23), and
+     rescoring with oversampling (D1);
    - W2 checks binary against int8 through the golden set.
 
 ### 12.3 W1.5: format changes before the first build
@@ -286,7 +295,8 @@ Each stage resumes after a crash. The first run measured the rates and sizes in 
 
 ### 12.5 First semantic build (W2)
 
-1. **Measurements on a sample** (the remaining one is the HNSW build time and Qdrant's memory use at scale).
+1. **Measurements on a sample** (the HNSW build time and Qdrant's memory use at scale were measured in the first
+   full run, below, and so were memory and semantic search latency on the on-disk layout).
    - **Embedding rate:** below.
    - **Recall:** binary and int8, each rescored, against exact search: recall@10 at least 0.9997 on the evaluation
      sample ([EVALUATION.md](EVALUATION.md)); the full-scale golden check is the guard.
@@ -302,7 +312,8 @@ Each stage resumes after a crash. The first run measured the rates and sizes in 
    - show progress and the ETA in the log (built); not on health, which the embed stage deliberately never
      touches.
 3. **Lend RAM if the graph build is disk-bound:** give the container more memory for the build only
-   (`pct set <ctid> -memory <MB>` takes effect live on an LXC), then hand it back.
+   (`pct set <ctid> -memory <MB>` takes effect live on an LXC), then hand it back. With the graph on disk (D8) this
+   is less likely to be needed; what a rebuild of the graphs needs is CPU time and free disk.
 4. **Switch hybrid on** when the semantic collection covers every page in `applied_snapshot` and the golden set
    passes (at least 90% in the top 5). Until then, keyword search answers alone.
 
@@ -336,13 +347,66 @@ search) is not built: no query reads the semantic collection yet.
 - **The text form.** A passage is embedded as its title, section heading and body (`Chunk.indexed_text`), the
   form the passage-length evaluation measured (dense hit@5 0.953), recorded as `TEXT_FORM` in the state. A question
   is embedded as plain text. Changing the form is a new `TEXT_FORM`, and so a new collection.
-- **The collection.** Float16 vectors on disk with binary quantization held in RAM, HNSW off (`m=0`) during the load
-  and on (`m=16`, `ef_construct=100`) at the end, segments capped at about 1 GB, one optimization at a time. The
-  finish switches HNSW on, then moves the alias `wikipedia_semantic` (both idempotent, so a run that died between
-  them repeats them), and records the run complete.
+- **The collection.** Float16 vectors on disk, the binary-quantized copy on disk (`always_ram=False`), HNSW off
+  (`m=0`) during the load and on (`m=16`, `ef_construct=100`, `on_disk=True`) at the end, segments capped at about
+  1 GB (about 85 of them), two optimizations at a time. These values are the constants `SEMANTIC_HNSW`,
+  `SEMANTIC_QUANTIZATION` and `SEMANTIC_OPTIMIZATION_THREADS` in `embed.py`, and the code is the truth for them
+  (below). The finish switches HNSW on, then moves the alias `wikipedia_semantic` (both idempotent, so a run that
+  died between them repeats them), and records the run complete.
 - **What it will not do.** It does not delete a collection that has no usable state, and it does not resume with
   other settings. It does not catch up after a monthly rebuild: embed after a new snapshot builds a whole new
   collection (about 85 GB, about two days), because embedding only the changed articles is not built (W3).
+
+**The first full run and the move to disk, measured 2026-10-22/23** ([D8](DECISIONS.md#d8) has the decision).
+The run finished at 21:34 CDT on 2026-10-22: 41,590,915 passages from 7,245,149 articles, exactly the keyword
+index's count, at 220 passages/s overall. Qdrant then built the graphs with the graph and the binary copy pinned,
+and was killed at its 20G cap at 02:12 on 2026-10-23, 4 h 38 min in, with 62% of the passages indexed (about 93,000 a
+minute). Its anonymous memory at rest was 19.2 GB (peak 20.1 GB while loading): graph links 6.87 GB (about 250 B per
+passage, about 10.4 GB complete), binary copy 5.32 GB, keyword index 4.3 GB, and about 2.7 GB of other per-point
+bookkeeping (the remainder). Complete, it would have rested at about 22.7 GB.
+
+* **The layout that follows.** The graph (`hnsw_config.on_disk`) and the binary copy (`always_ram=False`) go on disk
+  with the float16 vectors, optimizer threads go from 1 to 2, and the rebuild finished at 13:04 on 2026-10-23 (about
+  5 h 40 min, 85 segments, no restart; limited by disk, not CPU). Measured, the pinned memory is 7.4-7.5 GB for Qdrant
+  plus 0.14 GB for the API. Qdrant memory-maps the files, and the page cache keeps the hot parts and gives them back
+  under pressure. That cache is charged to Qdrant's cgroup, so `MemoryMax` is also its cache budget, and it was set to
+  24G (D8).
+* **What it costs.** Measured on the box over loopback (`limit` 10): about 45 ms median once cached; about 0.5 to
+  0.9 s the first time a query touches the files; 6 s median and 37 s worst for the first queries right after the
+  rebuild. A first-time query reads about 290 MB from disk, because a search walks the graph of every one of the 85
+  segments; most of it is read amplification (the ZFS `recordsize` of the dataset was not checked). Nothing serves
+  semantic search yet, so this decides what to do before hybrid search is switched on (step 4). The levers, in order,
+  each still to be measured: fewer, larger segments (about 85 down to 10-20) at the next rebuild; a smaller ZFS
+  `recordsize` for Qdrant's dataset; lower rescoring and oversampling, if the golden set shows no recall loss;
+  pre-warming the graph and binary files after Qdrant starts; and last, pinning the binary copy again (+5.3 GB, about
+  12.8 GB pinned, which misses the goal). A newer Qdrant (1.16 or later) with `hnsw_config.inline_storage` is a further
+  option, about 150 GB more disk (an estimate; a staged upgrade from 1.12).
+* **Why moving it costs a rebuild.** In every Qdrant version up to 1.20, changing where the graph or the quantized
+  copy lives makes Qdrant rebuild every segment's graph in the background, although the files are identical. It
+  costs CPU only; the keyword index keeps serving and no embedding is redone. A change of the optimizer thread count
+  does not rebuild. On the maintainer's box the graph build took 16 segments in its first hour at one thread.
+
+**The maintenance job** (`src/wiki_mirror/maintain.py`, its record `maintenance_record.py`; the operator's view is in
+[OPERATIONS.md](OPERATIONS.md#the-maintenance-job)). The same night showed that Qdrant 1.12 does not restart pending
+optimizations after it restarts: the semantic collection sat `grey` until an update operation arrived, and nothing
+noticed. Every 15 minutes the job resumes any `grey` collection with an empty optimizers update, makes the live
+semantic collection's HNSW, quantization and optimizer-thread settings equal to the three constants, and writes
+`state/maintenance.json`, which health and `wiki-mirror status` read. Choices that would look like bugs:
+
+* **The code is the truth.** A setting changed by hand is put back within 15 minutes. A layout change is a change to
+  the constants, reviewed and shipped like any other.
+* **A settings change that rebuilds waits** until the collection's embedding run is complete (the embed stage keeps
+  HNSW off during the load on purpose), the collection is not `red`, the build lock is free and free disk is at
+  least `min_free_disk_gb`. The lock is probed and never held.
+* **Nothing stops the record.** Qdrant not answering, `systemctl` failing or an unreadable cgroup file become empty
+  fields and a problem sentence. The job exits 1 only when it cannot write the record.
+* **A crash is an automatic restart.** `last_crash_at` is the start time of the Qdrant run in which systemd's
+  `NRestarts` went up; a start by hand resets that count and is not a crash. systemd's `Result` and the cgroup's
+  `oom_kill` counter are not used: the first reads `success` after an automatic restart, the second restarts at 0
+  with the unit.
+* **Out of scope:** starting or retrying embedding runs, the keyword collection's settings, segment sizes and
+  pre-warming. Nothing pushes an alert; health turns `degraded` (a stale record, a restart after a failure within 24
+  hours, Qdrant above 90% of its cap) and `wiki-mirror status` shows it.
 
 **Embedding rate, measured 2026-10-16** (bge-m3 through the embedding server at background priority, about
 2,000-character passages, whichever nodes were awake): 14.5 passages/s with one request in flight, 49.5/s with 8,
@@ -503,16 +567,18 @@ packed greedily (consecutive pieces joined while they fit the target; a piece is
 41.5M, matches the 41.59M actually indexed. Packing only inside one top-level section barely helps (2,048 gives
 35.8M), because most sections have no subsections, so the options below pack across sections:
 
-| Cut | Passages | Mean chars | Under 300 chars | Embed time | float16 on disk | Binary in RAM |
+| Cut | Passages | Mean chars | Under 300 chars | Embed time | float16 on disk | Binary copy |
 |---|---|---|---|---|---|---|
 | v1, sections never merge | 41.5M | 717 | 31% | ~42 h | 85 GB | 5.3 GB |
 | pack to 1,024 | 30.1M | 1,004 | 6% | ~41 h | 62 GB | 3.9 GB |
 | pack to 1,536 | 25.1M | 1,205 | 4% | ~39 h | 51 GB | 3.2 GB |
 | pack to 2,048 | 21.6M | 1,400 | 3% | ~37 h | 44 GB | 2.8 GB |
 
-Packing buys RAM and time, not disk: v1's binary vectors plus HNSW graph come to about 10-11 GB beside the keyword
-index's ~4.3 GB, above Qdrant's 12G cap, while 2,048 needs about half that. The cost is retrieval quality, which
-the passage-length evaluation measured before anything was rebuilt.
+Packing buys memory and time, not disk: v1's binary vectors plus HNSW graph were estimated at about 10-11 GB
+beside the keyword index's ~4.3 GB, above Qdrant's then 12G cap, while 2,048 needs about half that (the graph
+measured later is about 10.4 GB alone, [D8](DECISIONS.md#d8); both now live on disk, so this is page cache and
+build time rather than pinned memory). The cost is retrieval quality, which the passage-length evaluation measured
+before anything was rebuilt.
 
 **Passage-length evaluation and result (2026-10-19, D5): keep v1.** The method, the fairness corrections, the
 decision rule and the full results table are in [EVALUATION.md](EVALUATION.md). In short: on 300 golden questions

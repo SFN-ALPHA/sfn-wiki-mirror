@@ -13,7 +13,7 @@
 | Nightly self-update | `update.sh` with deferral, format guard, rollback ([D4](DECISIONS.md#d4)) | Built 2026-10-17; opt-in for an installation (`--auto-update`), on for the maintainer's |
 | **Annotations** | What the parser drops today, kept beside the text: links, images, references, infobox fields, tables, math, quality signals and more; article reads return them | **Planned 2026-10-19**, [below](#article-annotations-and-the-reader); must be on the box before the 2026-11-02 build |
 | **Reader** | A thin web page on the LAN: search, results, article text with clickable links | **Planned 2026-10-19**, [below](#article-annotations-and-the-reader) |
-| **W2** | Semantic index, hybrid search, query-focused snippet | **In progress.** Cut decided 2026-10-19 ([D5](DECISIONS.md#d5)); the embedding run is built ([D7](DECISIONS.md#d7)); the first full run started 2026-10-20; the [semantic catch-up](#the-semantic-catch-up) (needed after the 2026-11-02 build), hybrid search, the fusion-weight check and the focused snippet remain |
+| **W2** | Semantic index, hybrid search, query-focused snippet | **In progress.** Cut decided 2026-10-19 ([D5](DECISIONS.md#d5)); the embedding run is built ([D7](DECISIONS.md#d7)); the first full run started 2026-10-20 and finished 2026-10-22; the index moved to disk and a maintenance job was added on 2026-10-23 ([D8](DECISIONS.md#d8)), with the memory (7.4-7.5 GB pinned) and semantic latency measured and the cap set to 24G; the [semantic catch-up](#the-semantic-catch-up) (needed after the 2026-11-02 build), hybrid search, the fusion-weight check and the focused snippet remain |
 | **W3** | Monthly in-place updates | Designed ([DESIGN.md §12.6](DESIGN.md#126-the-monthly-update-w3)); not started; target the 2026-12-02 update |
 
 Until W3 lands the monthly timer runs a full keyword build beside the live collection and swaps the alias, which
@@ -223,8 +223,8 @@ with hybrid on.
 * Model **bge-m3** (1,024 dimensions, cosine), so a query is embedded once for both indexes. Newer open
   models scored higher on public benchmarks but were not worth a different model now; a model change stays
   possible at any later full rebuild.
-* **Float16 originals on disk** (about 85 GB) with **binary quantization in RAM** (about 5.3 GB) and rescoring.
-  Binary against int8 is not measured separately at full scale; the golden check is the guard.
+* **Float16 originals on disk** (about 85 GB) with a **binary-quantized copy** (5.3 GB) and rescoring; the copy and
+  the HNSW graph live on disk too ([D8](DECISIONS.md#d8)). Binary against int8 is not measured separately at full scale; the golden check is the guard.
 * A second Qdrant collection, `wikipedia_semantic_<born>` behind the alias `wikipedia_semantic`, with the same
   point ids and payload as the keyword collection ([ARCHITECTURE.md](ARCHITECTURE.md#the-index-two-collections-shared-point-ids)).
 
@@ -239,13 +239,21 @@ with hybrid on.
 2. **An embedding-server key** for the mirror, with no other use (if the server requires one). It must live in a 0600 file readable by `wikimirror-sync` alone
    (like `enterprise.env`), never in `mirror.yaml`, a log or model context. The key's file, its setting name
    and its place in `config.py` are not designed yet; record the choice as the next decision in [DECISIONS.md](DECISIONS.md).
-3. **Qdrant's memory cap raised from 12G to about 20G** (`MemoryMax` in
-   `systemd/wiki-mirror-qdrant.service`; the box has 32 GB). The keyword index rests at 4.3 GB; binary
-   vectors plus the HNSW graph add about 10 to 11 GB. Also check `vm.max_map_count` on the Proxmox host
-   (`sysctl -w vm.max_map_count=1048576`). The API (1.5 GB) and a build (5 GB) must still fit beside it.
+3. **Memory.** **Decided and measured 2026-10-23 ([D8](DECISIONS.md#d8)); the cap is 24G.** The cap was
+   raised from 12G to 20G for a semantic index held in RAM (`MemoryMax` in `systemd/wiki-mirror-qdrant.service`;
+   the box has 32 GB), and Qdrant was killed at 20G on 2026-10-23 with the graph 62% built: that layout needed about
+   22.7 GB at rest. The graph and the binary copy now live on disk, and after the rebuild Qdrant's pinned memory
+   rests at 7.4-7.5 GB (the estimate was 7.0 GB). The cap is 24G, not the 14G first planned, because under cgroup v2
+   the page cache of Qdrant's memory-mapped files is charged to its cgroup, so the cap is also its cache budget; 24G
+   is what the API (1.5 GB), a build (5 GB), the maintenance job and the system leave on a 32 GB box. **Still to do:
+   measure Qdrant's pinned memory during a monthly build** (the estimate is 12 GB, with two keyword indexes side by
+   side). Also check `vm.max_map_count` on the Proxmox host (`sysctl -w vm.max_map_count=1048576`).
 4. **The indexer.** **Built 2026-10-19** as the `embed` stage ([D7](DECISIONS.md#d7); how to run it, and how it
-   resumes and verifies its checkpoint: [OPERATIONS.md](OPERATIONS.md)), except the health route's progress, which is
-   a log line each minute instead. As planned: a build stage after `index`, or a mode of it, that makes one pass over
+   resumes and verifies its checkpoint: [OPERATIONS.md](OPERATIONS.md)). Its first full run finished on 2026-10-22.
+   The health route's progress, once a gap (the stage logs a line a minute), is covered by the `semantic` block of
+   `/v1/wiki/health` (the collection's status, points, indexed vectors and whether the run completed) and by the
+   Semantic index section of `wiki-mirror status`, kept honest by the maintenance job ([OPERATIONS.md](OPERATIONS.md#the-maintenance-job)).
+   As planned: a build stage after `index`, or a mode of it, that makes one pass over
    the article store in page-id order:
    * cut each article with the same chunker, and embed through the embedding server's `/api/embed`;
    * **16 requests in flight** (the knee measured on the maintainer's embedding router; tune it to your server),
@@ -255,17 +263,25 @@ with hybrid on.
    * upsert into the new collection with HNSW indexing off during the load and switched on at the end;
    * checkpoint the last page id fully embedded, so a resume repeats only the windows in flight, and verify it
      against Qdrant on resume; write it into an index state file like the keyword collection's;
-   * show progress and an ETA on `/v1/wiki/health`;
+   * show progress on `/v1/wiki/health` (built as the `semantic` block; the ETA stays in the log);
    * stay within the existing rules: one build at a time (the build lock), the disk-floor check before creating
      a collection, and no secrets in logs.
 5. **Hybrid search.** Query both collections and fuse with RRF (k=60). Fusion must key on (point id,
    `text_hash`), so a passage already updated in one index is never merged with the other index's older version
    of it. Switch hybrid on only when the semantic collection covers every page in `applied_snapshot` and the
    golden set passes; until then keyword search answers alone and `mode` stays `lexical`. The reply's `mode`
-   becomes `hybrid` ([API.md](API.md#post-v1wikisearch)).
+   becomes `hybrid` ([API.md](API.md#post-v1wikisearch)). **Semantic search latency on the on-disk layout
+   was measured on 2026-10-23:** about 45 ms once cached, about half a second the first time, and seconds to tens
+   of seconds right after a restart or a cold cache; a first-time query reads about 290 MB, because it walks all 85
+   segments ([D8](DECISIONS.md#d8) has the table). Before hybrid search is switched on, try the levers, each still
+   to be measured, in this order: fewer, larger segments (85 down to 10-20, at the next rebuild); a smaller ZFS
+   `recordsize` for Qdrant's dataset; lower rescoring and oversampling, checked on the golden set; pre-warming the
+   graph and binary files after Qdrant starts; and last, pinning the binary copy (+5.3 GB, about 12.8 GB pinned,
+   which misses the 10 GB goal).
 6. **A fusion-weight check.** On the evaluation sample, equal-weight fusion's hit@1 (0.713) trailed dense alone
    (0.823) with hard negatives. Before switching hybrid on, try weights on the golden set at full scale and keep
-   equal weights only if they hold up.
+   equal weights only if they hold up. Run it alongside the latency measurement in the previous item, on the same
+   layout.
 7. **A query-focused snippet.** Show the best 320-character window of the matching passage, chosen by overlap
    with the query terms, instead of the start of the passage. It held the answer 8 to 12 points more often on
    the live cut ([EVALUATION.md](EVALUATION.md)). It is a change to the snippet alone and can ship before the

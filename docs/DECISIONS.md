@@ -16,6 +16,8 @@ only the conclusion, and say what was accepted as a cost.
 | [D4](#d4) | 2026-10-17 | The container updates itself nightly at 02:20 local time (opt-in for other installations, 2026-10-19) |
 | [D5](#d5) | 2026-10-19 | The semantic build embeds the live passage cut with bge-m3; packing rejected on measurement |
 | [D6](#d6) | 2026-10-19 | A site's network lives in `/etc/wiki-mirror/site.env`; the firewall in the repository is a template |
+| [D7](#d7) | 2026-10-19 | The embedding run is its own stage, unit and key file |
+| [D8](#d8) | 2026-10-23 | The semantic index lives on disk, and a maintenance job keeps it healthy |
 
 <a id="d1"></a>
 ## D1 - 2026-10-16 - A local Wikipedia mirror
@@ -189,4 +191,156 @@ leaves the build state alone, because the index being served is fine. **Deferred
 (the journal has a line a minute), hybrid search and fusion weights, and the catch-up after a monthly rebuild,
 which embeds only articles whose `text_hash` changed; until that lands, `embed` after a rebuild starts a new full
 collection. **Accepted:** the HNSW graphs go in RAM, so the box needs 32 GB; the 1 GB segment cap is not measured
-at this scale yet.
+at this scale yet. **Superseded in part by [D8](#d8):** the graphs and the binary copy went in RAM for one day, and
+the 20G cap did not hold them; both now live on disk and the cap is 24G.
+
+<a id="d8"></a>
+## D8 - 2026-10-23 - The semantic index lives on disk, and a maintenance job keeps it healthy
+
+**Decision.** All three files of the semantic index live on disk: the float16 vectors (as before), the HNSW graph
+(`hnsw_config.on_disk: true`) and the binary-quantized copy (`quantization_config.binary.always_ram: false`). The
+optimizer threads for the semantic collection go from 1 to 2. The goal is a mirror whose pinned RAM stays under
+10 GB. A new job, `wiki-mirror-maintain.timer`, runs `python -m wiki_mirror maintain` every 15 minutes: it resumes a
+collection Qdrant left paused, keeps the semantic collection's live settings equal to the constants in `embed.py`,
+and writes a record that `/v1/wiki/health` and `wiki-mirror status` show. Decided by the maintainer.
+
+**Context.** The first full embedding run finished on 2026-10-22 at 21:34 CDT: 41,590,915 passages from 7,245,149
+articles (exactly the keyword index's count), at 220 passages per second overall, with no over-stride or
+empty-passage warning. As the code then said ([D7](#d7)), the run switched HNSW on with the graph in RAM
+(`on_disk=False`) and the binary copy pinned (`always_ram=True`), and Qdrant built the graphs in the background, one
+segment at a time. At 02:12:18 on 2026-10-23 Qdrant was killed for exceeding its 20G cap (`MemoryMax=20G`), 4 h
+38 min into the build, with 25,855,559 of 41,590,915 passages indexed (62%, about 93,000 per minute). systemd
+restarted it 6 s later (`Restart=on-failure`), so keyword search was down for those seconds only. After the restart
+the semantic collection sat at status `grey`: optimizations pending and not started. Qdrant 1.12 does not restart
+pending optimizations after it restarts until an update operation arrives, and nothing noticed; `wiki-mirror status`
+did not show the semantic collection at all.
+
+Qdrant's memory at rest after the restart was 19.2 GB of anonymous (pinned) memory, with a peak of 20.1 GB while
+loading. Measured, the breakdown was:
+
+| Part | Size |
+|---|---|
+| HNSW graph links, with 62% built | 6.87 GB (about 250 B per passage, so about 10.4 GB when complete) |
+| Binary copy, pinned | 5.32 GB (128 B per passage) |
+| Keyword index at rest (measured 2026-10-18) | 4.3 GB |
+| Other per-point bookkeeping (ID maps, payload stores) | about 2.7 GB (the remainder; not measured directly) |
+
+With the graph completed in RAM the collection would have rested at about 22.7 GB, so 20G could never have held it.
+
+**Reasoning.** What "on disk" means here: Qdrant memory-maps the files, and the kernel's page cache keeps the
+recently used parts in spare RAM and reclaims them under pressure. A Qdrant that is heavy on page cache is not
+killed for it, because only anonymous memory can be. The container's memory graph shows the cache as used; it is
+lent, not owned, with one exception found afterwards: under cgroup v2 the cache of Qdrant's memory-mapped files is
+charged to Qdrant's cgroup, so `MemoryMax` is also its cache budget (below). With the graph and the binary copy on
+disk, the pinned memory at rest was expected to be about 7.0 GB for Qdrant. **Measured after the rebuild finished
+(2026-10-23, 13:10-13:20): 7.4-7.5 GB** (`RssAnon` 7.39 GB; 7.52 GB of anonymous memory in the cgroup), and 0.14 GB
+for the API. The whole container used 7.9 GB of its 34.4 GB (a 32 GiB container, in decimal GB), with 18.7 GB of page
+cache and 26.4 GB available. The goal of under 10 GB pinned is met.
+
+The rebuild is not free to start: in every Qdrant version up to 1.20 (`HnswConfig::mismatch_requires_rebuild` and
+the config-mismatch optimizer), changing where the graph or the quantized copy lives makes Qdrant rebuild every
+segment's graph in the background, although the files are identical (its own source comment says so). It
+costs background work, not embeddings: the keyword index keeps serving and nothing is embedded again. Changing
+`max_optimization_threads` does not rebuild. The change was applied on the box by hand at 07:22 on 2026-10-23 (a
+`PATCH` of the collection, with Qdrant's cap raised to 26G for the rebuild, temporarily, by `systemctl set-property
+--runtime`). Measured on the rebuild: 16 segments in the first hour at one thread, and memory fell from 19.4 GB to
+14.6 GB in the first 80 minutes. The threads were set to 2 by hand at about 08:45. The rebuild finished green at
+13:04, about 5 h 40 min after it started: 41,590,915 points indexed in 85 segments, with no Qdrant restart. It was
+limited by disk, not CPU: Qdrant used about 38% of one core.
+
+The maintenance job exists because the incident had two halves, and only one was memory. The other was that nothing
+resumed the paused collection and nothing showed it. The job resumes any `grey` collection with an empty optimizers
+update, reconciles the semantic collection's settings to the code, and leaves a record that health turns into
+`degraded` when the job stops, when Qdrant was restarted after a failure within 24 hours, or when its anonymous
+memory is above 90% of its cap. Reconciling to the code, not to a hand `PATCH`, makes the layout a reviewed change.
+A settings change that Qdrant would turn into a rebuild waits until the collection's embedding run is complete, the
+collection is not `red`, the build lock is free, the disk has its free floor, Qdrant holds no more than 90% of its
+memory cap and its restart count is readable and at most 1 ([OPERATIONS.md](OPERATIONS.md#the-maintenance-job)). A change that does not rebuild (the thread count)
+waits until the collection is `green` instead: any collection update makes Qdrant stop the optimizations in flight,
+which throws away the segment being rebuilt.
+
+The resume is guarded, because Qdrant's `grey` after a restart is deliberate: it keeps an optimization that just ran
+Qdrant out of memory from starting again by itself. A job that resumed every `grey` collection on every run would turn
+one such optimization into a kill every 15 minutes, and each kill takes keyword search down. The guard is stateless
+on purpose: it reads systemd's `NRestarts`, the count of Qdrant's automatic restarts after a failure since it was
+last started by hand. A record the job keeps of its own work can be lost, damaged, or left stale by a run killed after
+it sent its updates; the count cannot. A `grey` collection is resumed by itself only while the count is at most 1.
+At 2 or more, or when the count cannot be read, it is held: neither resumed nor given a settings update. It is held
+too when memory is above 90% of the cap or the disk is under its floor, and those two lift by themselves. The bound is
+at most two crashes after a start by hand: a first crash the job did not cause is resumed once, and a resume that
+kills Qdrant is held at the second crash. After a clean start the job gets one more retry.
+
+The cost is accepted: a second crash holds the collection even when the job did not cause it, and a box whose unit
+already shows `NRestarts` of 2 or more holds its `grey` collections until someone resumes them by hand or starts Qdrant
+by hand. A start by hand, `systemctl reset-failed` and a reboot reset the count and give the job its allowance again,
+on purpose: the operator has looked. The 90% is a judgment, the line health already uses, not a measurement
+([OPERATIONS.md](OPERATIONS.md#the-crash-loop-guard)).
+
+**Alternatives considered.**
+
+* **Keep everything in RAM.** About 22.7 GB at rest; it crashed at 20G, and the cap would have had to rise past what
+  a 32 GB box leaves for the API, a build and the page cache.
+* **Graph on disk, binary copy pinned.** About 12.3 GB pinned. It is Qdrant's usual low-memory setup, and it misses
+  the 10 GB goal. It remains the last resort if the latency below proves too slow (lever 6).
+* **Upgrade Qdrant first, for inline storage.** Not needed to reach the goal. Still worth doing later, for two years
+  of fixes, leaner ID maps and the inline option below.
+
+**Consequences.**
+
+* **Semantic search latency, measured 2026-10-23.** On the box, over loopback, with `limit` 10, `with_payload:
+  ["page_id"]` and real stored passages as query vectors. Qdrant's data is on ZFS on the NVMe pool, not on NFS.
+
+  | Case | Median | Worst |
+  |---|---|---|
+  | Right after the rebuild, 20 stored passages, first query each | 6.0 s | 37 s |
+  | Same 20, repeated (cached) | 45 ms | 158 ms |
+  | 5 random vectors, first time | 867 ms | 1.1 s |
+  | Same 5, repeated | 42 ms | 45 ms |
+  | Minutes later, 5 new stored passages, first time | 553 ms | 628 ms |
+  | 5 more, first time, rescoring with the full vectors off | 231 ms | 258 ms |
+
+  For the last 10 first-time queries Qdrant read 2,870 MB from disk, about **290 MB per query**: a search walks the
+  graph of every one of the 85 segments and reads small pieces of the graph, the binary copy and, when rescoring, the
+  float16 vectors. ZFS reads a whole record per access (128K by default; the dataset's `recordsize` was not checked),
+  so most of those bytes are amplification. For comparison, keyword search on the box takes 241 ms cold and 27 ms
+  cached. So cached semantic search is fast, a first-time search takes about half a second, and the first searches
+  after a restart or with a cold cache can take seconds to tens of seconds. Nothing searches the semantic collection
+  yet, so nothing is slower today; this decides what to do before hybrid search ships.
+* **The levers if that is too slow for hybrid search**, in the order they are worth trying; each is still to be
+  measured and none is done: (1) fewer, larger segments (about 85 down to 10-20), at the next rebuild: each search
+  walks every segment's graph, so the work per query falls about in proportion, with no extra RAM; (2) a smaller ZFS
+  `recordsize` for Qdrant's dataset (for example 16K), host-side, applying to files written after the change and so
+  to the next rebuild; (3) rescoring and oversampling: rescoring with the full vectors costs about half the time
+  here, and whether it can be lowered without losing recall is to be measured on the golden set; (4) pre-warm the
+  graph and binary files after Qdrant starts, so the first searches after a restart are not the slow ones; (5) a
+  newer Qdrant (1.16 or later) with `hnsw_config.inline_storage`, which stores each neighbour's quantized vector next
+  to the link so a graph step is one read (an estimate from its file format: about 150 GB more disk; it needs a
+  staged upgrade from 1.12); (6) the binary copy in RAM (`always_ram: true`), about 5.3 GB more pinned (about 12.8 GB),
+  which misses the 10 GB goal: the last resort.
+* **The code is the truth for the semantic settings.** `embed.SEMANTIC_HNSW`, `SEMANTIC_QUANTIZATION` and
+  `SEMANTIC_OPTIMIZATION_THREADS` are the layout. A setting changed by hand on the box is put back within 15 minutes.
+  To change the layout, change the constants; the job then applies the change, and for a graph or quantization
+  placement change Qdrant rebuilds every segment's graph (hours of background work, limited by disk). A new collection from `embed` is created
+  with the same constants, so a fresh embedding run starts on the same layout. This applies to **every box that runs
+  the code**: a changed layout constant starts a rebuild of the semantic collection on each box's next maintenance run
+  after the code update (hours of disk work, search unaffected). Unlike a change to `deploy/FORMAT`, nothing holds
+  such an update back; a hold like that is a possible follow-up.
+* **Qdrant's memory cap is 24G, and the page cache counts against it.** Under cgroup v2 the cache that Qdrant's
+  memory-mapped files bring in is charged to its cgroup, so `MemoryMax` is also its cache budget. Measured under a 26G
+  runtime cap: `memory.current` 27.91 GB, equal to the cap (anonymous 7.52 GB plus file 19.93 GB, of which 16.06 GB
+  mapped); `memory.events` showed `max` 13693 (the cgroup reached its cap and reclaimed cache that often), `oom` 0 and
+  `oom_kill` 0. Reclaiming cache is normal and never kills, but a smaller cap means a smaller cache and slower
+  semantic search. The 14G first planned would have left about 6.5 GB of cache, less than the graph (about 10.4 GB)
+  and the binary copy (about 5.3 GB) that a search walks. The cap's job is to stop a runaway Qdrant before the
+  container runs out of memory, not to limit cache. On a 32 GB box 24G is what is left after the other units' caps:
+  API 1.5G, build 5G, maintenance job 256M (the embedding run, 2G, never runs beside a build: they share the build
+  lock) and about 1.25 GB for the system, so even if everything peaks at once the container does not run out. A box
+  with less RAM lowers the cap by the difference; the cost is cache, so semantic search is slower. Qdrant's pinned
+  memory during a monthly build, when two keyword indexes exist side by side, is an estimate of 12 GB and the one
+  figure **still to be measured**. A box that set a cap at runtime keeps it until reboot; the unit's 24G applies after
+  the next `install.sh` run or reboot.
+* **Alerting stays pull-only.** Nothing pushes. A stopped job, a recent crash or a Qdrant near its cap shows as
+  `degraded` in `/v1/wiki/health` and as red lines in `wiki-mirror status`.
+* **Accepted:** the job's resume depends on a Qdrant behaviour that a newer version may fix, which makes the resume a
+  harmless no-op; the job does not start or retry embedding runs, and does not touch the keyword collection's
+  settings or any segment size.

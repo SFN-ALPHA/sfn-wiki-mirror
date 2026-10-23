@@ -77,7 +77,10 @@ CREDENTIALS = "carries credentials"
 #: What a blocker may say about any of them: scheme, host and path.
 SHOWN_PATH = "git.example.org/team/wiki-mirror.git"
 UPDATE_TIMER = "wiki-mirror-update.timer"
-ALWAYS_ENABLED = "wiki-mirror-qdrant.service wiki-mirror.service wiki-mirror-build.timer"
+ALWAYS_ENABLED = (
+    "wiki-mirror-qdrant.service wiki-mirror.service wiki-mirror-build.timer "
+    "wiki-mirror-maintain.timer"
+)
 #: Every state `systemctl is-enabled` can answer that is not `enabled`; several exit 0.
 NOT_ENABLED_STATES = ["disabled", "enabled-runtime", "static", "indirect", "alias", "masked",
                       "not-found"]  # fmt: skip
@@ -774,7 +777,8 @@ def test_install_units_by_default_enables_everything_but_the_update_timer(box: B
     started = [call for call in box.calls() if call.startswith("systemctl start ")]
     assert started == [f"systemctl start {unit}" for unit in ALWAYS_ENABLED.split()]
     assert (
-        "qdrant, the API and the monthly build timer enabled (no build started)" in result.stdout
+        "qdrant, the API and the monthly build and maintenance timers enabled (no build started)"
+        in result.stdout
     )
 
 
@@ -802,7 +806,8 @@ def test_install_units_with_auto_update_enables_and_starts_the_update_timer(box:
     assert _enable_call(box.calls()) == f"systemctl enable {ALWAYS_ENABLED} {UPDATE_TIMER}"
     assert f"systemctl start {UPDATE_TIMER}" in box.calls()
     assert (
-        "qdrant, the API and the monthly build timer and the nightly update timer enabled"
+        "qdrant, the API and the monthly build and maintenance timers and the nightly update "
+        "timer enabled"
         in result.stdout
     )
     assert "NOT enabled" not in result.stdout

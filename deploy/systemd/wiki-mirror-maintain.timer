@@ -1,0 +1,38 @@
+# Every 15 minutes: run wiki-mirror-maintain.service, the job that heals Qdrant and leaves the
+# record health reads.
+#
+# **Why 15 minutes.** A Qdrant that was restarted after a failure sits paused until the job
+# resumes it, so the interval is the longest a collection waits (`wiki-mirror status` says "within
+# 15 minutes"). It is also the unit of "stale": /v1/wiki/health calls the mirror `degraded` when
+# the record is more than 60 minutes old, which is four missed runs - the timer is off or the job
+# is failing. Cheap enough to run this often: a run takes seconds and reads a few kilobytes.
+#
+# OnBootSec gives Qdrant time to start and load its collections before the first look after a
+# reboot. OnUnitActiveSec counts from the start of the previous run, so a run that takes long
+# does not pile runs up. Persistent= does not apply to a monotonic timer; there is nothing to
+# catch up on, as each run looks at the present.
+#
+# AccuracySec and RandomizedDelaySec are small: one host, and the time of day does not matter,
+# only the interval.
+#
+# Install: install.sh enables it with the others (it only reads, resumes and applies the code's
+# own settings, so it is safe on every box). A box that follows main by itself
+# (wiki-mirror-update.timer) receives this file from update.sh but not the enabling; once:
+#          systemctl enable --now wiki-mirror-maintain.timer
+#          systemctl list-timers wiki-mirror-maintain
+#
+# See docs/DESIGN.md section 12.5 and docs/OPERATIONS.md ("The maintenance job").
+
+[Unit]
+Description=Wikipedia mirror maintenance, every 15 minutes
+Documentation=file:///opt/wiki-mirror/docs/OPERATIONS.md
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=30s
+RandomizedDelaySec=30s
+Unit=wiki-mirror-maintain.service
+
+[Install]
+WantedBy=timers.target

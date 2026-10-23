@@ -11,8 +11,9 @@
 #   wiki-mirror build-now               start a build now (hours; follow it with `wiki-mirror logs build`)
 #   wiki-mirror embed-now               start the semantic index's embedding run (about two days; follow it
 #                                 with `wiki-mirror logs embed`; resumes where it stopped)
-#   wiki-mirror logs [api|build|embed|qdrant]
-#                                 follow a unit's journal (default: api)
+#   wiki-mirror logs [api|build|embed|maintain|qdrant]
+#                                 follow a unit's journal (default: api); maintain is the
+#                                 15-minute job that heals and reports on Qdrant
 #   wiki-mirror update [--accept-format-change]
 #                                 fast-forward the checkout, reinstall, restart the API; the
 #                                 flag allows a commit that changes the built data's format
@@ -46,6 +47,8 @@ QDRANT_UNIT=wiki-mirror-qdrant.service
 BUILD_UNIT=wiki-mirror-build.service
 BUILD_TIMER=wiki-mirror-build.timer
 EMBED_UNIT=wiki-mirror-embed.service
+MAINTAIN_UNIT=wiki-mirror-maintain.service
+MAINTAIN_TIMER=wiki-mirror-maintain.timer
 UPDATE_TIMER=wiki-mirror-update.timer
 
 if [[ -t 1 ]]; then
@@ -81,6 +84,18 @@ api_call() {
 }
 
 py() { "$VENV/bin/python" -I "$@"; }
+
+# Shows the lines a Python snippet prints as "<level><TAB><text>" through good/warn/bad/dim, so
+# the snippets decide what is wrong while this script stays the one place that knows the colours.
+render() {
+    local level text
+    while IFS=$'\t' read -r level text; do
+        case "$level" in
+            good|warn|bad|dim) "$level" "$text" ;;
+            *) printf '  %s\n' "$text" ;;
+        esac
+    done
+}
 
 cmd_status() {
     require_root status
@@ -144,6 +159,111 @@ for label, value in rows:
     if value is not None:
         print("  %-18s %s" % (label, value))
 '
+        # Why the status is degraded, one line each (none otherwise).
+        printf '%s' "$health" | py -c '
+import json, sys
+
+for reason in json.load(sys.stdin).get("reasons") or []:
+    print("bad\t" + str(reason))
+' | render
+
+        head2 "Semantic index"
+        printf '%s' "$health" | py -c '
+import json, sys
+
+semantic = json.load(sys.stdin).get("semantic")
+
+
+def count(value):
+    return "{:,}".format(value) if isinstance(value, int) else "?"
+
+
+if not isinstance(semantic, dict):
+    print("dim\tno semantic index yet")
+else:
+    status = semantic.get("status")
+    optimizer = str(semantic.get("optimizer_status") or "ok")
+    points, indexed = count(semantic.get("points")), count(semantic.get("indexed_vectors"))
+    if optimizer != "ok":
+        # Qdrant reports its optimizer failure as the collection being red.
+        print("bad\toptimizer failed: " + optimizer.removeprefix("error: "))
+    elif status == "green":
+        print("good\tready (%s passages)" % points)
+    elif status == "yellow":
+        print("warn\tbuilding its search graph (%s of %s indexed)" % (indexed, points))
+    elif status == "grey":
+        print("bad\tpaused - the maintenance job resumes it within 15 minutes")
+    else:
+        print("warn\tcollection status %s" % status)
+    print("%s\tembedding run %s" % (
+        "good" if semantic.get("complete") else "dim",
+        "complete" if semantic.get("complete") else "not complete"))
+    print("dim\tcollection %s" % semantic.get("collection"))
+' | render
+
+        head2 "Maintenance"
+        printf '%s' "$health" | py -c '
+import json, sys
+from datetime import UTC, datetime
+
+# The job leaves this every 15 minutes; health calls it stale at 60 (api.MAINTENANCE_STALE_MINUTES).
+STALE_MINUTES = 60
+# Decimal gigabytes, as docs/SIZING.md counts them.
+GB = 10 ** 9
+record = json.load(sys.stdin).get("maintenance")
+
+
+def when(text):
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except (TypeError, ValueError):
+        return None
+
+
+if not isinstance(record, dict):
+    print("warn\tno maintenance record - enable the timer once: "
+          "systemctl enable --now wiki-mirror-maintain.timer")
+    raise SystemExit
+ran = when(record.get("ran_at"))
+if ran is None:
+    print("bad\tlast run: time unreadable (%s)" % record.get("ran_at"))
+else:
+    minutes = int((datetime.now(UTC) - ran).total_seconds() // 60)
+    stale = minutes > STALE_MINUTES
+    print("%s\tlast run %s (%d minutes ago)%s" % (
+        "bad" if stale else "good", record["ran_at"], minutes,
+        " - the timer or the job has stopped: wiki-mirror logs maintain" if stale else ""))
+unit = record.get("qdrant") or {}
+if unit.get("found") is None:
+    # systemd could not be asked at all: crashes and memory are not being watched.
+    print("bad\tthe Qdrant unit could not be read")
+elif not unit.get("found"):
+    print("bad\tthe Qdrant unit is not installed")
+else:
+    crash = unit.get("last_crash_at")
+    print("%s\tQdrant restarts after a failure: %s%s" % (
+        "warn" if crash else "good", unit.get("restarts"),
+        ", last at %s" % crash if crash else ""))
+    anon, cap = unit.get("anon_bytes"), unit.get("memory_max_bytes")
+    if anon is None:
+        print("dim\tQdrant memory unknown")
+    elif not cap:
+        print("good\tQdrant memory %.1f GB (no cap)" % (anon / GB))
+    else:
+        share = 100 * anon / cap
+        print("%s\tQdrant memory %.1f GB of %.1f GB (%d%%)" % (
+            "bad" if share > 90 else "good", anon / GB, cap / GB, round(share)))
+last = record.get("last_action")
+if isinstance(last, dict):
+    print("dim\tlast action %s on %s: %s" % (last.get("at"), last.get("collection"), last.get("detail")))
+else:
+    print("dim\tno action taken yet")
+for collection in record.get("collections") or []:
+    if collection.get("held"):
+        print("bad\t%s is held: %s" % (collection.get("name"), collection["held"]))
+for problem in record.get("problems") or []:
+    print("bad\t" + str(problem))
+' | render
     else
         bad "the API did not answer at $API_URL/v1/wiki/health"
         dim "wiki-mirror logs api"
@@ -154,6 +274,13 @@ for label, value in rows:
         good "$(printf '%-40s next %s' "$BUILD_TIMER" "$(systemctl show "$BUILD_TIMER" -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)")"
     else
         warn "$BUILD_TIMER is not enabled - no monthly build will run"
+    fi
+    if [[ "$(systemctl is-enabled "$MAINTAIN_TIMER" 2>/dev/null || true)" == enabled ]]; then
+        good "$(printf '%-40s next %s' "$MAINTAIN_TIMER" "$(systemctl show "$MAINTAIN_TIMER" -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)")"
+    else
+        # Unlike the update timer this one is meant to be on everywhere: it only reads, resumes
+        # and applies the code's own settings, and without it nobody notices a Qdrant that failed.
+        warn "$MAINTAIN_TIMER is not enabled - Qdrant is neither watched nor healed; enable it once: systemctl enable --now $MAINTAIN_TIMER"
     fi
     if [[ "$(systemctl is-enabled "$UPDATE_TIMER" 2>/dev/null || true)" == enabled ]]; then
         good "$(printf '%-40s next %s' "$UPDATE_TIMER" "$(systemctl show "$UPDATE_TIMER" -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)")"
@@ -169,7 +296,7 @@ for label, value in rows:
     head2 "Firewall (refused so far; service_refused should stay 0)"
     local counters
     counters="$(nft list counters 2>/dev/null \
-        | awk '/counter / {name = $2} /packets/ {printf "  %-16s %s packets\n", name, $2}' || true)"
+        | awk '/^[[:space:]]*counter / {name = $2} /^[[:space:]]*packets [0-9]+ bytes/ {printf "  %-16s %s packets\n", name, $2}' || true)"
     if [[ -n "$counters" ]]; then
         printf '%s\n' "$counters"
     else
@@ -221,13 +348,15 @@ cmd_logs() {
         api)    unit="$API_UNIT" ;;
         build)  unit="$BUILD_UNIT" ;;
         embed)  unit="$EMBED_UNIT" ;;
+        maintain) unit="$MAINTAIN_UNIT" ;;
         qdrant) unit="$QDRANT_UNIT" ;;
-        *) die "unknown log '$1' (api|build|embed|qdrant)" ;;
+        *) die "unknown log '$1' (api|build|embed|maintain|qdrant)" ;;
     esac
     shift || true
     # A finished oneshot has nothing to follow: show its recent history instead of waiting
-    # forever on a unit that will not run again until next month.
-    if [[ "$unit" == "$BUILD_UNIT" || "$unit" == "$EMBED_UNIT" ]] \
+    # forever on a unit that will not run again until next month (or, for the maintenance job,
+    # until the next quarter hour).
+    if [[ "$unit" == "$BUILD_UNIT" || "$unit" == "$EMBED_UNIT" || "$unit" == "$MAINTAIN_UNIT" ]] \
        && ! [[ "$(systemctl is-active "$unit" 2>/dev/null || true)" =~ ^(active|activating)$ ]]; then
         exec journalctl -u "$unit" -n 100 --no-pager "$@"
     fi

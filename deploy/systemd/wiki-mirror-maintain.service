@@ -1,0 +1,87 @@
+# The maintenance job: look at Qdrant, heal what can be healed, and leave a record for health.
+#
+# Started every 15 minutes by wiki-mirror-maintain.timer (and by hand: `systemctl start
+# wiki-mirror-maintain`). `python -m wiki_mirror maintain` asks Qdrant how each mirror collection
+# is, and reads systemd's view of wiki-mirror-qdrant.service (restarts after a failure, memory
+# against its cap). It then:
+#   * resumes a collection whose status is `grey` - Qdrant 1.12 does not restart pending
+#     optimizations after it is restarted (an OOM kill, 2026-10-23) until some update arrives, so
+#     the job sends the empty update that starts them;
+#   * keeps the semantic collection's storage and optimizer settings equal to what the code
+#     declares (a storage change makes Qdrant rebuild the graphs in the background);
+#   * writes <data_dir>/state/maintenance.json, which /v1/wiki/health and `wiki-mirror status`
+#     read. Health says `degraded` when the record is more than an hour old: four missed runs.
+# It never starts, retries or touches an embedding run, a build or an update.
+#
+# Runs as `wikimirror-sync`, the build user, because it needs to write the record where the other
+# jobs write their state, and the API user must not be able to write the data (CLAUDE.md,
+# constraint 6). It uses nothing but Qdrant on loopback (nftables already lets this user do so,
+# as the embed unit does) and the local state directory; it holds no credentials and needs no
+# network beyond loopback.
+#
+# **Safe to run unattended, on every box.** It only reads, resumes and applies the code's own
+# settings; every action is idempotent, so a run that is killed half way costs the next run a
+# repeat, nothing more.
+#
+# **It never takes the build lock.** A build or an embedding run holds it for hours or days, and
+# that is exactly when Qdrant is busiest and most likely to fall over; the job must still run
+# then. It touches no build or index state, only Qdrant's own settings and its own record.
+#
+# **Qdrant down is a result, not a failure.** `After=` orders it behind Qdrant at boot, but there
+# is no `Requires=`: with Qdrant stopped the job must still run, write a record that says so, and
+# let health report it. Exit 1 means the record could not be written; the next run is the retry,
+# so no Restart= here - the timer is the retry.
+#
+# systemd access: the job runs `systemctl show` (over D-Bus, so AF_UNIX stays in
+# RestrictAddressFamilies and /run stays readable) and reads /sys/fs/cgroup/.../memory.stat and
+# memory.max, which stay readable under ProtectControlGroups=true (that makes them read-only,
+# which is all it needs).
+#
+# 256 M: a Python process with the Qdrant client holds about 100 MB. TimeoutStartSec=5min is far
+# above a run (a few seconds); a hang is cut and the next quarter hour tries again.
+#
+# `-I` (isolated mode) for the same reason as the API unit.
+#
+# Install: install.sh copies it and enables wiki-mirror-maintain.timer. A box that updates itself
+# gets the unit from update.sh but not the timer: enable it once with
+# `systemctl enable --now wiki-mirror-maintain.timer`. See docs/DESIGN.md section 12.5 and
+# docs/OPERATIONS.md ("The maintenance job").
+
+[Unit]
+Description=Wikipedia mirror maintenance (heal Qdrant, record what was seen)
+Documentation=file:///opt/wiki-mirror/docs/OPERATIONS.md
+After=wiki-mirror-qdrant.service
+
+[Service]
+Type=oneshot
+User=wikimirror-sync
+Group=wikimirror
+WorkingDirectory=/var/lib/wiki-mirror
+ExecStart=/opt/wiki-mirror/.venv/bin/python -I -m wiki_mirror maintain
+# Group-readable output (the API user is in group wikimirror and reads the record), nothing for
+# anyone else.
+UMask=0027
+
+TimeoutStartSec=5min
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=256M
+
+# Hardening, as the embed unit's. One writable place: local data. It talks to Qdrant on
+# loopback and to systemd over its socket.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/wiki-mirror
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

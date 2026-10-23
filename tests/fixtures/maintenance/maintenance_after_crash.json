@@ -1,0 +1,51 @@
+{
+  "ran_at": "2026-10-23T12:30:04Z",
+  "qdrant": {
+    "found": true,
+    "active": true,
+    "restarts": 1,
+    "invocation_id": "eca45b0334914a06bc0c80efc9d8cb79",
+    "started_at": "2026-10-23T07:12:23Z",
+    "last_crash_at": "2026-10-23T07:12:23Z",
+    "anon_bytes": 16908554240,
+    "memory_max_bytes": 27917287424
+  },
+  "collections": [
+    {
+      "name": "wikipedia_lexical_20261001",
+      "alias": "wikipedia_lexical",
+      "status": "green",
+      "optimizer_status": "ok",
+      "points": 41590915,
+      "indexed_vectors": 41593444,
+      "segments": 43,
+      "held": null
+    },
+    {
+      "name": "wikipedia_semantic_20261001",
+      "alias": "wikipedia_semantic",
+      "status": "yellow",
+      "optimizer_status": "ok",
+      "points": 41590915,
+      "indexed_vectors": 25855559,
+      "segments": 85,
+      "held": null
+    }
+  ],
+  "actions": [
+    {
+      "at": "2026-10-23T12:30:04Z",
+      "collection": "wikipedia_semantic_20261001",
+      "action": "resumed",
+      "detail": "status was grey (optimizations pending after a Qdrant restart); resumed them"
+    }
+  ],
+  "last_action": {
+    "at": "2026-10-23T12:30:04Z",
+    "collection": "wikipedia_semantic_20261001",
+    "action": "resumed",
+    "detail": "status was grey (optimizations pending after a Qdrant restart); resumed them"
+  },
+  "problems": [],
+  "schema": 2
+}

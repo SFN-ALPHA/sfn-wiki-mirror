@@ -1,0 +1,18 @@
+table inet wiki_mirror {
+	counter in_refused {
+		comment "Inbound connections no rule admitted (not SSH or 8300 from the LAN)"
+		packets 165446 bytes 15929135
+	}
+	counter in_invalid {
+		comment "Inbound packets conntrack calls invalid"
+		packets 923 bytes 83381
+	}
+	counter out_refused {
+		comment "Outbound connections no rule admitted - a new egress need or a compromise"
+		packets 1 bytes 60
+	}
+	counter service_refused {
+		comment "wikimirror (API) or qdrant tried to open an outbound connection - always an event"
+		packets 4 bytes 242
+	}
+}

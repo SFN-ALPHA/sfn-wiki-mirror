@@ -995,10 +995,19 @@ def test_run_embed_creates_the_collection_for_dense_search_with_hnsw_off(
     assert vectors.datatype == models.Datatype.FLOAT16
     assert vectors.on_disk is True
     assert made["hnsw_config"].m == 0
-    assert made["quantization_config"].binary.always_ram is True
+    assert made["quantization_config"] == embed.SEMANTIC_QUANTIZATION
     assert made["optimizers_config"].max_segment_size == embed._MAX_SEGMENT_KB
-    assert made["optimizers_config"].max_optimization_threads == 1
+    assert made["optimizers_config"].max_optimization_threads == embed.SEMANTIC_OPTIMIZATION_THREADS
     assert made["on_disk_payload"] is True
+
+
+def test_semantic_settings_keep_everything_on_disk_and_use_two_optimizer_threads() -> None:
+    # The operator's decision of 2026-10-23 (docs/DECISIONS.md D8), spelled out so that a change
+    # to the layout has to change this test on purpose: the maintenance job reads these values.
+    assert (embed.SEMANTIC_HNSW.m, embed.SEMANTIC_HNSW.ef_construct) == (16, 100)
+    assert embed.SEMANTIC_HNSW.on_disk is True
+    assert embed.SEMANTIC_QUANTIZATION.binary.always_ram is False
+    assert embed.SEMANTIC_OPTIMIZATION_THREADS == 2
 
 
 def test_run_embed_completion_switches_hnsw_on_after_the_last_upsert(
@@ -1016,7 +1025,7 @@ def test_run_embed_completion_switches_hnsw_on_after_the_last_upsert(
         events.append("hnsw")
         assert kwargs["collection_name"] == _COLLECTION
         hnsw = kwargs["hnsw_config"]
-        assert (hnsw.m, hnsw.ef_construct, hnsw.on_disk) == (16, 100, False)
+        assert (hnsw.m, hnsw.ef_construct, hnsw.on_disk) == (16, 100, True)
         return real_update(**kwargs)
 
     monkeypatch.setattr(client, "upsert", upsert)
@@ -1067,6 +1076,74 @@ def test_run_embed_state_records_what_the_vectors_are_made_of(tmp_path: Path) ->
     assert (state["model"], state["dimensions"]) == ("bge-m3", DIMS)
     assert state["text_form"] == TEXT_FORM
     assert KEY not in json.dumps(state)
+
+
+# -- whether a collection's load has finished ---------------------------------------------------
+
+
+def test_semantic_index_complete_after_a_finished_run_is_true(tmp_path: Path) -> None:
+    _run(_config(tmp_path), memory_client(), FakeSource(_articles(3)), _Embedder())
+    assert embed.semantic_index_complete(tmp_path / "data", _COLLECTION) is True
+
+
+def test_semantic_index_complete_while_a_run_is_still_loading_is_false(tmp_path: Path) -> None:
+    config = _config(tmp_path, embedding_concurrency=1)
+    with pytest.raises(EmbedError, match="went away"):
+        _run(
+            config,
+            memory_client(),
+            FakeSource(_articles()),
+            _FailsAt(5),
+            window_articles=1,
+            windows_queued=2,
+        )
+    assert _state(tmp_path)["complete"] is False
+    assert embed.semantic_index_complete(tmp_path / "data", _COLLECTION) is False
+
+
+def test_semantic_index_complete_without_a_state_file_is_false(tmp_path: Path) -> None:
+    assert embed.semantic_index_complete(tmp_path / "data", _COLLECTION) is False
+
+
+def test_semantic_index_complete_with_an_unreadable_state_is_false_and_says_so(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _state_file(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json", encoding="utf-8")
+    with caplog.at_level(logging.WARNING):
+        assert embed.semantic_index_complete(tmp_path / "data", _COLLECTION) is False
+    assert "unreadable" in caplog.text
+
+
+def test_semantic_index_complete_quiet_with_an_unreadable_state_is_false_and_logs_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _state_file(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG):
+        assert embed.semantic_index_complete(tmp_path / "data", _COLLECTION, quiet=True) is False
+    assert caplog.text == ""
+
+
+def test_semantic_index_complete_with_another_snapshots_state_is_false(tmp_path: Path) -> None:
+    _run(_config(tmp_path), memory_client(), FakeSource(_articles(3)), _Embedder())
+    # The file of the 20261001 collection says it is complete, but it describes another born.
+    state = _state(tmp_path)
+    state["born"] = "20260901"
+    _state_file(tmp_path).write_text(json.dumps(state), encoding="utf-8")
+    assert embed.semantic_index_complete(tmp_path / "data", _COLLECTION) is False
+
+
+@pytest.mark.parametrize(
+    "name", ["wikipedia_lexical_20261001", "wikipedia_semantic_", "wikipedia_semantic_../x"]
+)
+def test_semantic_index_complete_for_a_name_this_stage_does_not_create_is_false(
+    tmp_path: Path, name: str
+) -> None:
+    _run(_config(tmp_path), memory_client(), FakeSource(_articles(3)), _Embedder())
+    assert embed.semantic_index_complete(tmp_path / "data", name) is False
 
 
 def test_run_embed_a_complete_state_is_a_no_op(

@@ -31,8 +31,8 @@ The reference deployment, with the example addresses above:
 | Snapshots | NFS dataset `192.168.1.40:/mnt/tank/wikipedia-mirror` (a NAS), mounted on the Proxmox host and bind-mounted at `/mnt/wikipedia` |
 | Python | 3.13, built from source by the installer (Debian 12 ships 3.11) |
 | Users | `wikimirror` (API), `wikimirror-sync` (download, parse, index), `qdrant`, `root` |
-| Services | `wiki-mirror-qdrant`, `wiki-mirror` (API), `wiki-mirror-build` (oneshot) |
-| Timers | `wiki-mirror-build.timer` (monthly), `wiki-mirror-update.timer` (nightly; opt-in, see [The nightly update](#the-nightly-update)) |
+| Services | `wiki-mirror-qdrant`, `wiki-mirror` (API), `wiki-mirror-build` (oneshot), `wiki-mirror-maintain` (oneshot) |
+| Timers | `wiki-mirror-build.timer` (monthly), `wiki-mirror-maintain.timer` (every 15 minutes, see [The maintenance job](#the-maintenance-job)), `wiki-mirror-update.timer` (nightly; opt-in, see [The nightly update](#the-nightly-update)) |
 
 ### Memory and disk guidance
 
@@ -40,13 +40,18 @@ Memory, with the box at 32 GB:
 
 | Process | Cap | Notes |
 |---|---|---|
-| Qdrant | `MemoryMax=20G` | The first full keyword build peaked at 5.1 GB of anonymous memory during segment merges and rests at 4.3 GB. The semantic index (W2) adds about 5.3 GB of binary vectors and the HNSW graphs in RAM, so the cap is 20G and the container needs 32 GB ([the first embedding run](#the-semantic-index-w2-the-first-embedding-run)). |
-| API | `MemoryMax=1500M` | |
+| Qdrant | `MemoryMax=24G` | The first full keyword build peaked at 5.1 GB of anonymous memory during segment merges and rests at 4.3 GB. The semantic index (W2) keeps its float16 vectors, its HNSW graph and its binary-quantized copy on disk ([D8](DECISIONS.md#d8)); measured after the rebuild, Qdrant's pinned memory rests at 7.4-7.5 GB. The cap is 24G, not that number plus headroom, because under cgroup v2 the page cache of Qdrant's memory-mapped files is charged to its cgroup: a smaller cap means a smaller cache and slower semantic search. On a 32 GB box 24G is what the other units' caps leave (API 1.5G, build 5G, maintenance job 256M, about 1.25 GB for the system); a box with less RAM lowers it by the difference. The pinned peak during a monthly build, when two keyword indexes exist side by side, is an estimate (12 GB) and **still to be measured**. The earlier 20G was sized for the index held in RAM, which needed about 22.7 GB at rest and was killed at 20G on 2026-10-23. A box that set a cap at runtime with `systemctl set-property --runtime` keeps it until reboot; the unit's 24G applies after the next `install.sh` run or reboot. |
+| API | `MemoryMax=1500M` | About 0.2 GB at rest. |
 | Build | `MemoryMax=5G` | `Nice=10`, idle I/O priority: a build never makes search slow. |
 | Embed | `MemoryMax=2G` | Same priorities; holds only a few windows of vectors. |
+| Maintenance job | `MemoryMax=256M` | A Python process with the Qdrant client holds about 100 MB, and runs for seconds. |
 
-`systemctl status` shows a `Memory:` line that includes reclaimable page cache. To judge Qdrant, read anonymous
-memory instead:
+`systemctl status` shows a `Memory:` line that includes reclaimable page cache. A Qdrant with its semantic index
+on disk shows a large figure there on purpose: Qdrant memory-maps those files and the kernel keeps the parts in
+use in spare RAM, gives them back under pressure, and a process is never OOM-killed for page cache. The cache is
+lent, not owned, so the container's memory graph will read high after a semantic search and that is not a
+problem. To judge Qdrant, read anonymous memory instead (`wiki-mirror status` prints it in its Maintenance
+section, against the cap):
 
 ```bash
 # grep '^anon ' /sys/fs/cgroup/system.slice/wiki-mirror-qdrant.service/memory.stat
@@ -329,17 +334,18 @@ $ curl -s -o /dev/null -w '%{http_code}\n' http://<mirror-host>:8300/v1/wiki/hea
 
 | Command | What it does |
 |---|---|
-| `wiki-mirror status` | Services, the mirror's health, the build unit, both timers, the checkout's commit, the firewall counters. Exits non-zero if the API does not answer. |
+| `wiki-mirror status` | Services, the mirror's health and, when it is `degraded`, each reason as a red line; the semantic index; the maintenance job's last run, Qdrant's restarts and memory, and any collection the job holds; the build unit, the three timers, the checkout's commit, the firewall counters. Exits non-zero if the API does not answer. |
 | `wiki-mirror build-now` | Starts the build unit in the background and returns. Resets the retry limit. Refuses if a build is running. |
 | `wiki-mirror embed-now` | Starts the semantic index's embedding run ([below](#the-semantic-index-w2-the-first-embedding-run)), or resumes an interrupted one, in the background and returns. Resets the retry limit. Refuses if a run is going. |
-| `wiki-mirror logs [api\|build\|embed\|qdrant]` | Follows a unit's journal (default `api`). For an idle build or embed unit it prints the last 100 lines instead. |
+| `wiki-mirror logs [api\|build\|embed\|maintain\|qdrant]` | Follows a unit's journal (default `api`). For an idle build, embed or maintenance unit it prints the last 100 lines instead. |
 | `wiki-mirror update [--accept-format-change]` | The update ([below](#the-nightly-update)). |
 | `wiki-mirror search "<query>" [limit]` | A real query through the real API, default 5 results. |
 | `wiki-mirror key add <name>` / `list` / `revoke <name>` | Agent keys ([API.md](API.md#client-keys)). |
 
-The Python entry point behind it is `python -m wiki_mirror <download|parse|index|build|embed|serve|status|key>`.
+The Python entry point behind it is `python -m wiki_mirror <download|parse|index|build|embed|maintain|serve|status|key>`.
 `download`, `parse` and `index` run one stage by hand, for resuming one that failed. Exit codes: 0 success, 1 a
-stage failed, 2 a configuration or usage error (systemd does not retry 2).
+stage failed, 2 a configuration or usage error (systemd does not retry 2). `maintain` is the maintenance job,
+which the timer runs ([The maintenance job](#the-maintenance-job)).
 
 Settings are in `/etc/wiki-mirror/mirror.yaml` (every key commented at its default; an unknown key
 fails the start). The primary key is never in it: the loader refuses an `api_key` there.
@@ -347,8 +353,13 @@ fails the start). The primary key is never in it: the loader refuses an `api_key
 ### What healthy looks like
 
 `wiki-mirror status` should read: both services `active`; the build unit `idle, last run ok`; mirror `status ok` with
-a snapshot date (`empty` before the first build, `building` during one, `degraded` if something is wrong); both
-timers enabled; a `last update` row whose outcome is `updated` or `current`; and **`service_refused` at 0**.
+a snapshot date (`empty` before the first build, `building` during one, `degraded` if something is wrong, with each
+reason on a red line under the table); a **Semantic index** section that reads `ready` (or `building its search
+graph (N of M indexed)` while Qdrant works on it, which is normal after an embedding run) and never `paused` or
+`optimizer failed`; a **Maintenance** section whose last run is under 15 minutes old (an hour is the limit), with Qdrant's
+restarts after a failure at 0 or long ago, its memory well under its cap, and no problem lines; all three
+timers enabled (the update timer only if you chose it); a `last update` row whose outcome is `updated` or
+`current`; and **`service_refused` at 0**.
 Anything above 0 there means the API or Qdrant user tried to open an outbound connection, which neither ever
 should: read the kernel log on the Proxmox host (`journalctl -k | grep wiki-mirror`).
 
@@ -511,11 +522,14 @@ LiteLLM and the like), and hosted embedding services.
    the measured cluster defaults (16 requests in flight, 8 texts per request; lower the first for one Ollama node);
    `embedding_headers` can carry a background-priority header such as `X-Priority: 3` if the server has
    one. Without `embedding_url` the command exits 2.
-4. **Give the container 32 GB of RAM** (`pct set <ctid> -memory 32768` on the host, live for an LXC) and **restart
-   Qdrant to take its new cap** (`MemoryMax` is now 20G; `wiki-mirror update` installs the unit, then
-   `systemctl restart wiki-mirror-qdrant`). The binary vectors (about 5.3 GB) and the HNSW graphs live in RAM next to
-   the keyword index's 4.3 GB. Disk needs about 95 GB more than today; the run refuses to create the collection below
-   `min_free_disk_gb`.
+4. **Give the container 32 GB of RAM** (`pct set <ctid> -memory 32768` on the host, live for an LXC; 8 GB is the
+   minimum for the keyword index alone). The semantic index keeps its vectors, its HNSW graph and its binary-quantized
+   copy on disk ([D8](DECISIONS.md#d8)), so beside the keyword index's 4.3 GB Qdrant pins only about 2.7 GB of
+   per-point bookkeeping (7.4-7.5 GB at rest, measured after the first rebuild); the files in use are
+   cached in the RAM that is left, which is why 32 GB is still the size to give. Disk needs about 100 GB more than
+   today (the float16 vectors about 85 GB, the binary copy 5.3 GB, the graph about 10 GB, plus payload); the run refuses to create the collection below `min_free_disk_gb`.
+   Qdrant's cap in the unit (`MemoryMax`) is 24G, which on a 32 GB box leaves the other units their caps and Qdrant
+   its cache ([the memory table](#memory-and-disk-guidance)); `wiki-mirror update` installs the unit as it is.
 
 Then:
 
@@ -530,9 +544,14 @@ What it reads and writes:
   build cut.
 * **It writes** the collection `wikipedia_semantic_<born>` and its state file `state/index_semantic_<born>.json`
   (`<born>` is the date tag of that store's snapshot). When every passage is in, it switches HNSW on and moves the
-  alias `wikipedia_semantic` to the collection. Qdrant then builds the graphs in the background, one segment at a
-  time, which takes longer than the run. Watch `curl -s localhost:6333/collections/wikipedia_semantic` until its
-  `status` is `green`. Search does not use the collection yet.
+  alias `wikipedia_semantic` to the collection, with the graph and the binary copy on disk. Qdrant then builds the
+  graphs in the background, on disk, `SEMANTIC_OPTIMIZATION_THREADS` (2) segments at a time, which takes hours
+  after the run: on the maintainer's box about 4 h 38 min had built 62% of the graph before the 2026-10-23 incident
+  ([D8](DECISIONS.md#d8)), at about 93,000 passages a minute. Watch it in `wiki-mirror status` (Semantic index:
+  `building its search graph (N of M indexed)` until `ready`), or `curl -s localhost:6333/collections/wikipedia_semantic`
+  until its `status` is `green`. The build is Qdrant's own and survives a restart only with help: a restart in the
+  middle leaves the collection `grey` (paused) and the maintenance job resumes it within 15 minutes ([The
+  maintenance job](#the-maintenance-job)). Search does not use the collection yet.
 * **It holds the build lock for the whole run**, so the monthly build waits (exits 1, "a build is already running")
   until the embedding is done, and `wiki-mirror update` defers the same way.
 * **A failure does not turn health `degraded`:** the embed stage never writes the build state.
@@ -591,6 +610,177 @@ http://127.0.0.1:6333/collections/wikipedia_semantic_<born>`) and its state file
   [ROADMAP.md](ROADMAP.md)). Until then, run `embed-now` only when you want that cost, and delete the superseded
   semantic collection and its state file by hand when you no longer need it.
 * **No hybrid search.** The collection is built and the alias points at it, but no query reads it.
+* **Semantic search latency depends on the page cache.** Measured after the rebuild (over loopback, `limit` 10): about
+  45 ms once cached, about half a second the first time a query touches the files, and seconds to tens of seconds
+  right after a restart or with a cold cache. A first-time query reads about 290 MB from disk. The levers if that is
+  too slow for hybrid search, none done yet, are listed in [D8](DECISIONS.md#d8).
+
+## The maintenance job
+
+`wiki-mirror-maintain.timer` runs `python -m wiki_mirror maintain` (through the oneshot
+`wiki-mirror-maintain.service`) 5 minutes after boot and then every 15 minutes, as `wikimirror-sync`. It exists
+because of the incident of 2026-10-23, when Qdrant was killed for memory, systemd restarted it six seconds later, and
+the semantic collection then sat paused with nobody told ([D8](DECISIONS.md#d8)). The service has `MemoryMax=256M`,
+no `Restart=` (the timer is the retry), and is ordered after Qdrant but does not require it, so a run still happens
+and records the fact when Qdrant is down. It is safe on every box and takes seconds.
+
+### What each run does
+
+1. Reads Qdrant's systemd unit (`systemctl show`: whether it is installed and running, how
+   many times systemd restarted it after a failure, when the running process started) and its memory (`anon` in the
+   unit's `memory.stat`, and `memory.max`, its cap).
+2. Lists the mirror's collections in Qdrant (`wikipedia_lexical_*`, `wikipedia_semantic_*`).
+3. **Resumes** a collection whose status is `grey`, unless it is held ([below](#the-crash-loop-guard)). Qdrant 1.12
+   does not restart pending optimizations after it restarts until some update operation arrives; the job sends the
+   empty update that starts them (`PATCH /collections/<name>` with `{"optimizers_config": {}}`).
+4. **Reconciles** the semantic collection behind the `wikipedia_semantic` alias with the code: the graph's `m`,
+   `ef_construct` and `on_disk`, the binary copy's `always_ram`, and the optimizer thread count must equal the
+   constants `SEMANTIC_HNSW`, `SEMANTIC_QUANTIZATION` and `SEMANTIC_OPTIMIZATION_THREADS` in
+   `src/wiki_mirror/embed.py`. Only the parts that differ are sent, in one update.
+5. Writes the record, `state/maintenance.json`, which `/v1/wiki/health` and `wiki-mirror status` show
+   ([API.md](API.md#get-v1wikihealth)).
+
+It never starts or retries an embedding run, a build or an update, and it leaves the keyword collection's settings
+and all segment sizes alone. Nothing pushes a notification; health and `wiki-mirror status` are where a problem shows.
+
+On a box whose semantic collection already has the settings the code names (the maintainer's, whose placement was
+changed by hand on 2026-10-23), the first run finds them equal and does nothing.
+
+### The crash-loop guard
+
+Qdrant leaves a collection `grey` after a restart on purpose, so that an optimization that just ran it out of memory
+does not start again by itself and kill it again. Resuming every `grey` collection on every run would turn one such
+optimization into a kill every 15 minutes, and every kill takes keyword search down. So the job resumes carefully.
+
+The guard keeps no state of its own. It reads systemd's `NRestarts`: the number of times systemd restarted Qdrant
+after a failure since Qdrant was last started by hand. That number survives everything that can happen to the job (a
+lost or damaged record, a run killed by its timeout, an update that timed out but was applied), which a record the job
+keeps of its own work would not.
+
+A `grey` collection is resumed by itself only while `NRestarts` is **at most 1**. Otherwise it is **held**: neither
+resumed nor given a settings update. Its `held` field says why, a problem sentence says it too, and health turns
+`degraded`. The reasons, checked in this order:
+
+1. The restart count cannot be read: Qdrant's unit could not be read, it is not installed, or systemd gave no count.
+   `held` ends with the command to resume by hand. The hold lifts when the count can be read.
+2. The count is 2 or more. `held` ends with the command to resume by hand. Fix the cause (the memory cap, the disk),
+   then resume it with that command, which `wiki-mirror status` shows, or start Qdrant by hand, which resets the
+   count.
+3. Qdrant's anonymous memory is above 90% of its cap. The 90% is a judgment, the same line health uses for "close to
+   being killed", not a measured value.
+4. Free disk is under `min_free_disk_gb`, or the disk could not be checked.
+
+Holds 3 and 4 are checked on every run and lift by themselves when the condition clears.
+
+The bound: at most two crashes follow a start by hand before the job stops. A first crash the job did not cause is
+resumed once; if that resume kills Qdrant, the count is 2 and the collection is held. After a clean start (a reboot, a
+start by hand: count 0), a resume that kills Qdrant is retried once more, then held.
+
+A start by hand, `systemctl reset-failed` and a reboot reset the count and give the job its allowance again. That is
+deliberate: the operator has looked. The accepted cost is that a second crash holds the collection even when the job
+did not cause it; two crashes since the last start by hand are worth a person's look. A box whose Qdrant unit already
+shows `NRestarts` of 2 or more (check with `systemctl show wiki-mirror-qdrant -p NRestarts`) holds its `grey`
+collections until someone resumes them by hand or starts Qdrant by hand.
+
+A run in which Qdrant does not answer records `collections: []`, and a collection Qdrant will not describe (other than
+"it is gone") appears only as a problem. Nothing is carried over from the previous record.
+
+### When a settings change waits
+
+A change to where the graph or the binary copy lives makes Qdrant rebuild every segment's graph in the background:
+hours of background work on 41.6M passages, mostly disk reads and writes, with the keyword index still serving and no
+embeddings redone (a change of the thread count alone does not rebuild). So the job applies a settings change only
+when all of these hold, and otherwise leaves it and says why in the record, trying again 15 minutes later:
+
+* the collection's embedding run is complete (the embed stage keeps HNSW off while it loads, on purpose);
+* the collection is not `red` (a settings change would hide why it failed);
+* no build or embedding run holds the build lock. The job only probes the lock and never holds it: a build starting
+  while the job held it would exit 1 and wait an hour for its retry;
+* for a change that rebuilds (the graph's `m`, `ef_construct` or `on_disk`, or the quantization): the restart count
+  can be read and is at most 1 (the first two reasons for a hold, above), Qdrant holds no more than 90% of its memory
+  cap, and free disk is at least `min_free_disk_gb`, because a rebuild rewrites segments.
+
+A change that does not rebuild (only the optimizer thread count) waits until the collection is `green`, because any
+collection update makes Qdrant stop the optimizations in flight, which would throw away the segment being rebuilt. A
+`grey` collection has nothing in flight and is changed at once, unless it is held (a held collection gets no settings
+update). Where the collection is not `grey`, the change cannot cause an out-of-memory kill, so it ignores the restart
+count. If a settings update on a `grey` collection fails, the plain
+resume follows in the same run.
+
+### The problem sentences
+
+A run with problems still exits 0 and writes its record. Each problem is one line in `wiki-mirror status`
+(Maintenance section) and in the journal (`wiki-mirror logs maintain`); health shows the record as `maintenance`.
+
+| Problem | What it means and what to do |
+|---|---|
+| `Qdrant did not answer: <ErrorType>` | The job could not list the collections. `systemctl status wiki-mirror-qdrant` and `wiki-mirror logs qdrant`. If Qdrant is still loading after a restart, it clears by itself on a later run. |
+| `could not read Qdrant's unit: <why>` | `systemctl` is missing, slow or failing, or its reply had no `LoadState`. The rest of the record is still written, crashes and memory are not watched, and health is `degraded`. A `grey` collection is held until the unit can be read, because the restart count is unknown. |
+| `Qdrant's unit wiki-mirror-qdrant.service is not installed` | The unit file is missing. Run `/opt/wiki-mirror/deploy/install.sh`. Health is `degraded` (`Qdrant's unit is not installed, so the maintenance job does not watch crashes and memory`), and a `grey` collection is held. |
+| `Qdrant's unit is not running (ActiveState=<state>)` | Qdrant is stopped or failed. `systemctl start wiki-mirror-qdrant`, then `wiki-mirror logs qdrant` for why it stopped. |
+| `could not read Qdrant's memory: <why>` | The cgroup files could not be read (`memory.stat`, `memory.max`, or the unit's cgroup path). Health cannot judge the memory share until this clears. |
+| `<name>: Qdrant would not describe it (<ErrorType>)` | The collection was listed but could not be read. The collection is left out of the record's `collections`; this sentence is all the record says about it. Look at `wiki-mirror logs qdrant`. |
+| `<name> is held: <unreadable>, so a crash loop cannot be ruled out; it is not resumed by itself until the count can be read` | The first reason of [the crash-loop guard](#the-crash-loop-guard). `<unreadable>` is `Qdrant's unit could not be read`, `Qdrant's unit wiki-mirror-qdrant.service is not installed` or `systemd did not report Qdrant's restart count`. Clears on the first run that can read the count. If Qdrant is healthy, `held` ends with the command to resume by hand. |
+| `<name> is held: Qdrant has restarted itself after a failure <N> times since it was last started by hand (the last at <time>); resuming it may be what kills Qdrant again, so it is not resumed by itself` | The count is 2 or more. Find why Qdrant died (`wiki-mirror logs qdrant`; the memory cap and the disk are the usual causes), fix it, then resume by hand with the command at the end of the `held` text (`wiki-mirror status` shows it), or start Qdrant by hand, which resets the count. |
+| `<name> is held: Qdrant holds <N>% of its memory cap; resuming would risk another out-of-memory kill` | Clears by itself when memory falls to 90% or less. If it persists, the cap is too small for the collection's layout. |
+| `<name> is held: <disk sentence>` | Free disk is under `min_free_disk_gb`, or `the free disk space could not be checked (<ErrorType>)`. Free space; it clears by itself. |
+| `<name> is still paused after a resume at <time>` | The collection was `grey`, the job resumed it, and it is `grey` again. The resume did not take: check `wiki-mirror logs qdrant` and `curl -s localhost:6333/collections/<name>` for `optimizer_status`. If Qdrant itself needs a restart, `systemctl restart wiki-mirror-qdrant`; the next run resumes the collection again. |
+| `<name>: optimizer failed: <text>` (or `status is red, and Qdrant gave no optimizer error`) | Qdrant's optimizer stopped with an error. The job does not touch a red collection's settings. Read the text and `wiki-mirror logs qdrant` (a full disk and an out-of-memory kill are the usual causes); fix the cause, then a restart of Qdrant, and the job resumes it. |
+| `<name>: settings not changed yet: <why>; they differ from the code's: <changes>` | A settings change is waiting (previous section); `<why>` says for what: the embedding run is not finished, the collection is red, the build lock is held, free disk is under the floor, `Qdrant holds <N>% of its memory cap and a rebuild would risk an out-of-memory kill`, the restart count cannot be read (`<unreadable>, so a crash loop cannot be ruled out`), `Qdrant has restarted itself after a failure <N> times since it was last started by hand, and a rebuild may be what kills it; it is tried again after a person has looked and started Qdrant by hand`, or `it waits for green (it is <status>): any collection update stops the optimizations in flight, which would throw away the segment being rebuilt`. Nothing to do unless it persists with a run that has finished: then the reason is the one to fix. |
+| `<name>: could not resume: <ErrorType>` / `<name>: could not apply settings: <ErrorType>` | Qdrant refused the update or did not answer it. The update is repeated 15 minutes later; if it keeps failing, `wiki-mirror logs qdrant`. |
+
+### Exit codes
+
+0: the record was written, whether or not it holds problems. 1: the record could not be written (the state
+directory is full or not writable) or the run raised; systemd shows the unit failed and the next run is the retry.
+The job checks that it can write the record before it sends anything to Qdrant, because a run that cannot report must
+not act: a run that exits 1 for this reason has changed nothing. The record is flushed to disk before it replaces the
+old one.
+2: a configuration error (the next run, 15 minutes later, hits it again until it is fixed).
+
+### Following it
+
+```bash
+# wiki-mirror logs maintain           # the journal of the job: one line per run, one per action and problem
+# systemctl start wiki-mirror-maintain  # a run now, instead of waiting for the timer
+# systemctl list-timers wiki-mirror-maintain
+```
+
+`wiki-mirror status` shows the last run and its age, Qdrant's restarts after a failure and the latest, its memory
+against its cap, the last action and each problem. It adds `the Qdrant unit could not be read` (in red, distinct from
+`the Qdrant unit is not installed`) and `<name> is held: <reason>` (in red).
+`/v1/wiki/health` turns `degraded` when the record is more than 60 minutes old (four missed runs: the timer is off or
+the job is failing), when Qdrant was restarted after a failure within the last 24 hours, when Qdrant's anonymous
+memory is above 90% of its cap, when a collection is held, and when the job could not read Qdrant's unit or
+found it not installed ([API.md](API.md#get-v1wikihealth)). Health's "restarted after a failure within 24 hours" has two
+blind spots: `systemctl reset-failed`, and a restart by hand during systemd's wait before an automatic restart. The
+crash-loop guard does not depend on it.
+
+### Enabling it
+
+`install.sh` installs both units and enables the timer on every box. A box that updates itself
+(`wiki-mirror-update.timer`) receives the units from `update.sh` but not the enabling, so once:
+
+```bash
+# systemctl enable --now wiki-mirror-maintain.timer
+```
+
+Until then `wiki-mirror status` warns "no maintenance record - enable the timer once", and health has
+`maintenance: null` without being `degraded` for it.
+
+### Changing the layout
+
+The code is the truth for the semantic collection's settings. A setting changed by hand (a `PATCH` on the
+collection) is put back within 15 minutes. To change the layout, change the constants in `embed.py` and ship the
+change: the job applies it to the live collection once it may (above), and a collection `embed` creates later starts
+with the same constants. Remember what it costs: a change to the graph or to where the binary copy lives is a
+rebuild of every segment's graph in Qdrant, hours of CPU on this index. A decision of this size gets a row in
+[DECISIONS.md](DECISIONS.md).
+
+A changed layout constant is a rebuild of the semantic collection on **every box that runs that code**, started by
+that box's next maintenance run after the code update: hours of disk work, with search unaffected. Unlike a change to
+`deploy/FORMAT`, nothing holds such an update back. The waits above are the only brake: the embedding run finished, the
+collection not `red`, the build lock free, the disk floor, and Qdrant under 90% of its memory cap.
 
 ## The monthly build
 
@@ -738,7 +928,12 @@ connection into a hang for the whole connect timeout. Input stays a drop.
 | Mirror `degraded`, `wiki-mirror logs api` says the snapshot "is N days old, past the 40-day limit" | The monthly build did not land | `wiki-mirror status` (Schedule, build unit), `systemctl list-timers`; `wiki-mirror build-now`. |
 | Mirror `degraded`, `wiki-mirror logs api` says the collection "was indexed with chunker ... but this code cuts with ..." | The code that cuts passages changed since the served index was built | Rebuild the index. The next monthly snapshot is cut by the running code and replaces the old index; to fix it sooner, delete the served `wikipedia_lexical_<born>` collection by hand (search is down until `wiki-mirror build-now` finishes). |
 | Build stops "no space left on device" | `/` full: two stores or two collections side by side (about 100 GB peak) | `df -h /`; `du -sh /var/lib/wiki-mirror/*`. A finished build deletes stores and index states older than the serving and rollback snapshots, and superseded collections; if the disk is still full, delete by hand only article stores older than those two (`ls /var/lib/wiki-mirror/articles`), never the serving one. Then `wiki-mirror build-now`. |
-| Qdrant restarts repeatedly, `wiki-mirror logs qdrant` shows it killed | Memory: `MemoryMax=20G` reached, or the container's 32 GB | `systemctl show wiki-mirror-qdrant -p NRestarts`; check the collection still has `max_optimization_threads: 1` and `max_segment_size: 400000` (`curl -s localhost:6333/collections/wikipedia_lexical`); lower `storage.performance.max_search_threads` in `qdrant.yaml`; do not run a build and heavy search together. Qdrant recovers from its WAL after a kill and the build resumes. |
+| Qdrant restarts repeatedly, `wiki-mirror logs qdrant` shows it killed; health says "Qdrant was restarted after a failure at ..." or "Qdrant holds N% of its memory cap" | Memory: the cap in the unit (`MemoryMax`) reached, or the container's 32 GB. Only anonymous (pinned) memory counts toward a kill, not page cache. On 2026-10-23 the cap was 20G and the semantic index was held in RAM (about 22.7 GB at rest), which could not fit ([D8](DECISIONS.md#d8)) | `wiki-mirror status` (Maintenance: Qdrant's memory against its cap and the last restart); `systemctl show wiki-mirror-qdrant -p NRestarts`. Check the semantic collection is on the layout the code names: the job reports a difference as a problem and puts it back (see [The maintenance job](#the-maintenance-job)); a graph or binary copy in RAM again is the first suspect. For the keyword collection, check it still has `max_optimization_threads: 1` and `max_segment_size: 400000` (`curl -s localhost:6333/collections/wikipedia_lexical`); lower `storage.performance.max_search_threads` in `qdrant.yaml`; do not run a build and heavy search together. Qdrant recovers from its WAL after a kill and the build resumes. A restart can leave a collection paused: next row. |
+| Semantic index reads "paused - the maintenance job resumes it within 15 minutes" (collection status `grey`), usually after Qdrant restarted | Qdrant 1.12 does not restart pending optimizations after a restart until some update arrives, so the graph build stops where it was | Nothing, unless the job holds the collection (next row): it resumes it within 15 minutes and records the action. To do it now, `systemctl start wiki-mirror-maintain`. If it is still paused after a resume ("<name> is still paused after a resume at ..."), see [the problem sentences](#the-problem-sentences). If the job is not running, enable its timer ([Enabling it](#enabling-it)). |
+| Health `degraded` with `<name> is held by the maintenance job: <held>`; `wiki-mirror status` shows `<name> is held: <reason>` | The crash-loop guard stopped the job resuming a paused collection ([The crash-loop guard](#the-crash-loop-guard)). Most often systemd has restarted Qdrant after a failure 2 or more times since it was last started by hand (`systemctl show wiki-mirror-qdrant -p NRestarts`), so the work may be what killed it. A box whose unit already shows 2 or more holds its paused collections until someone acts | Fix the cause first (`wiki-mirror logs qdrant`: the memory cap, the disk). Then resume by hand with the command at the end of the `held` text: `runuser -u wikimirror-sync -- curl -X PATCH http://127.0.0.1:6333/collections/<name> -H 'Content-Type: application/json' -d '{"optimizers_config":{}}'`, or start Qdrant by hand, which resets the count and gives the job its allowance again. A hold for memory, disk or an unreadable count lifts by itself once that clears. |
+| Health `degraded` with "the maintenance job could not read Qdrant's unit, so crashes and memory are not watched" | `systemctl` is missing, slow or failing, or its reply had no `LoadState` | `systemctl show wiki-mirror-qdrant -p LoadState`; `wiki-mirror logs maintain` names the reason. Clears on the next run that can read the unit. |
+| Health `degraded` with "Qdrant's unit is not installed, so the maintenance job does not watch crashes and memory" | `wiki-mirror-qdrant.service` is missing | Run `/opt/wiki-mirror/deploy/install.sh`. |
+| Health `degraded` with "the maintenance job last ran at ..., N minutes ago; its timer or the job has stopped", or `wiki-mirror status` warns that the timer is not enabled | The record is more than 60 minutes old: the timer is off, or every run is failing (exit 1: the record cannot be written) | `systemctl list-timers wiki-mirror-maintain`; `systemctl enable --now wiki-mirror-maintain.timer` if it is off; `wiki-mirror logs maintain` for a failing run (a full or unwritable `/var/lib/wiki-mirror/state`). The warning clears on the next successful run. |
 | A client says the mirror is unavailable or gets 401 | Key mismatch or revoked, wrong URL, or the firewall | `curl -s -o /dev/null -w '%{http_code}\n' http://<mirror-host>:8300/v1/wiki/health` from the client should print 401 (reachable, key required); then check its key with `wiki-mirror key list`. |
 | An agent gets 401 on `/mcp` | Key mistyped, revoked, or not added on this box | `wiki-mirror key list` shows who has a key. A lost key cannot be shown again: `wiki-mirror key revoke <name>`, then `wiki-mirror key add <name>`. |
 | `wiki-mirror status` says `degraded`; `wiki-mirror logs api` says "the article store for snapshot <date tag> (collection wikipedia_lexical_...) cannot be opened" | A build moved the alias (or the collection's `applied_snapshot` moved) but that snapshot's store is missing, unfinished or damaged | The old snapshot is still serving. `ls /var/lib/wiki-mirror/articles`; `wiki-mirror build-now` repeats parse and index (it resumes). The API picks the result up within 30 seconds. |
@@ -764,18 +959,19 @@ dedicated, deleting the container or VM is simpler and removes the firewall too.
 1. **Stop and disable the units** (the timers first, so nothing starts again):
 
    ```bash
-   # systemctl disable --now wiki-mirror-update.timer wiki-mirror-build.timer
-   # systemctl disable --now wiki-mirror.service wiki-mirror-build.service wiki-mirror-update.service wiki-mirror-qdrant.service
+   # systemctl disable --now wiki-mirror-update.timer wiki-mirror-build.timer wiki-mirror-maintain.timer
+   # systemctl disable --now wiki-mirror.service wiki-mirror-build.service wiki-mirror-update.service wiki-mirror-maintain.service wiki-mirror-qdrant.service
    ```
 
-   (`wiki-mirror-build.service` and `wiki-mirror-update.service` are oneshots; a "not loaded" message for an idle one
-   is fine.)
+   (`wiki-mirror-build.service`, `wiki-mirror-update.service` and `wiki-mirror-maintain.service` are oneshots; a
+   "not loaded" message for an idle one is fine.)
 2. **Remove the unit files:**
 
    ```bash
    # rm /etc/systemd/system/wiki-mirror.service /etc/systemd/system/wiki-mirror-qdrant.service
    # rm /etc/systemd/system/wiki-mirror-build.service /etc/systemd/system/wiki-mirror-build.timer
    # rm /etc/systemd/system/wiki-mirror-update.service /etc/systemd/system/wiki-mirror-update.timer
+   # rm /etc/systemd/system/wiki-mirror-maintain.service /etc/systemd/system/wiki-mirror-maintain.timer
    # systemctl daemon-reload
    ```
 

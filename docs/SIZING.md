@@ -43,35 +43,47 @@ Qdrant and the article store must be on local disk (SSD or NVMe), not on network
 memory peaked at 5.1 GB during the last merges and rests at 4.3 GB. The rest is memory-mapped files that the
 kernel can drop.
 
-**Semantic index for the live passage cut** (estimates; the semantic build has not run yet). 41.5M passages,
-1,024 dimensions:
+**Semantic index for the live passage cut** (the first full embedding run finished on 2026-10-22: 41,590,915
+passages, 1,024 dimensions; the sizes below are the arithmetic, with the measured ones marked):
 
 | Part | Arithmetic | Size |
 |---|---|---|
-| Float16 originals, on disk | 41.5M x 1,024 x 2 B | about **85 GB** |
-| Binary-quantized vectors, in RAM | 41.5M x 1,024 bits = 128 B each | about **5.3 GB** |
-| HNSW graph (m=16) | layer 0 holds up to 2m = 32 links of 4 B per point: 41.5M x 128 B | about **5 GB** |
-| Payload (ids, section, hash) | | about 1-2 GB |
-| **Total on disk** | 85 + 5 + 1-2, plus the binary copy if stored | **about 95 GB** |
+| Float16 originals, on disk | 41.5M x 1,024 x 2 B | about **85 GB** (estimate) |
+| Binary-quantized copy, on disk | 41.5M x 1,024 bits = 128 B each | **5.3 GB** (measured 5.32 GB) |
+| HNSW graph links (m=16), on disk | measured about 250 B per passage: 6.87 GB with 62% built | **about 10.4 GB** when complete (the layer-0 arithmetic, 32 links of 4 B = 128 B per point, gave about 5 GB and was too low) |
+| Payload (ids, section, hash) | | about 1-2 GB (estimate) |
+| **Total on disk** | 85 + 5.3 + 10.4 + 1-2 | **about 102 GB** |
 
-The binary vectors and the graph make about 10 GB that should be resident for fast search. `qdrant.yaml` currently
-sets the HNSW index to `on_disk: true`; whether the graph is held in RAM or paged from NVMe is a configuration
-choice to settle in the semantic build ([ROADMAP.md](ROADMAP.md)).
+All three large parts live on disk ([D8](DECISIONS.md#d8)): Qdrant memory-maps them and the kernel keeps the parts
+in use in spare RAM. They are not pinned. The measured breakdown of Qdrant's anonymous memory when they were held in
+RAM (19.2 GB at rest, 62% of the graph built) was: graph links 6.87 GB, binary copy 5.32 GB, keyword index 4.3 GB,
+and about 2.7 GB of per-point bookkeeping (ID maps, payload stores; the remainder, not measured directly). Finished,
+that layout would have rested at about 22.7 GB.
 
 **Totals (estimates).**
 
-- Local disk: 25 (articles) + 37 (keyword) + about 95 (semantic) = about **160 GB**. Add headroom: a monthly
+- Local disk: 25 (articles) + 37 (keyword) + about 102 (semantic) = about **165 GB**. Add headroom: a monthly
   build holds two article stores side by side for a few hours (about 100 GB peak before the semantic index), and
   Qdrant's optimizer needs free space for segment rewrites. The build refuses to start below 20 GB free. **Plan on
   250 GB of local disk, plus about 300 GB of bulk storage for the snapshots.** This is the one disk figure the other
   docs quote.
-- RAM for Qdrant: about 4-5 GB (keyword) + 5.3 GB (binary) + up to 5 GB (graph) = about 15 GB, which is why the
-  cap rises from 12G to about 20G for the semantic build. A 32 GB host also runs the API (cap 1.5 GB) and a build
-  (cap 5 GB), and the kernel needs page cache for the memory-mapped files.
+- RAM for Qdrant, pinned: **7.4-7.5 GB** at rest, measured after the on-disk rebuild finished on 2026-10-23 (7.52 GB
+  of anonymous memory in the cgroup; the estimate had been 7.0 GB), and 0.14 GB for the API. The goal, a mirror whose
+  pinned memory stays under 10 GB, is met. Before the change the pinned memory was 19.2 GB with the rebuild 62% done,
+  and the full in-RAM layout was projected at about 22.7 GB.
+- Qdrant's cap is **24G**, and it is a cache budget as much as a safety limit: under cgroup v2 the page cache of
+  Qdrant's memory-mapped files is charged to its cgroup. Measured under a 26G cap, the cgroup sat at the cap (7.52 GB
+  anonymous plus 19.93 GB of file cache) and reclaimed cache 13,693 times without a kill. A smaller cap means a
+  smaller cache and slower semantic search: a 14G cap would leave about 6.5 GB of cache, less than the graph (about
+  10.4 GB) and the binary copy (about 5.3 GB) that a search walks. On a 32 GB host 24G is what the other units' caps
+  leave (API 1.5G, build 5G, maintenance job 256M, about 1.25 GB for the system; the 2G embedding run never runs beside
+  a build). A host with less RAM lowers the cap by the difference and pays in cache. Qdrant's pinned memory during a
+  monthly build, when two keyword indexes exist side by side, is an estimate of 12 GB and **still to be measured**
+  ([D8](DECISIONS.md#d8) has the reasoning and the levers).
 
 **Packed alternatives** (estimates from the passage-length evaluation, not adopted; see [D5](DECISIONS.md#d5)):
 
-| Cut | Passages | float16 on disk | Binary in RAM |
+| Cut | Passages | float16 on disk | Binary copy |
 |---|---|---|---|
 | Live cut (sections never merge) | 41.5M | 85 GB | 5.3 GB |
 | Packed to 1,024 characters | 30.1M | 62 GB | 3.9 GB |
@@ -147,7 +159,11 @@ recorded in [D5](DECISIONS.md#d5).
 
 Search needs no GPU. A query is one keyword encoding plus one Qdrant query, answered in about 27 ms when the index
 is cached and about 240 ms on first touch (measured 2026-10-18). Once the semantic index is live, each search also
-embeds the query text once (one short request to the embedding server). See
+embeds the query text once (one short request to the embedding server). A semantic query on the on-disk layout
+was measured on the finished rebuild (2026-10-23, over loopback, `limit` 10): about 45 ms median once cached, about
+0.5 to 0.9 s the first time a query touches the files, and 6 s median (37 s worst) for the first queries right after
+the rebuild. A first-time query reads about 290 MB from disk. Nothing serves semantic search yet, so this decides
+what to do before hybrid search ships ([D8](DECISIONS.md#d8) has the table and the levers). See
 [API.md](API.md#performance-and-capacity) for what limits concurrency.
 
 ## Minimum hardware, by stage
@@ -158,5 +174,5 @@ These combine the figures above; they are estimates, not tested minimums.
 |---|---|
 | Serve the keyword index | About 8 GB RAM for Qdrant and the API (the first deployment ran on 8 GB until the first build), about 70 GB of fast local disk for the store and index (250 GB once monthly builds need their headroom), 6 cores (the parse stage runs 5 workers by default) |
 | First keyword build | The above plus about 300 GB of bulk storage for snapshots, and free local disk for two stores; the first build's run, 2026-10-17 15:45Z to 2026-10-18 05:12Z, took about 13.5 hours on six cores (measured; download and parse timings were not recorded separately) |
-| Semantic build | About 160 GB of fast local disk, 32 GB RAM with Qdrant capped near 20G, and an embedding server with enough effective TFLOPS: about 45 hours at 29 |
+| Semantic build | About 165 GB of fast local disk, 32 GB RAM (7.4-7.5 GB of it pinned by Qdrant with the index on disk, measured, with the rest as page cache), and an embedding server with enough effective TFLOPS: about 45 hours at 29 |
 | Monthly refresh | About 45 minutes of download, 1-2 hours of parse and the embedding of changed passages (estimates for the update; the full build figures are measured) |

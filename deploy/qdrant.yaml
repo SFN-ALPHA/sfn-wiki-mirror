@@ -1,4 +1,4 @@
-# Qdrant 1.12.4 settings for the mirror's LXC (6 vCPU, 8 GB RAM, local SSD).
+# Qdrant 1.12.4 settings for the mirror's LXC (6 vCPU, 32 GB RAM, 8 GB at the least; local SSD).
 #
 # Installed by install.sh to /etc/wiki-mirror/qdrant.yaml and read by
 # wiki-mirror-qdrant.service (`--config-path`). Only keys that differ from Qdrant's
@@ -12,10 +12,14 @@
 #     anyone who can reach it.
 #   * Storage is on local SSD. Qdrant memory-maps segments; NFS makes every search a network
 #     round trip and mmap on NFS misbehaves (docs/DESIGN.md section 4).
-#   * The memory settings below are for 8 GB shared with the API (1.5 G cap) and a build
-#     (5 G cap); they will be revisited in W2, when dense vectors arrive and the real
-#     working set is measured. Collection-level settings made by the index code override the
-#     node defaults here.
+#   * The memory settings below are node-wide defaults, written for a box shared with the API
+#     (1.5 G cap) and a build (5 G cap). The semantic collection's layout is not set here:
+#     the code sets it per collection (SEMANTIC_HNSW, SEMANTIC_QUANTIZATION and
+#     SEMANTIC_OPTIMIZATION_THREADS in src/wiki_mirror/embed.py), and the maintenance job keeps
+#     the live collection equal to it. All three of its files - float16 vectors, HNSW graph and
+#     binary-quantized copy - are on disk, memory-mapped and cached by the kernel, so the
+#     pinned memory stays under 10 GB (docs/DECISIONS.md D8). Collection-level settings made
+#     by the index code override the node defaults here.
 #
 # See docs/DESIGN.md sections 4 and 6, docs/OPERATIONS.md.
 
@@ -55,14 +59,17 @@ storage:
   hnsw_index:
     # Node-wide default: HNSW graphs on disk. The lexical (sparse) index W1 builds is
     # separate and configured by the index code; this matters for W2's dense vectors, where
-    # an in-RAM graph over ~13 million points does not fit in 8 GB. Costs some search
+    # an in-RAM graph over 41.6M points (about 10.4 GB of links, measured) was part of what
+    # ran Qdrant out of its cap on 2026-10-23 (docs/DECISIONS.md D8). Costs some search
     # latency, which a client's tools tolerate (an agent already waits seconds on a
-    # web fetch).
+    # web fetch); measured on the finished rebuild: about 45 ms cached, about half a second
+    # the first time, seconds to tens of seconds after a restart (docs/DECISIONS.md D8).
     on_disk: true
 
   collection:
     vectors:
-      # Original vectors on disk by default (W2 keeps quantized copies in RAM); same reason.
+      # Original vectors on disk by default; the semantic collection's binary-quantized copy
+      # is on disk too (D8), set by the code at creation, not here; same reason.
       on_disk: true
 
 service:

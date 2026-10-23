@@ -40,10 +40,16 @@ Non-obvious constraints:
   built per request. A server without authentication needs none.
 * **The collection is loaded without HNSW and indexed at the end.** Building the graph while 41
   million points arrive costs far more than building it once per segment afterwards: the collection
-  is created with `m=0` and `finish` sets `m=16` (`_finish`). Qdrant then builds the graphs in the
-  background, one segment at a time, and that outlives this stage; it is logged, not waited for.
-  Vectors are float16 on disk with binary quantization held in RAM (the box serves the quantized
-  copy and rescoring reads the disk), which is what lets 85 GB of vectors search from a 32 GB host.
+  is created with `m=0` and `_finish` sets `SEMANTIC_HNSW`. Qdrant then builds the graphs in the
+  background, `SEMANTIC_OPTIMIZATION_THREADS` segments at a time, and that outlives this stage; it
+  is logged, not waited for.
+* **Everything is on disk, and these constants are the one definition of that layout.** The
+  float16 vectors, the HNSW graph (`SEMANTIC_HNSW`, `on_disk=True`) and the binary-quantized copy
+  (`SEMANTIC_QUANTIZATION`, `always_ram=False`) all live on disk, so the mirror's pinned RAM stays
+  under 10 GB (the operator's decision of 2026-10-23, docs/DECISIONS.md D8): the page cache keeps
+  the hot parts in spare RAM and gives them back under pressure, so nothing is OOM-killed. This
+  stage creates and finishes the collection with them, and the maintenance job (`maintain.py`)
+  keeps the live collection equal to them.
 * **Resuming is checked, not assumed, twice.** The state file records the chunker, model,
   dimensions and text form; any difference from the running configuration refuses the resume
   (mixing two models' vectors in one collection ruins it silently). Then the contents are checked
@@ -53,8 +59,8 @@ Non-obvious constraints:
   checkpoint steps back to just before the highest article still present (`_verified_checkpoint`)
   and a warning says so. A collection with no usable state is never deleted automatically: two
   days of vectors are not discarded on a guess.
-* **Segments are capped** (`_MAX_SEGMENT_KB`) and optimized one at a time, for the reasons in
-  `index.py`; the numbers here are the dense collection's own.
+* **Segments are capped** (`_MAX_SEGMENT_KB`) and optimized `SEMANTIC_OPTIMIZATION_THREADS` at a
+  time, for the reasons in `index.py`; the numbers here are the dense collection's own.
 * **Local state, no build state.** Progress lives in `state/index_semantic_<born>.json`, written
   atomically after every window. This stage never writes `build.json`: the index being served is
   fine while an embedding run is failing, and `/v1/wiki/health` must not say otherwise. It does
@@ -69,6 +75,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import time
 import uuid
 from collections import deque
@@ -99,6 +106,9 @@ from wiki_mirror.text.sanitize import Chunk
 __all__ = [
     "ALIAS",
     "EMBEDDING_API_KEY_ENV",
+    "SEMANTIC_HNSW",
+    "SEMANTIC_OPTIMIZATION_THREADS",
+    "SEMANTIC_QUANTIZATION",
     "TEXT_FORM",
     "EmbedError",
     "Embedder",
@@ -107,6 +117,7 @@ __all__ = [
     "open_source_store",
     "passage_embedding_text",
     "run_embed",
+    "semantic_index_complete",
     "semantic_state_file",
 ]
 
@@ -114,6 +125,9 @@ logger = logging.getLogger("wiki_mirror.embed")
 
 #: The name a later hybrid search will follow. An alias, like the lexical one.
 ALIAS: Final = "wikipedia_semantic"
+
+#: `wikipedia_semantic_<born>`, where the group is the born tag (`collection_name`).
+_OWN_COLLECTION: Final = re.compile(r"wikipedia_semantic_(\d{8})")
 
 #: The environment variable holding the embedding server's key, if it wants one.
 EMBEDDING_API_KEY_ENV: Final = "EMBEDDING_API_KEY"
@@ -147,16 +161,30 @@ _PROGRESS_SECONDS: Final = 60.0
 #: section 12.5 says to look at it once the graphs are built.
 _MAX_SEGMENT_KB: Final = 1_000_000
 
-#: Segment optimizations (merges, graph builds, quantization) at once. One at a time, as for the
-#: lexical collection (`index._MAX_OPTIMIZATION_THREADS`): the box runs Qdrant, the API and this
-#: stage's client together, and concurrent graph builds are what ran Qdrant out of memory once.
-_MAX_OPTIMIZATION_THREADS: Final = 1
+#: Segment optimizations (merges, graph builds, quantization) at once, for the semantic collection:
+#: two (the lexical collection keeps one, `index._MAX_OPTIMIZATION_THREADS`). Two are safe because
+#: each graph build holds only its own segment's graph on the heap (about 120 MB for a
+#: 470,000-point segment), and they halve the time a rebuild takes. The 2026-10-23 out-of-memory
+#: kill happened with one thread, on the in-RAM graph layout this replaced. docs/DECISIONS.md D8.
+SEMANTIC_OPTIMIZATION_THREADS: Final = 2
 
 #: HNSW once the load is done: Qdrant's own defaults (`m=16`, `ef_construct=100`), the setting
-#: the evaluation's recall numbers assume; the graph stays in RAM (`on_disk=False`) because
-#: with 85 GB of vectors on disk, a graph walk that also read the disk would be unusable.
-_HNSW_M: Final = 16
-_HNSW_EF_CONSTRUCT: Final = 100
+#: the evaluation's recall numbers assume. The graph is **on disk** (`on_disk=True`): the in-RAM
+#: graph ran Qdrant out of its 20G cap on 2026-10-23, and the operator decided that day to keep
+#: the mirror's pinned RAM under 10 GB, leaving the hot parts to the page cache, which gives its
+#: RAM back under pressure (docs/DECISIONS.md D8). Semantic search latency on this layout is not
+#: measured yet; it will be once the rebuild has finished (docs/DESIGN.md section 12.5). The
+#: maintenance job keeps the live collection equal to this value.
+SEMANTIC_HNSW: Final = models.HnswConfigDiff(m=16, ef_construct=100, on_disk=True)
+
+#: The binary-quantized copy of the vectors: held on disk too (`always_ram=False`), for the same
+#: reason as the graph (docs/DECISIONS.md D8). Binary quantization is what lets 85 GB of float16
+#: vectors be searched from a 32 GB host: the quantized copy is scanned and only the best
+#: candidates are rescored from the full vectors. The maintenance job keeps the live collection
+#: equal to this value.
+SEMANTIC_QUANTIZATION: Final = models.BinaryQuantization(
+    binary=models.BinaryQuantizationConfig(always_ram=False)
+)
 
 #: Longest a single request is retried before the stage gives up, seconds. The systemd unit
 #: restarts the stage 15 minutes later and it resumes, so a longer wait here buys nothing.
@@ -223,6 +251,33 @@ def semantic_state_file(data_dir: Path, born: str) -> Path:
         born: The collection's born tag.
     """
     return data_dir / "state" / f"index_semantic_{born}.json"
+
+
+def semantic_index_complete(data_dir: Path, collection: str, *, quiet: bool = False) -> bool:
+    """Whether an embedding run has finished loading `collection` (its state says `complete`).
+
+    The maintenance job asks this before it changes a semantic collection's settings: while a run
+    is still loading, HNSW is off on purpose (`_create_collection`), and "fixing" it would build
+    the graph under 41 million arriving points. Health asks it on every poll.
+
+    Args:
+        data_dir: The service's local data directory.
+        collection: A collection name, normally `wikipedia_semantic_<born>`.
+        quiet: Do not log an unreadable state file. Health sets it, because it must not write a
+            log line per poll; the maintenance job leaves it off, so the problem is logged once
+            per 15-minute run.
+
+    Returns:
+        True only when `collection` is a name this module creates and its state file reads
+        `"complete": true`. A name that is not ours, an absent state and an unreadable or
+        another snapshot's state are all False, so the caller waits rather than guesses.
+    """
+    found = _OWN_COLLECTION.fullmatch(collection)
+    if found is None:
+        return False
+    born = found[1]
+    state = _read_state(semantic_state_file(data_dir, born), born, quiet=quiet)
+    return state is not None and state.complete
 
 
 def passage_embedding_text(article: Article, chunk: Chunk) -> str:
@@ -858,9 +913,10 @@ def _highest_page_id(client: QdrantClient, name: str, last_page_id: int) -> int 
 def _create_collection(client: QdrantClient, name: str, dimensions: int) -> None:
     """Create the dense collection (HNSW off for the load) and the `page_id` payload index.
 
-    One unnamed vector: cosine, float16 on disk, binary-quantized in RAM. `m=0` turns HNSW off
-    until `_finish`. The payload index is the same on-disk integer index as the lexical
-    collection's, for W3's per-article selection.
+    One unnamed vector: cosine, float16 on disk, binary-quantized per `SEMANTIC_QUANTIZATION`
+    (the copy on disk too). `m=0` turns HNSW off until `_finish` sets `SEMANTIC_HNSW`; the
+    optimizer runs `SEMANTIC_OPTIMIZATION_THREADS` threads. The payload index is the same on-disk
+    integer index as the lexical collection's, for W3's per-article selection.
     """
     client.create_collection(
         collection_name=name,
@@ -871,13 +927,11 @@ def _create_collection(client: QdrantClient, name: str, dimensions: int) -> None
             on_disk=True,
         ),
         hnsw_config=models.HnswConfigDiff(m=0),
-        quantization_config=models.BinaryQuantization(
-            binary=models.BinaryQuantizationConfig(always_ram=True)
-        ),
+        quantization_config=SEMANTIC_QUANTIZATION,
         on_disk_payload=True,
         optimizers_config=models.OptimizersConfigDiff(
             max_segment_size=_MAX_SEGMENT_KB,
-            max_optimization_threads=_MAX_OPTIMIZATION_THREADS,
+            max_optimization_threads=SEMANTIC_OPTIMIZATION_THREADS,
         ),
     )
     client.create_payload_index(
@@ -1045,17 +1099,12 @@ async def _commit(
 
 
 def _finish(client: QdrantClient, name: str) -> None:
-    """Turn HNSW on for the finished collection and point the alias at it.
+    """Turn HNSW on (`SEMANTIC_HNSW`) for the finished collection and point the alias at it.
 
     Both are idempotent, so a run that died between them and the final state write simply
     repeats them. Qdrant builds the graphs in the background; this does not wait for that.
     """
-    client.update_collection(
-        collection_name=name,
-        hnsw_config=models.HnswConfigDiff(
-            m=_HNSW_M, ef_construct=_HNSW_EF_CONSTRUCT, on_disk=False
-        ),
-    )
+    client.update_collection(collection_name=name, hnsw_config=SEMANTIC_HNSW)
     previous = _alias_target(client)
     operations: list[models.AliasOperations] = []
     if previous is not None:
@@ -1148,11 +1197,12 @@ def _duration(seconds: float) -> str:
     return f"{minutes}m"
 
 
-def _read_state(path: Path, born: str) -> _EmbedState | None:
+def _read_state(path: Path, born: str, *, quiet: bool = False) -> _EmbedState | None:
     """Load the state, or None if there is none, it is unreadable, or it is another's.
 
     An unreadable state is logged and reported as none; `_begin` then refuses to touch a
-    collection that exists without one, rather than discard it.
+    collection that exists without one, rather than discard it. `quiet` suppresses that log line
+    for callers that look on every poll (`semantic_index_complete`).
     """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -1173,7 +1223,8 @@ def _read_state(path: Path, born: str) -> _EmbedState | None:
     except FileNotFoundError:
         return None
     except (OSError, ValueError, KeyError, TypeError):
-        logger.warning("embed state %s is unreadable", path)
+        if not quiet:
+            logger.warning("embed state %s is unreadable", path)
         return None
     return state if state.born == born else None
 

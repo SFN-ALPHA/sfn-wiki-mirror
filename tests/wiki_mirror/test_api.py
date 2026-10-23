@@ -16,15 +16,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 from qdrant_client.http.exceptions import UnexpectedResponse
 from starlette.testclient import WebSocketDisconnect
 
@@ -43,7 +45,14 @@ from tests.fixtures.wiki_mirror_fakes import (
     served_over,
     write_store,
 )
-from wiki_mirror.api import STALE_AFTER_DAYS, ServiceHealth, build_service, create_app
+from wiki_mirror.api import (
+    MAINTENANCE_STALE_MINUTES,
+    QDRANT_CRASH_REPORT_HOURS,
+    STALE_AFTER_DAYS,
+    ServiceHealth,
+    build_service,
+    create_app,
+)
 from wiki_mirror.config import MirrorConfig
 from wiki_mirror.keys import (
     RECHECK_SECONDS,
@@ -197,9 +206,7 @@ def _keyed_app(
         tmp_path, _articles(), clock=frozen_clock.monotonic, clients_file=tmp_path / "clients.json"
     )
     keys = ClientKeys(settings.clients_file, API_KEY, clock=frozen_clock.monotonic)
-    health = ServiceHealth(
-        settings, served, client, state_reader=FakeStateStore().read, clock=_now
-    )
+    health = ServiceHealth(settings, served, client, state_reader=FakeStateStore().read, clock=_now)
     app = create_app(settings, served, health, keys=keys)
     return TestClient(app), settings.clients_file, served
 
@@ -563,9 +570,7 @@ def _health(
 def test_health_serving_snapshot_is_ok_with_counts_and_the_build_state(
     tmp_path: Path, frozen_clock: FrozenClock
 ) -> None:
-    report = _health(
-        tmp_path, frozen_clock, FakeState(phase="serving", snapshot_date="2026-10-01")
-    )
+    report = _health(tmp_path, frozen_clock, FakeState(phase="serving", snapshot_date="2026-10-01"))
     assert report["status"] == "ok"
     assert (report["snapshot"], report["articles"], report["collection"]) == (
         "2026-10-01",
@@ -576,6 +581,9 @@ def test_health_serving_snapshot_is_ok_with_counts_and_the_build_state(
     assert report["build"]["phase"] == "serving"
     assert set(report) == {
         "status",
+        "reasons",
+        "semantic",
+        "maintenance",
         "snapshot",
         "applied_snapshot",
         "articles",
@@ -655,9 +663,7 @@ def test_health_counts_the_new_store_when_the_applied_snapshot_moves_under_the_s
     tmp_path: Path, frozen_clock: FrozenClock
 ) -> None:
     served, client, config = served_over(tmp_path, _articles(), clock=frozen_clock.monotonic)
-    health = ServiceHealth(
-        config, served, client, state_reader=FakeStateStore().read, clock=_now
-    )
+    health = ServiceHealth(config, served, client, state_reader=FakeStateStore().read, clock=_now)
     first = health()
     november = make_snapshot("2026-11-01")
     write_store(config, [*_articles(), make_article(7, "Venus")], november)
@@ -675,9 +681,7 @@ def test_health_counts_the_new_store_when_the_applied_snapshot_moves_under_the_s
 def test_health_failed_build_while_serving_is_degraded(
     tmp_path: Path, frozen_clock: FrozenClock
 ) -> None:
-    report = _health(
-        tmp_path, frozen_clock, FakeState(phase="failed", error="parse: OSError")
-    )
+    report = _health(tmp_path, frozen_clock, FakeState(phase="failed", error="parse: OSError"))
     assert report["status"] == "degraded"
     assert report["build"]["error"] == "parse: OSError"
 
@@ -750,9 +754,7 @@ def test_health_counts_the_articles_of_a_store_once(
     tmp_path: Path, frozen_clock: FrozenClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     served, client, config = served_over(tmp_path, _articles(), clock=frozen_clock.monotonic)
-    health = ServiceHealth(
-        config, served, client, state_reader=FakeStateStore().read, clock=_now
-    )
+    health = ServiceHealth(config, served, client, state_reader=FakeStateStore().read, clock=_now)
     health()
     with served.lease() as serving:
         assert serving is not None
@@ -913,6 +915,738 @@ def test_health_index_cut_by_another_chunker_is_degraded(
     report = health()
     served.close()
     assert (report["status"], report["snapshot"]) == ("degraded", "2026-10-01")
+
+
+# -- why health is degraded --------------------------------------------------------------------
+
+
+def test_health_ok_has_no_reasons(tmp_path: Path, frozen_clock: FrozenClock) -> None:
+    report = _health(tmp_path, frozen_clock, FakeState(phase="serving"))
+    assert (report["status"], report["reasons"]) == ("ok", [])
+
+
+def test_health_failed_build_names_the_build_in_reasons(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    report = _health(tmp_path, frozen_clock, FakeState(phase="failed", error="parse: OSError"))
+    assert report["reasons"] == ["the last build failed"]
+
+
+def test_health_qdrant_down_names_qdrant_in_reasons(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    class Down:
+        def get_aliases(self) -> Any:
+            raise ConnectionError
+
+    report = _health(
+        tmp_path,
+        frozen_clock,
+        FakeState(phase="serving"),
+        indexed=False,
+        client=Down(),  # type: ignore[arg-type]
+    )
+    assert report["reasons"] == [
+        "serving has a problem: Qdrant could not be asked where the alias points"
+    ]
+
+
+def test_health_qdrant_failing_to_count_names_qdrant_in_reasons(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, real, config = served_over(tmp_path, _articles(), clock=frozen_clock.monotonic)
+
+    class CannotCount:
+        def count(self, **_: Any) -> Any:
+            raise ConnectionError
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real, name)
+
+    health = ServiceHealth(
+        config,
+        served,
+        CannotCount(),  # type: ignore[arg-type]
+        state_reader=FakeStateStore(FakeState(phase="serving")).read,
+        clock=_now,
+    )
+    report = health()
+    served.close()
+    assert (report["status"], report["reasons"]) == ("degraded", ["Qdrant could not be asked"])
+
+
+def test_health_serving_problem_is_in_reasons(tmp_path: Path, frozen_clock: FrozenClock) -> None:
+    served, client, config = served_over(tmp_path, _articles(), clock=frozen_clock.monotonic)
+    state = config.data_dir / "state" / "index_lexical_20261001.json"
+    recorded = json.loads(state.read_text(encoding="utf-8"))
+    recorded["chunker"] = "v0:1/1"
+    state.write_text(json.dumps(recorded), encoding="utf-8")
+    health = ServiceHealth(
+        config,
+        served,
+        client,
+        state_reader=FakeStateStore(FakeState(phase="serving")).read,
+        clock=_now,
+    )
+    report = health()
+    served.close()
+    assert len(report["reasons"]) == 1
+    assert report["reasons"][0].startswith("serving has a problem:")
+
+
+def test_health_alias_ahead_of_every_store_gives_the_store_problem_as_the_reason(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    config = make_config(tmp_path)
+    qdrant = memory_client()
+    build_snapshot(config, qdrant, _articles(), make_snapshot("2026-10-01"))
+    served = ServedSnapshot(config, qdrant, clock=frozen_clock.monotonic)
+    health = ServiceHealth(
+        config,
+        served,
+        qdrant,
+        state_reader=FakeStateStore(FakeState(phase="serving")).read,
+        clock=_now,
+    )
+    health()
+    index_without_store(config, qdrant, _articles(), make_snapshot("2026-11-01"))
+    report = health()
+    served.close()
+    assert len(report["reasons"]) == 1
+    assert report["reasons"][0].startswith("serving has a problem: the article store for snapshot")
+
+
+def test_health_holder_not_serving_the_alias_without_a_problem_says_it_has_not_caught_up(
+    tmp_path: Path,
+) -> None:
+    class Counts:
+        def count(self, **_: Any) -> Any:
+            return SimpleNamespace(count=3)
+
+    health = ServiceHealth(
+        make_config(tmp_path),
+        StubServed(None, alias="wikipedia_lexical_20261101"),  # type: ignore[arg-type]
+        Counts(),  # type: ignore[arg-type]
+        state_reader=FakeStateStore(FakeState(phase="serving")).read,
+        clock=_now,
+    )
+    report = health()
+    assert report["reasons"] == ["the alias moved and serving has not caught up with it yet"]
+
+
+def test_health_stale_snapshot_is_in_reasons_with_its_age(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    clock = _Clock(datetime(2026, 10, 1, tzinfo=UTC) + timedelta(days=STALE_AFTER_DAYS + 1))
+    health, served = _stale_health(tmp_path, frozen_clock, clock)
+    report = health()
+    served.close()
+    assert report["reasons"] == [
+        f"the snapshot served is {STALE_AFTER_DAYS + 1} days old, "
+        f"past the {STALE_AFTER_DAYS}-day limit"
+    ]
+
+
+# -- the semantic collection on health ---------------------------------------------------------
+
+_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
+_SEMANTIC = "wikipedia_semantic_20261001"
+
+
+def _qdrant_result(name: str) -> dict[str, Any]:
+    """The `result` of a Qdrant reply recorded in `tests/fixtures/qdrant/`."""
+    raw = json.loads((_FIXTURES / "qdrant" / name).read_text(encoding="utf-8"))["result"]
+    assert isinstance(raw, dict)
+    return raw
+
+
+class _SemanticQdrant:
+    """The in-memory client, except that aliases and collection info replay real Qdrant replies.
+
+    The replies are the ones recorded in `tests/fixtures/qdrant/`, parsed into the client's own
+    types, so the code under test reads what it would read from the server.
+    """
+
+    def __init__(
+        self, real: QdrantClient, *, collection: str = "collection_semantic_yellow.json"
+    ) -> None:
+        self._real = real
+        self._collection = collection
+        #: Raised by both semantic calls when set.
+        self.error: Exception | None = None
+        #: Replaces the recorded `optimizer_status` when set.
+        self.optimizer_status: Any = None
+
+    def get_aliases(self) -> Any:
+        if self.error is not None:
+            raise self.error
+        return models.CollectionsAliasesResponse.model_validate(_qdrant_result("aliases.json"))
+
+    def get_collection(self, collection_name: str) -> Any:
+        assert collection_name == _SEMANTIC
+        raw = _qdrant_result(self._collection)
+        if self.optimizer_status is not None:
+            raw = {**raw, "optimizer_status": self.optimizer_status}
+        return models.CollectionInfo.model_validate(raw)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
+def _semantic_health(
+    tmp_path: Path,
+    frozen_clock: FrozenClock,
+    *,
+    stub: _SemanticQdrant | None = None,
+    clock: Callable[[], datetime] = _now,
+) -> dict[str, Any]:
+    """Health over a real store, with Qdrant answering the semantic questions from fixtures."""
+    served, real, config = served_over(tmp_path, _articles(), clock=frozen_clock.monotonic)
+    health = ServiceHealth(
+        config,
+        served,
+        stub or _SemanticQdrant(real),  # type: ignore[arg-type]
+        state_reader=FakeStateStore(FakeState(phase="serving")).read,
+        clock=clock,
+    )
+    try:
+        return health()
+    finally:
+        served.close()
+
+
+def _embed_state(**changes: object) -> str:
+    """An embedding run's state file in the form `embed` writes (all fields it reads)."""
+    state: dict[str, object] = {
+        "born": "20261001",
+        "last_page_id": 99,
+        "articles": 7,
+        "passages": 41590915,
+        "over_stride": 0,
+        "empty": 0,
+        "complete": True,
+        "chunker": "v1:1/1",
+        "model": "bge-m3",
+        "dimensions": 1024,
+        "text_form": "indexed_text/title+heading+text/v1",
+        "applied_snapshot": "20261001",
+    }
+    return json.dumps({**state, **changes})
+
+
+def _write_semantic_state(tmp_path: Path, content: str) -> None:
+    """Leave `content` where the embedding run leaves its state for collection `_SEMANTIC`."""
+    path = tmp_path / "data" / "state" / "index_semantic_20261001.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def test_health_semantic_reports_the_collection_the_alias_points_at(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    _write_semantic_state(tmp_path, _embed_state())
+    report = _semantic_health(tmp_path, frozen_clock)
+    assert report["semantic"] == {
+        "collection": _SEMANTIC,
+        "status": "yellow",
+        "optimizer_status": "ok",
+        "points": 41590915,
+        "indexed_vectors": 25855559,
+        "segments": 85,
+        "complete": True,
+    }
+
+
+def test_health_semantic_grey_collection_is_reported_and_leaves_the_status_alone(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, real, config = served_over(tmp_path, _articles(), clock=frozen_clock.monotonic)
+    stub = _SemanticQdrant(real, collection="collection_semantic_grey.json")
+    health = ServiceHealth(
+        config,
+        served,
+        stub,  # type: ignore[arg-type]
+        state_reader=FakeStateStore(FakeState(phase="serving")).read,
+        clock=_now,
+    )
+    report = health()
+    served.close()
+    assert report["semantic"]["status"] == "grey"
+    assert (report["status"], report["reasons"]) == ("ok", [])
+
+
+def test_health_semantic_optimizer_error_is_reported_with_its_text(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, real, config = served_over(tmp_path, _articles(), clock=frozen_clock.monotonic)
+    stub = _SemanticQdrant(real)
+    stub.optimizer_status = {"error": "Service internal error: no space left"}
+    health = ServiceHealth(
+        config,
+        served,
+        stub,  # type: ignore[arg-type]
+        state_reader=FakeStateStore(FakeState(phase="serving")).read,
+        clock=_now,
+    )
+    report = health()
+    served.close()
+    assert report["semantic"]["optimizer_status"] == "error: Service internal error: no space left"
+
+
+def test_health_without_a_semantic_alias_reports_semantic_null(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    report = _health(tmp_path, frozen_clock, FakeState(phase="serving"))
+    assert report["semantic"] is None
+
+
+def test_health_semantic_lookup_failing_reports_null_logs_and_still_answers(
+    tmp_path: Path, frozen_clock: FrozenClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    served, real, config = served_over(tmp_path, _articles(), clock=frozen_clock.monotonic)
+    stub = _SemanticQdrant(real)
+    health = ServiceHealth(
+        config,
+        served,
+        stub,  # type: ignore[arg-type]
+        state_reader=FakeStateStore(FakeState(phase="serving")).read,
+        clock=_now,
+    )
+    stub.error = UnexpectedResponse(500, "boom", b"", None)  # type: ignore[arg-type]
+    with caplog.at_level(logging.WARNING, logger="wiki_mirror.api"):
+        report = health()
+    served.close()
+    assert report["semantic"] is None
+    assert report["status"] == "ok"
+    assert "semantic collection could not be asked" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (_embed_state(complete=True), True),
+        (_embed_state(complete=False), False),
+        (_embed_state(born="20250101"), False),
+        (json.dumps({"complete": True}), False),
+        (json.dumps([True]), False),
+        ("{not json", False),
+        (None, False),
+    ],
+)
+def test_health_semantic_complete_follows_the_embedding_state_file(
+    tmp_path: Path, frozen_clock: FrozenClock, content: str | None, expected: bool
+) -> None:
+    if content is not None:
+        _write_semantic_state(tmp_path, content)
+    report = _semantic_health(tmp_path, frozen_clock)
+    assert report["semantic"]["complete"] is expected
+
+
+# -- the maintenance record on health ----------------------------------------------------------
+
+_MAINTENANCE_FIXTURE = _FIXTURES / "maintenance" / "maintenance_after_crash.json"
+
+#: The instant the fixture's record was written.
+_RAN_AT = datetime(2026, 10, 23, 12, 30, 4, tzinfo=UTC)
+
+
+def _stamp(moment: datetime) -> str:
+    """A time as the maintenance record writes it."""
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_maintenance(tmp_path: Path, *, ran_at: datetime, **unit: object) -> dict[str, Any]:
+    """Write the fixture record with a new `ran_at` and Qdrant-unit fields; return what it holds.
+
+    The crash is moved three days before the run by default, so a test is about one cause unless
+    it moves it itself.
+    """
+    record = json.loads(_MAINTENANCE_FIXTURE.read_text(encoding="utf-8"))
+    record["ran_at"] = _stamp(ran_at)
+    record["qdrant"]["last_crash_at"] = _stamp(ran_at - timedelta(days=3))
+    record["qdrant"].update(unit)
+    path = tmp_path / "data" / "state" / "maintenance.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record), encoding="utf-8")
+    return record  # type: ignore[no-any-return]
+
+
+def _maintenance_health(tmp_path: Path, frozen_clock: FrozenClock, now: datetime) -> dict[str, Any]:
+    """Health with the clock at `now`; the lexical snapshot (2026-10-01) is fresh then."""
+    health, served = _stale_health(tmp_path, frozen_clock, _Clock(now))
+    try:
+        return health()
+    finally:
+        served.close()
+
+
+def test_health_maintenance_is_the_record_the_job_left(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    written = _write_maintenance(tmp_path, ran_at=_RAN_AT)
+    report = _maintenance_health(tmp_path, frozen_clock, _RAN_AT + timedelta(minutes=5))
+    assert report["maintenance"] == written
+    assert (report["status"], report["reasons"]) == ("ok", [])
+
+
+def test_health_without_a_maintenance_record_reports_null_and_is_not_degraded(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    report = _maintenance_health(tmp_path, frozen_clock, _RAN_AT)
+    assert (report["maintenance"], report["status"], report["reasons"]) == (None, "ok", [])
+
+
+def test_health_with_a_garbage_maintenance_record_reports_null_and_still_answers(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    path = tmp_path / "data" / "state" / "maintenance.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json", encoding="utf-8")
+    report = _maintenance_health(tmp_path, frozen_clock, _RAN_AT)
+    assert (report["maintenance"], report["status"]) == (None, "ok")
+
+
+def test_health_maintenance_record_older_than_the_limit_is_degraded_with_its_reason(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    _write_maintenance(tmp_path, ran_at=_RAN_AT)
+    report = _maintenance_health(
+        tmp_path, frozen_clock, _RAN_AT + timedelta(minutes=MAINTENANCE_STALE_MINUTES, seconds=1)
+    )
+    assert report["status"] == "degraded"
+    assert len(report["reasons"]) == 1
+    assert "maintenance job last ran at 2026-10-23T12:30:04Z" in report["reasons"][0]
+    assert "stopped" in report["reasons"][0]
+
+
+def test_health_maintenance_record_exactly_at_the_limit_is_not_degraded(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    _write_maintenance(tmp_path, ran_at=_RAN_AT)
+    report = _maintenance_health(
+        tmp_path, frozen_clock, _RAN_AT + timedelta(minutes=MAINTENANCE_STALE_MINUTES)
+    )
+    assert report["status"] == "ok"
+
+
+def test_health_maintenance_record_with_an_unreadable_time_is_degraded(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    record = _write_maintenance(tmp_path, ran_at=_RAN_AT)
+    record["ran_at"] = "yesterday"
+    (tmp_path / "data" / "state" / "maintenance.json").write_text(
+        json.dumps(record), encoding="utf-8"
+    )
+    report = _maintenance_health(tmp_path, frozen_clock, _RAN_AT)
+    assert report["reasons"] == ["the maintenance job's last run time is unreadable"]
+
+
+def test_health_qdrant_crash_within_a_day_is_degraded_with_its_time(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    crash = _RAN_AT - timedelta(hours=QDRANT_CRASH_REPORT_HOURS - 1)
+    _write_maintenance(tmp_path, ran_at=_RAN_AT, last_crash_at=_stamp(crash))
+    report = _maintenance_health(tmp_path, frozen_clock, _RAN_AT)
+    assert report["status"] == "degraded"
+    assert report["reasons"] == [f"Qdrant was restarted after a failure at {_stamp(crash)}"]
+
+
+def test_health_qdrant_crash_older_than_a_day_is_not_degraded(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    crash = _RAN_AT - timedelta(hours=QDRANT_CRASH_REPORT_HOURS, seconds=1)
+    _write_maintenance(tmp_path, ran_at=_RAN_AT, last_crash_at=_stamp(crash))
+    report = _maintenance_health(tmp_path, frozen_clock, _RAN_AT)
+    assert report["status"] == "ok"
+
+
+def test_health_qdrant_that_never_crashed_is_not_degraded(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    _write_maintenance(tmp_path, ran_at=_RAN_AT, last_crash_at=None, restarts=0)
+    assert _maintenance_health(tmp_path, frozen_clock, _RAN_AT)["status"] == "ok"
+
+
+def test_health_qdrant_memory_over_ninety_percent_of_its_cap_is_degraded(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    _write_maintenance(tmp_path, ran_at=_RAN_AT, anon_bytes=91, memory_max_bytes=100)
+    report = _maintenance_health(tmp_path, frozen_clock, _RAN_AT)
+    assert report["status"] == "degraded"
+    assert report["reasons"] == ["Qdrant holds 91% of its memory cap and is close to being killed"]
+
+
+def test_health_qdrant_memory_at_ninety_percent_of_its_cap_is_not_degraded(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    _write_maintenance(tmp_path, ran_at=_RAN_AT, anon_bytes=90, memory_max_bytes=100)
+    assert _maintenance_health(tmp_path, frozen_clock, _RAN_AT)["status"] == "ok"
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        {"anon_bytes": 10**12, "memory_max_bytes": None},
+        {"anon_bytes": None, "memory_max_bytes": 100},
+    ],
+)
+def test_health_qdrant_memory_with_an_unknown_figure_is_not_degraded(
+    tmp_path: Path, frozen_clock: FrozenClock, unit: dict[str, int | None]
+) -> None:
+    _write_maintenance(tmp_path, ran_at=_RAN_AT, **unit)
+    assert _maintenance_health(tmp_path, frozen_clock, _RAN_AT)["status"] == "ok"
+
+
+def test_health_maintenance_causes_add_to_the_existing_reasons(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    _write_maintenance(tmp_path, ran_at=_RAN_AT, anon_bytes=99, memory_max_bytes=100)
+    served, client, config = served_over(tmp_path, _articles(), clock=frozen_clock.monotonic)
+    health = ServiceHealth(
+        config,
+        served,
+        client,
+        state_reader=FakeStateStore(FakeState(phase="failed", error="x")).read,
+        clock=_Clock(_RAN_AT),
+    )
+    report = health()
+    served.close()
+    assert report["reasons"][0] == "the last build failed"
+    assert len(report["reasons"]) == 2
+
+
+def _hold_semantic(tmp_path: Path, held: str | None) -> None:
+    """Set (or clear) `held` on the semantic collection of the record already written."""
+    path = tmp_path / "data" / "state" / "maintenance.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    for collection in record["collections"]:
+        if collection["alias"] == "wikipedia_semantic":
+            collection["held"] = held
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+
+def test_health_a_held_collection_is_degraded_with_its_name_and_reason(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    _write_maintenance(tmp_path, ran_at=_RAN_AT)
+    _hold_semantic(tmp_path, "Qdrant holds 95% of its memory cap")
+    report = _maintenance_health(tmp_path, frozen_clock, _RAN_AT)
+    assert report["status"] == "degraded"
+    assert report["reasons"] == [
+        "wikipedia_semantic_20261001 is held by the maintenance job: "
+        "Qdrant holds 95% of its memory cap"
+    ]
+
+
+def test_health_a_hold_is_logged_once_and_again_when_it_lifts(
+    tmp_path: Path, frozen_clock: FrozenClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write_maintenance(tmp_path, ran_at=_RAN_AT)
+    _hold_semantic(tmp_path, "waiting")
+    health, served = _stale_health(tmp_path, frozen_clock, _Clock(_RAN_AT))
+    with caplog.at_level(logging.INFO, logger="wiki_mirror.api"):
+        statuses = [health()["status"] for _ in range(2)]
+        _hold_semantic(tmp_path, None)
+        statuses.append(health()["status"])
+    served.close()
+    assert statuses == ["degraded", "degraded", "ok"]
+    assert caplog.text.count("is held by the maintenance job") == 1
+    assert caplog.text.count("cause of degraded has cleared") == 1
+
+
+def test_health_an_unreadable_qdrant_unit_is_degraded_with_its_reason(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    _write_maintenance(
+        tmp_path,
+        ran_at=_RAN_AT,
+        found=None,
+        active=False,
+        restarts=None,
+        started_at=None,
+        last_crash_at=None,
+        anon_bytes=None,
+        memory_max_bytes=None,
+    )
+    report = _maintenance_health(tmp_path, frozen_clock, _RAN_AT)
+    assert report["status"] == "degraded"
+    assert report["reasons"] == [
+        "the maintenance job could not read Qdrant's unit, so crashes and memory are not watched"
+    ]
+
+
+def test_health_a_unit_systemd_says_is_not_installed_is_degraded_with_its_own_reason(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    _write_maintenance(tmp_path, ran_at=_RAN_AT, found=False, last_crash_at=None)
+    report = _maintenance_health(tmp_path, frozen_clock, _RAN_AT)
+    assert report["status"] == "degraded"
+    assert report["reasons"] == [
+        "Qdrant's unit is not installed, so the maintenance job does not watch crashes and memory"
+    ]
+
+
+def test_health_failed_passage_count_logs_the_type_once_and_the_recovery_once(
+    tmp_path: Path, frozen_clock: FrozenClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    served, real, config = served_over(tmp_path, _articles(), clock=frozen_clock.monotonic)
+    failing = [True]
+
+    class Flaky:
+        def count(self, **kwargs: Any) -> Any:
+            if failing[0]:
+                raise ConnectionError("SECRET-HOST refused")
+            return real.count(**kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real, name)
+
+    health = ServiceHealth(
+        config,
+        served,
+        Flaky(),  # type: ignore[arg-type]
+        state_reader=FakeStateStore(FakeState(phase="serving")).read,
+        clock=_now,
+    )
+    with caplog.at_level(logging.INFO, logger="wiki_mirror.api"):
+        down = [health() for _ in range(3)]
+        failing[0] = False
+        up = health()
+    served.close()
+    assert all(report["reasons"] == ["Qdrant could not be asked"] for report in down)
+    assert up["status"] == "ok"
+    assert caplog.text.count("could not be asked (ConnectionError)") == 1
+    assert caplog.text.count("Qdrant can be asked again") == 1
+    assert "Traceback" not in caplog.text
+    assert "SECRET-HOST" not in caplog.text
+
+
+def test_health_a_second_poll_during_the_first_ones_bookkeeping_waits_and_logs_nothing_twice(
+    tmp_path: Path, frozen_clock: FrozenClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Deterministic: events hold the first poll inside its "cause raised" log line, with the
+    # health lock taken, while the second poll starts. The second must wait for the lock and then
+    # find the cause already raised, so the log line appears once and neither poll fails.
+    _write_maintenance(tmp_path, ran_at=_RAN_AT)
+    _hold_semantic(tmp_path, "waiting")
+    health, served = _stale_health(tmp_path, frozen_clock, _Clock(_RAN_AT))
+    entered = threading.Event()
+    release = threading.Event()
+    api_logger = logging.getLogger("wiki_mirror.api")
+    real_warning = api_logger.warning
+
+    def slow_warning(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        release.wait(timeout=10)
+        real_warning(*args, **kwargs)
+
+    results: list[str] = []
+    with caplog.at_level(logging.INFO, logger="wiki_mirror.api"):
+        api_logger.warning = slow_warning  # type: ignore[method-assign]
+        try:
+            first = threading.Thread(target=lambda: results.append(health()["status"]))
+            first.start()
+            assert entered.wait(timeout=10)
+            second = threading.Thread(target=lambda: results.append(health()["status"]))
+            second.start()
+            release.set()
+            first.join(timeout=10)
+            second.join(timeout=10)
+        finally:
+            del api_logger.warning
+    served.close()
+    assert results == ["degraded", "degraded"]
+    assert caplog.text.count("is held by the maintenance job") == 1
+
+
+def test_health_semantic_lookup_is_skipped_when_qdrant_already_failed_the_count(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    served, real, config = served_over(tmp_path, _articles(), clock=frozen_clock.monotonic)
+    asked: list[str] = []
+
+    class CannotCount:
+        def count(self, **_: Any) -> Any:
+            raise ConnectionError
+
+        def get_aliases(self) -> Any:
+            asked.append("get_aliases")
+            return real.get_aliases()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real, name)
+
+    health = ServiceHealth(
+        config,
+        served,
+        CannotCount(),  # type: ignore[arg-type]
+        state_reader=FakeStateStore(FakeState(phase="serving")).read,
+        clock=_now,
+    )
+    report = health()
+    served.close()
+    assert report["semantic"] is None
+    assert asked == []
+
+
+def test_health_semantic_failure_log_names_only_the_exception_type_and_is_paired(
+    tmp_path: Path, frozen_clock: FrozenClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    served, real, config = served_over(tmp_path, _articles(), clock=frozen_clock.monotonic)
+    stub = _SemanticQdrant(real)
+    health = ServiceHealth(
+        config,
+        served,
+        stub,  # type: ignore[arg-type]
+        state_reader=FakeStateStore(FakeState(phase="serving")).read,
+        clock=_now,
+    )
+    with caplog.at_level(logging.INFO, logger="wiki_mirror.api"):
+        stub.error = UnexpectedResponse(500, "SECRET-BODY", b"SECRET-BODY", None)  # type: ignore[arg-type]
+        for _ in range(3):
+            health()
+        stub.error = None
+        health()
+    served.close()
+    assert caplog.text.count("could not be asked (UnexpectedResponse)") == 1
+    assert caplog.text.count("can be asked again") == 1
+    assert "SECRET-BODY" not in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_health_a_maintenance_cause_is_logged_once_and_again_when_it_clears(
+    tmp_path: Path, frozen_clock: FrozenClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write_maintenance(tmp_path, ran_at=_RAN_AT)
+    clock = _Clock(_RAN_AT + timedelta(minutes=MAINTENANCE_STALE_MINUTES + 5))
+    health, served = _stale_health(tmp_path, frozen_clock, clock)
+    with caplog.at_level(logging.INFO, logger="wiki_mirror.api"):
+        statuses = [health()["status"] for _ in range(3)]
+        _write_maintenance(tmp_path, ran_at=clock.now)  # the job ran again
+        statuses.append(health()["status"])
+    served.close()
+    assert statuses == ["degraded", "degraded", "degraded", "ok"]
+    assert caplog.text.count("maintenance job last ran at") == 1
+    assert caplog.text.count("maintenance cause of degraded has cleared") == 1
+
+
+def test_health_a_stale_maintenance_record_does_not_hide_a_build_in_progress(
+    tmp_path: Path, frozen_clock: FrozenClock
+) -> None:
+    _write_maintenance(tmp_path, ran_at=_RAN_AT)
+    config = make_config(tmp_path)
+    qdrant = memory_client()
+    served = ServedSnapshot(config, qdrant, clock=frozen_clock.monotonic)
+    health = ServiceHealth(
+        config,
+        served,
+        qdrant,
+        state_reader=FakeStateStore(FakeState(phase="downloading")).read,
+        clock=_Clock(_RAN_AT + timedelta(days=2)),
+    )
+    report = health()
+    served.close()
+    assert (report["status"], report["reasons"]) == ("building", [])
 
 
 # -- only HTTP is served ---------------------------------------------------------------------
