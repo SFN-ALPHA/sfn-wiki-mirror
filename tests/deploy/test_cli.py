@@ -10,8 +10,11 @@ through a symlink in a separate `bin/`, and each verb is asked which stub it rea
 stubbed, since the command checks for root with `id -u`. `status` is run over stubbed `curl`
 (the health reply), `systemctl` and `nft` (real `nft list counters` output from
 `tests/fixtures/deploy/`), with the real interpreter standing in for the virtualenv's, and its
-output is read: the semantic index, the maintenance record, the schedule and the firewall counters.
-The only wall clock is the child process's own, in "minutes ago".
+output is read: the semantic index, the maintenance record, the schedule and the firewall counters,
+and the warning when the installed ruleset differs from the one the checkout renders (a stubbed
+`install.sh --show-firewall`). `search` is qualified over a recording `curl`: the mode, the limit,
+the `--` that ends the options, and a service error's reason. The only wall clock is the child
+process's own, in "minutes ago".
 
 See deploy/README.md and docs/OPERATIONS.md ("The `wiki-mirror` commands").
 """
@@ -55,13 +58,19 @@ class Installed:
         """The symlink standing in for /usr/local/bin/wiki-mirror."""
         return self.root / "bin" / "wiki-mirror"
 
-    def run(self, *args: str, uid: str = "0") -> subprocess.CompletedProcess[str]:
-        """Run the command through its symlink as user `uid` (what the stub `id -u` says)."""
+    def run(
+        self, *args: str, uid: str = "0", env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the command through its symlink as user `uid` (what the stub `id -u` says).
+
+        `env` adds environment variables, for example the installed firewall's path.
+        """
         environment = {
             **os.environ,
             "PATH": f"{self.root / 'stubs'}:{os.environ['PATH']}",
             "CONF_DIR": str(self.root / "conf"),
             "STUB_UID": uid,
+            **(env or {}),
         }
         environment.pop("APP_DIR", None)
         assert BASH is not None
@@ -608,6 +617,75 @@ def test_cli_status_firewall_shows_exactly_the_four_counters_with_their_packets(
     ]
 
 
+_DRIFT_WARNING = "the installed firewall differs from this checkout's - run `"
+
+
+def _firewall_box(
+    installed: Installed, *, rendered: str | None, on_disk: str | None
+) -> dict[str, str]:
+    """Stub the installer's `--show-firewall` and the installed ruleset; return the env to use.
+
+    Args:
+        installed: The scratch box (already given its status stubs).
+        rendered: What `install.sh --show-firewall` prints for the checkout; None makes it fail
+            as it does when the site file is missing or invalid.
+        on_disk: The installed ruleset's content; None leaves no such file.
+    """
+    script = (
+        '#!/bin/sh\necho "no site file" >&2\nexit 1\n'
+        if rendered is None
+        else f'#!/bin/sh\ntest "$1" = --show-firewall || exit 2\nprintf %s "{rendered}"\n'
+    )
+    _executable(installed.app / "deploy" / "install.sh", script)
+    nft_file = installed.root / "installed.nft"
+    if on_disk is not None:
+        nft_file.write_text(on_disk, encoding="utf-8")
+    return {"NFT_INSTALLED": str(nft_file)}
+
+
+def _status_with_firewall(
+    installed: Installed, *, rendered: str | None, on_disk: str | None
+) -> subprocess.CompletedProcess[str]:
+    """Run `status` over a box whose checkout renders `rendered` and has `on_disk` installed."""
+    _status_box(installed, _health_body())
+    env = _firewall_box(installed, rendered=rendered, on_disk=on_disk)
+    return installed.run("status", env=env)
+
+
+def test_cli_status_warns_when_the_installed_firewall_differs_from_the_checkouts(
+    installed: Installed,
+) -> None:
+    result = _status_with_firewall(installed, rendered="new rules", on_disk="old rules")
+    assert result.returncode == 0, result.stderr
+    install_sh = installed.app / "deploy" / "install.sh"
+    assert f"{_DRIFT_WARNING}{install_sh}` to apply it" in result.stdout
+
+
+def test_cli_status_warns_when_no_firewall_is_installed_at_all(installed: Installed) -> None:
+    result = _status_with_firewall(installed, rendered="new rules", on_disk=None)
+    assert _DRIFT_WARNING in result.stdout
+
+
+def test_cli_status_is_quiet_when_the_installed_firewall_is_the_checkouts(
+    installed: Installed,
+) -> None:
+    result = _status_with_firewall(installed, rendered="same rules", on_disk="same rules")
+    assert result.returncode == 0, result.stderr
+    assert "differs" not in result.stdout
+
+
+def test_cli_status_says_nothing_of_the_firewall_when_it_cannot_be_rendered(
+    installed: Installed,
+) -> None:
+    # update.sh and the installer already report an unrenderable site file; status must not fail
+    # or add a line to the counters because of it.
+    result = _status_with_firewall(installed, rendered=None, on_disk="old rules")
+    assert result.returncode == 0, result.stderr
+    assert "differs" not in result.stdout
+    assert "no site file" not in result.stdout + result.stderr
+    assert "service_refused" in result.stdout
+
+
 def test_cli_status_keeps_the_key_out_of_the_curl_arguments(installed: Installed) -> None:
     _status(installed, _health_body())
     arguments = (installed.root / "stubs" / "curl.args").read_text(encoding="utf-8")
@@ -731,7 +809,36 @@ def test_cli_search_an_unknown_option_is_a_usage_error(installed: Installed) -> 
     result = installed.run("search", "einstein", "--semantic")
     assert result.returncode == 1
     assert "unknown option '--semantic'" in result.stderr
+    assert "put it after a lone --" in result.stderr
     assert "usage: wiki-mirror search" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (("--", "--weird query"), {"query": "--weird query", "limit": 5}),
+        (("--", "--weird query", "3"), {"query": "--weird query", "limit": 3}),
+        (("--mode", "hybrid", "--", "--mode"), {"query": "--mode", "limit": 5, "mode": "hybrid"}),
+    ],
+    ids=["query", "query-and-limit", "mode-before-the-terminator"],
+)
+def test_cli_search_double_dash_ends_the_options_so_a_query_may_start_with_dashes(
+    installed: Installed, args: tuple[str, ...], expected: dict[str, object]
+) -> None:
+    _search_box(installed, _search_reply("lexical", _hit(1.0)))
+    result = installed.run("search", *args)
+    assert result.returncode == 0, result.stderr
+    assert _sent(installed) == expected
+
+
+def test_cli_search_double_dash_with_nothing_after_it_is_a_usage_error(
+    installed: Installed,
+) -> None:
+    _search_box(installed, _search_reply("lexical"))
+    result = installed.run("search", "--")
+    assert result.returncode == 1
+    assert "usage: wiki-mirror search" in result.stderr
+    assert not (installed.root / "stubs" / "curl.args").exists()
 
 
 @pytest.mark.parametrize("args", [(), ("",), ("a", "5", "extra"), ("a", "many")])

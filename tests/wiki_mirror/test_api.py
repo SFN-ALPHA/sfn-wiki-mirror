@@ -10,7 +10,10 @@ start, ignored at runtime), the alias moving or its store being unusable, and ev
 The search modes: an unknown mode (422), and `semantic` or `hybrid` with no usable semantic index,
 after the monthly build, with the embedding server failing, timing out or refusing the key (503
 semantic_unavailable, never keyword results, never the key or the query), and health's
-`search_modes` and `searchable_reason`.
+`search_modes` and `searchable_reason`. One test drives the route through every embedding failure
+that logs (busy, rejected, bad_reply, unreachable, breaker_open), with the key and the question in
+the fake server's own error text and every logger at DEBUG, and finds neither in a log line or a
+reply.
 
 See docs/DESIGN.md section 6.
 """
@@ -576,6 +579,86 @@ def test_api_search_refused_embedding_key_is_503_without_the_key_or_the_query(
     assert response.json()["error"] == "semantic_unavailable"
     assert key not in response.text
     assert "private" not in response.text
+
+
+def test_api_search_embedding_failures_log_neither_the_key_nor_the_query(
+    tmp_path: Path, frozen_clock: FrozenClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    key = "sk-sentinel-0123456789abcdef"
+    question = "my private question"
+    # Every failure the fake server produces carries both in its own text, so a path that echoed
+    # an exception or a body into a log line or a reply would show them.
+    secret = f"{key} {question}"
+    server = FakeEmbeddingServer()
+    answering = server.transport
+    gate, blocking, arrived = threading.Event(), threading.Event(), threading.Semaphore(0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if blocking.is_set():
+            arrived.release()
+            assert gate.wait(5), "the test never opened the gate"
+        return answering.handle_request(request)  # type: ignore[return-value]
+
+    server.transport = httpx.MockTransport(handler)
+    served, qdrant, settings = served_over(
+        tmp_path,
+        _articles(),
+        clock=frozen_clock.monotonic,
+        semantic=server,
+        environ={"EMBEDDING_API_KEY": key},
+    )
+    health = ServiceHealth(settings, served, qdrant, state_reader=FakeStateStore().read, clock=_now)
+    app = create_app(settings, served, health)
+    replies: list[httpx.Response] = []
+
+    def ask() -> httpx.Response:
+        reply = _search(TestClient(app), query=question, mode="hybrid")
+        replies.append(reply)
+        return reply
+
+    try:
+        # A lexical search first: the holder's first look pairs the semantic index and builds the
+        # embedder, which turns the `httpx` logger down to WARNING.
+        _search(TestClient(app), query=question)
+        with (
+            caplog.at_level(logging.DEBUG),
+            caplog.at_level(logging.DEBUG, logger="httpx"),
+            caplog.at_level(logging.DEBUG, logger="httpcore"),
+        ):
+            # busy: four searches held inside the embedding server, a fifth turned away.
+            blocking.set()
+            held = [threading.Thread(target=ask) for _ in range(4)]
+            for thread in held:
+                thread.start()
+            try:
+                for _ in held:
+                    assert arrived.acquire(timeout=5)
+                busy = ask()
+            finally:
+                blocking.clear()
+                gate.set()
+                for thread in held:
+                    thread.join(5)
+            server.reply = httpx.Response(401, text=secret)
+            rejected = ask()
+            server.reply = httpx.Response(200, text=secret)
+            bad_reply = ask()
+            server.reply = httpx.ConnectError(f"refused: {secret}")
+            unreachable = [ask() for _ in range(3)]
+            breaker_open = ask()
+    finally:
+        served.close()
+    for reply in (busy, rejected, bad_reply, *unreachable, breaker_open):
+        assert reply.status_code == 503
+        assert reply.json()["error"] == "semantic_unavailable"
+    assert "busy with other searches" in busy.json()["detail"]
+    assert breaker_open.json()["detail"].startswith("the embedding server failed 3 times")
+    # Each failure path logged its kind, so the checks below saw log lines from every one.
+    for kind in ("busy", "rejected", "bad_reply", "unreachable", "breaker_open"):
+        assert f"kind={kind}" in caplog.text
+    assert key not in caplog.text
+    assert question not in caplog.text
+    assert not any(key in reply.text or question in reply.text for reply in replies)
 
 
 @pytest.mark.parametrize("mode", ["semantic", "hybrid"])

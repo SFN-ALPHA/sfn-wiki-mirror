@@ -200,7 +200,7 @@ class MirrorConfig(BaseModel):
     @field_validator("embedding_headers", "query_embedding_headers")
     @classmethod
     def _embedding_headers_are_safe(cls, value: dict[str, str]) -> dict[str, str]:
-        """Refuse credentials, a name that is not an HTTP token, and control characters in a value.
+        """Refuse credentials, a name that is not an HTTP token, and a value that is not ASCII text.
 
         The messages never repeat a value (a header value can be a secret).
         """
@@ -211,8 +211,11 @@ class MirrorConfig(BaseModel):
             if name.casefold() in _CREDENTIAL_HEADERS:
                 msg = "must not set credentials; the key is EMBEDDING_API_KEY in the environment"
                 raise ValueError(msg)
-            if any(ord(char) < 0x20 or ord(char) == 0x7F for char in text):
-                msg = "header values must not hold control characters"
+            # Printable ASCII only: httpx encodes a header value as ASCII and raises
+            # UnicodeEncodeError on every request otherwise (a startup failure beats a search
+            # that can never be sent). This also refuses control characters and DEL.
+            if not (text.isascii() and text.isprintable()):
+                msg = "header values must be printable ASCII (no control or non-ASCII characters)"
                 raise ValueError(msg)
         return value
 

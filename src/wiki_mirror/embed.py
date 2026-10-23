@@ -583,15 +583,24 @@ def checked_vectors(vectors: object, count: int, dimensions: int) -> list[list[f
             msg = f"the embedding server returned a vector that is not {dimensions} numbers long"
             raise EmbedError(msg)
         numbers: list[float] = []
-        for number in vector:
-            if (
-                isinstance(number, bool)
-                or not isinstance(number, int | float)
-                or not math.isfinite(number)
-            ):
-                msg = "the embedding server returned a vector with a non-finite or other non-number"
+        for position, number in enumerate(vector):
+            try:
+                if isinstance(number, bool) or not isinstance(number, int | float):
+                    # A string would convert too; a bool is a number to Python, not to JSON.
+                    raise TypeError
+                # Converted before the finiteness check: a JSON integer of 400 digits is a valid
+                # Python int that `math.isfinite` cannot take (OverflowError), and one too big
+                # for a float is as bad as infinity.
+                value = float(number)
+            except (OverflowError, TypeError):
+                value = math.nan
+            if not math.isfinite(value):
+                msg = (
+                    "the embedding server returned a vector with a non-finite or other "
+                    f"non-number at position {position}"
+                )
                 raise EmbedError(msg)
-            numbers.append(float(number))
+            numbers.append(value)
         checked.append(numbers)
     return checked
 

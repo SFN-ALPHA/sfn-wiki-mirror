@@ -70,9 +70,12 @@ ranking alone and still says `hybrid`.
 `503 semantic_unavailable` with a plain reason in `detail`, when any of these holds: there is no semantic index; its
 embedding run is not complete; it was cut by another chunker than the running code's; it is of another snapshot than
 the articles being served (the month after a build, until the semantic catch-up, [ROADMAP.md](ROADMAP.md): its
-snippets would be cut from the wrong text); `embedding_url` is not set; or the embedding server did not answer the
-question (not reachable, timed out after 15 seconds, refused the API's key, answered another status, or answered
-something that is not one valid vector). `lexical` keeps working through all of these. Health says which modes are
+snippets would be cut from the wrong text); `embedding_url` is not set; the API's `EMBEDDING_API_KEY` is not printable
+ASCII; or the embedding server did not answer the question (not reachable, no connection within 3 seconds, no answer
+within 15 seconds, refused the API's key, answered another status, or answered something that is not one valid vector).
+At most four questions are embedded at once, so a fifth is refused at once ("busy with other searches; try again"), and
+after three searches in a row that timed out or could not reach the server, semantic and hybrid searches pause for 30
+seconds ("failed 3 times in a row") and then try one. `lexical` keeps working through all of these. Health says which modes are
 usable now (`search_modes`).
 
 Ranking:
@@ -389,7 +392,7 @@ would print query strings):
 | Event | Fields |
 |---|---|
 | Search | request id, client name, `mode`, `query_chars` (length only), result count |
-| Search that cannot be served (`semantic_unavailable`) | request id, client name, `mode`, the failure's kind (`unpaired`, `timeout`, `unreachable`, `rejected`, `status`, `bad_reply`) and its plain reason; never the query |
+| Search that cannot be served (`semantic_unavailable`) | request id, client name, `mode`, the failure's kind (`unpaired`, `not_configured`, `busy`, `breaker_open`, `timeout`, `unreachable`, `rejected`, `status`, `bad_reply`) and its plain reason; never the query |
 | Article read | request id, client name, page id, offset |
 | MCP tool call | tool name, client name, request id, `query_chars` or page id, result count |
 | Unauthorized | request id only |

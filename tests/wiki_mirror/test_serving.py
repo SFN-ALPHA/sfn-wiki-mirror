@@ -11,8 +11,10 @@ swapped out (its store must stay open until the request ends), and a swap racing
 The semantic index is paired with the served store in the same looks: real `run_embed` output
 (collection, alias, state file) over the same snapshot, and a fake embedding server. Named here:
 no semantic alias, an unreadable or incomplete state, an index of another snapshot (the month
-after a build, until the catch-up), one cut by another chunker, no `embedding_url`, Qdrant not
-answering, and that pairing never calls the embedding server and never logs the key.
+after a build, until the catch-up), one cut by another chunker, no `embedding_url`, a key that is
+not ASCII, Qdrant not answering (logged once per kind of fault, by the exception's type name
+alone), and that pairing never calls the embedding server. That the key and the question reach no
+log line is qualified on the API route, in `test_api.py`, where the logging failure paths run.
 
 The served pair is (collection, applied snapshot) (docs/DESIGN.md section 12.3): a recheck that
 finds the same alias target but a different `applied_snapshot` in the index state must swap the
@@ -26,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -709,9 +711,14 @@ _KEY = "sk-sentinel-0123456789abcdef"
 
 
 def _semantic_holder(
-    tmp_path: Path, clock: FrozenClock, **settings: object
+    tmp_path: Path,
+    clock: FrozenClock,
+    environ: Mapping[str, str] | None = None,
+    **settings: object,
 ) -> tuple[ServedSnapshot, QdrantClient, MirrorConfig, FakeEmbeddingServer]:
     """A holder that embeds questions through a fake server; `settings` override the config.
+
+    `environ` is the holder's process environment; the default holds the sentinel key `_KEY`.
 
     The semantic index is built by `_semantic_built` with the default settings; a holder with
     other settings (no `embedding_url`, another `embedding_model`) reads the same data directory.
@@ -725,7 +732,7 @@ def _semantic_holder(
         config,
         client,
         clock=clock.monotonic,
-        environ={"EMBEDDING_API_KEY": _KEY},
+        environ={"EMBEDDING_API_KEY": _KEY} if environ is None else environ,
         embed_transport=server.transport,
     )
     _OPEN_HOLDERS.append(served)
@@ -949,19 +956,81 @@ def test_an_unchanged_semantic_verdict_is_logged_once_not_on_every_look(
     assert len(paired) == 1
 
 
-def test_the_embedding_key_is_in_no_log_line(
+def test_a_key_that_is_not_ascii_leaves_lexical_only_and_the_reason_names_the_variable(
     tmp_path: Path, frozen_clock: FrozenClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    bad_key = "kéy-0123456789"
+    served, client, config, server = _semantic_holder(
+        tmp_path, frozen_clock, {"EMBEDDING_API_KEY": bad_key}
+    )
+    _semantic_built(config, client, "october")
+    with caplog.at_level(logging.INFO, logger="wiki_mirror.serving"):
+        modes, reason = _modes_and_reason(served)
+    assert modes == ("lexical",)
+    assert reason is not None
+    assert "EMBEDDING_API_KEY" in reason
+    assert "not printable ASCII" in reason
+    assert bad_key not in reason
+    assert bad_key not in caplog.text
+    assert server.requests == []
+
+
+def test_semantic_look_failing_is_logged_once_by_exception_type_and_never_its_text(
+    tmp_path: Path,
+    frozen_clock: FrozenClock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
     _semantic_built(config, client, "october")
-    with caplog.at_level(logging.DEBUG):
-        with served.lease() as current:
-            assert current is not None
-            current.search.search("mercury planet", 5, "semantic")
-        _rewrite_semantic_state(config, complete=False)
+    assert _modes_and_reason(served)[0] == _ALL_MODES
+    real = client.get_aliases
+
+    def failing(error: Exception) -> Callable[[], object]:
+        def down() -> object:
+            raise error
+
+        return down
+
+    with caplog.at_level(logging.WARNING, logger="wiki_mirror.serving"):
+        monkeypatch.setattr(client, "get_aliases", failing(ConnectionError("down at SECRET-HOST")))
+        for _ in range(3):
+            frozen_clock.advance(ALIAS_RECHECK_SECONDS + 1)
+            _modes_and_reason(served)
+        monkeypatch.setattr(client, "get_aliases", real)
         frozen_clock.advance(ALIAS_RECHECK_SECONDS + 1)
         _modes_and_reason(served)
-    assert _KEY not in caplog.text
+        monkeypatch.setattr(client, "get_aliases", failing(TimeoutError("slow at SECRET-HOST")))
+        frozen_clock.advance(ALIAS_RECHECK_SECONDS + 1)
+        _modes_and_reason(served)
+    judged = [r.getMessage() for r in caplog.records if "could not be judged" in r.getMessage()]
+    assert judged == [
+        "the semantic index could not be judged (ConnectionError); the earlier verdict stands",
+        "the semantic index could not be judged (TimeoutError); the earlier verdict stands",
+    ]  # the exception texts (which name a host) are in neither message
+
+
+def test_semantic_look_failing_with_no_verdict_yet_says_semantic_is_unavailable(
+    tmp_path: Path,
+    frozen_clock: FrozenClock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    served, client, config, _ = _semantic_holder(tmp_path, frozen_clock)
+    _semantic_built(config, client, "october")
+
+    def down() -> object:
+        raise ConnectionError("down")
+
+    # The lexical alias is answered by a stand-in, so a snapshot is served while the semantic
+    # alias cannot be read.
+    monkeypatch.setattr(serving, "aliased_collection", lambda _: "wikipedia_lexical_20261001")
+    monkeypatch.setattr(client, "get_aliases", down)
+    with caplog.at_level(logging.WARNING, logger="wiki_mirror.serving"):
+        _modes_and_reason(served)
+    assert "could not be judged (ConnectionError); semantic and hybrid search are unavailable" in (
+        caplog.text
+    )
 
 
 # -- threads ----------------------------------------------------------------------------------

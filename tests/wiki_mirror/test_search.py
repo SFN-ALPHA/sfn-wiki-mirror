@@ -24,6 +24,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from qdrant_client import models
 
 from tests.fixtures.wiki_mirror_fakes import (
     EMBEDDING_URL,
@@ -504,6 +505,29 @@ def test_search_semantic_embeds_the_question_as_plain_text(tmp_path: Path) -> No
     (request,) = server.requests
     assert request.url.path == "/api/embed"
     assert b'"input":["airship"]' in request.content.replace(b" ", b"")
+
+
+@pytest.mark.contract
+def test_search_dense_query_sends_quantization_params_and_the_keyword_query_sends_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    search, _ = _paired(tmp_path, _corpus())
+    client = search._client
+    calls: list[dict[str, object]] = []
+    real = client.query_points
+
+    def spy(*args: object, **kwargs: object) -> object:
+        calls.append(kwargs)
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(client, "query_points", spy)
+    search.search("airship", 5, "hybrid")
+    (sparse,) = [c for c in calls if c["using"] is not None]
+    (dense,) = [c for c in calls if c["using"] is None]
+    assert sparse["search_params"] is None
+    params = dense["search_params"]
+    assert isinstance(params, models.SearchParams)
+    assert params.quantization == models.QuantizationSearchParams(rescore=True, oversampling=1.0)
 
 
 @pytest.mark.contract

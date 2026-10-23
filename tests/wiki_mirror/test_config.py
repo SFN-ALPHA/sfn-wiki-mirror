@@ -163,6 +163,18 @@ def test_load_config_embedding_headers_that_are_not_valid_http_are_refused(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("field", ["embedding_headers", "query_embedding_headers"])
+def test_load_config_embedding_headers_with_a_non_ascii_value_are_refused_without_echoing_it(
+    tmp_path: Path, field: str
+) -> None:
+    # httpx cannot encode such a value, so every request would fail; refuse it at startup.
+    with pytest.raises(MirrorConfigError, match=field) as raised:
+        _load(tmp_path, f'{field}: {{"X-Priority": "caf\\u00e9"}}\n')
+    assert "printable ASCII" in str(raised.value)
+    assert "caf" not in str(raised.value)
+
+
+@pytest.mark.unit
 def test_load_config_query_embedding_headers_default_to_none_and_are_separate(
     tmp_path: Path,
 ) -> None:

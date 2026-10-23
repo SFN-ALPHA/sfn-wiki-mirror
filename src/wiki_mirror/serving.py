@@ -51,7 +51,8 @@ Non-obvious constraints:
   `wikipedia_semantic` alias and gives the served `WikiSearch` either a `SemanticBinding` or a
   plain reason why not. The semantic index is usable only when all of these hold: the alias
   exists; its state file is readable and `complete`; its `applied_snapshot` is the served
-  store's; it was cut by this code's chunker; and `embedding_url` is set. Otherwise `semantic`
+  store's; it was cut by this code's chunker; `embedding_url` is set; and the API's
+  `EMBEDDING_API_KEY`, if any, is printable ASCII (`query_embed.key_problem`). Otherwise `semantic`
   and `hybrid` searches answer 503 `semantic_unavailable` with that reason, never keyword
   results. This matters at the monthly build: the lexical index moves to the new snapshot at
   once and the semantic one stays on the old until the catch-up (docs/ROADMAP.md), and a
@@ -86,14 +87,14 @@ from qdrant_client import QdrantClient
 
 from wiki_mirror.config import MirrorConfig
 from wiki_mirror.embed import ALIAS as SEMANTIC_ALIAS
-from wiki_mirror.embed import semantic_index_info
+from wiki_mirror.embed import EMBEDDING_API_KEY_ENV, semantic_index_info
 from wiki_mirror.index import (
     aliased_collection,
     applied_snapshot,
     chunker_fingerprint,
     indexed_chunker,
 )
-from wiki_mirror.query_embed import QueryEmbedder
+from wiki_mirror.query_embed import QueryEmbedder, key_problem
 from wiki_mirror.search import SemanticBinding, WikiSearch
 from wiki_mirror.store import ArticleStore, StoreError
 
@@ -222,6 +223,9 @@ class ServedSnapshot:
         # The last semantic verdict and the snapshot it was given for: a pairing, or the reason
         # there is none. Touched only under the refresh lock, so it needs no other.
         self._semantic_verdict: tuple[Serving, _SemanticPairing | str] | None = None
+        # The type name of the exception the last failed semantic look logged, so the same fault
+        # is logged once and not on every look; None after a look that succeeded.
+        self._semantic_fault: str | None = None
         self._closed = False
         # Negative infinity: the first request always looks.
         self._next_check = float("-inf")
@@ -406,16 +410,31 @@ class ServedSnapshot:
             return
         try:
             verdict = self._semantic_for(current)
-        except Exception:
+        except Exception as exc:
             # Deliberately broad, as for the lexical alias: the Qdrant client raises its own
-            # family of errors for a server that is down, restarting or refusing. Not logged
-            # here: the lexical look, which asks Qdrant the same kind of question just before,
-            # logs a failure once (`_note_problem`). An earlier verdict for this snapshot stands,
-            # so a hiccup does not switch semantic search off for half a minute; with none, the
-            # reason says why.
+            # family of errors for a server that is down, restarting or refusing. Logged here
+            # too, because the lexical look only logs a failure when Qdrant is the cause, and
+            # this one can also be an unreadable state file or a bug. Only the exception's type
+            # name is kept, never its text (which can carry a path or a URL), and only when it
+            # differs from the last one logged, so a half-minute look does not repeat itself.
+            # An earlier verdict for this snapshot stands, so a hiccup does not switch semantic
+            # search off for half a minute; with none, the reason says why.
+            fault = type(exc).__name__
+            if fault != self._semantic_fault:
+                self._semantic_fault = fault
+                logger.warning(
+                    "the semantic index could not be judged (%s); %s",
+                    fault,
+                    "the earlier verdict stands"
+                    if self._semantic_verdict is not None and self._semantic_verdict[0] is current
+                    else "semantic and hybrid search are unavailable",
+                    extra={"component": "serving", "event": "semantic_check_failed"},
+                )
             if self._semantic_verdict is not None and self._semantic_verdict[0] is current:
                 return
             verdict = _SEMANTIC_QDRANT_DOWN
+        else:
+            self._semantic_fault = None
         if self._semantic_verdict == (current, verdict):
             return
         self._semantic_verdict = (current, verdict)
@@ -484,6 +503,11 @@ class ServedSnapshot:
             )
         if self._config.embedding_url is None:
             return "the embedding server is not configured (embedding_url in mirror.yaml)"
+        # The same trimmed value `QueryEmbedder.from_config` reads. A key httpx cannot send would
+        # fail every question, so say so in health instead of pairing a binding that cannot work.
+        key_sentence = key_problem(self._environ.get(EMBEDDING_API_KEY_ENV, "").strip())
+        if key_sentence is not None:
+            return key_sentence
         return _SemanticPairing(name, info.model, info.dimensions)
 
     def _swap_in(self, new: Serving) -> None:

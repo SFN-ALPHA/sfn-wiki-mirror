@@ -480,7 +480,8 @@ unchanged), `semantic` or `hybrid`. Decided by the maintainer.
 6. **The semantic index is paired with the served store, and is usable only for the same snapshot.** `serving`
    follows the `wikipedia_semantic` alias on the lexical alias's cadence (`ALIAS_RECHECK_SECONDS`) and accepts it only
    when: the alias exists; its state is readable and `complete`; its `applied_snapshot` equals the served lexical
-   store's; it was cut by this code's chunker; and `embedding_url` is set. Otherwise `semantic` and `hybrid` are
+   store's; it was cut by this code's chunker; `embedding_url` is set; and `EMBEDDING_API_KEY`, if there is one, is
+   printable ASCII (a header cannot carry anything else). Otherwise `semantic` and `hybrid` are
    unavailable with one plain reason, and health reports it (`search_modes`, and `semantic.searchable_reason`). The
    pairing reads local state and Qdrant only, never the embedding server. An unpaired semantic index does not make
    health `degraded`: nothing depends on it by default.
@@ -552,3 +553,24 @@ unchanged), `semantic` or `hybrid`. Decided by the maintainer.
   `hybrid` are unavailable. The gap is the catch-up's to close; hybrid cannot become the default before it does.
 * **Accepted:** a semantic request that is paired at the moment of a snapshot swap may see the unpaired reason once,
   for the few milliseconds between the swap and the next pairing look.
+* **A bound and a breaker keep a stalled embedding server from starving the API (review of 2026-10-23).** The routes
+  run in anyio's pool of 40 threads, shared with lexical search and `/v1/wiki/health`, and one embedding call can hold
+  a thread for its whole timeout. So at most 4 embeddings run at once (the fifth fails at once, kind `busy`), the
+  connect timeout is 3 s while the read, write and pool timeouts stay 15 s, and after 3 timeouts or unreachable errors
+  in a row the embedder refuses for 30 s (kind `breaker_open`), then lets one trial call through: a success closes it,
+  a failure opens it again. A call the server answered (a refused key, another status, a bad reply) never counts and
+  closes the breaker, because the server is up. The state belongs to one embedder, one per pairing, with one shared
+  `httpx.Client` (an SSL context costs about 3.4 ms of CPU with the GIL held to build, per call). Every failure,
+  including an undecodable reply, a 400-digit integer in a vector, and a key that is not printable ASCII, is a
+  `QueryEmbedError` and so a 503, never a 500; non-ASCII header values are refused at startup.
+* **The dense query's quantization parameters are explicit.** It sends `rescore=True` and `oversampling=1.0`, from named
+  constants, so Qdrant's defaults are not what recall depends on. The per-segment candidate pool is already
+  `limit x 4` (32 for the default limit of 8), which reaches the evaluation's measured setup (10 x oversampling 3.0,
+  recall@10 at least 0.9997); rescoring costs candidates times segments (D9). The golden-set run tunes it (W2 items 5
+  and 6). The keyword query sends none: sparse vectors are not quantized.
+* **`wiki-mirror status` warns when the installed firewall is not the checkout's.** `update.sh` reports a changed
+  firewall and never applies it, so a box can run new code under old rules, advertise `semantic` in `search_modes`, and
+  have the rules refuse the API's embedding call (each attempt counts in `service_refused`). Status renders the
+  checkout's ruleset for this site with `install.sh --show-firewall`, as `update.sh` does, and says so when it differs
+  from the installed file. It says nothing when the ruleset cannot be rendered; `update.sh` and the installer already
+  report that.

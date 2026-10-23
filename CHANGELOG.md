@@ -21,8 +21,15 @@ the keyword index by default; semantic and hybrid search are now available as op
   MCP tool gives a fixed sentence the model can act on. The default stays `lexical` until the golden set and the
   fusion-weight check pass.
 - **The API embeds each semantic question itself**, with a new synchronous client (`query_embed.py`): the model and
-  vector length come from the semantic index's state (not from `embedding_model`), no retries, a 15 s timeout, and the
-  API's own key, `EMBEDDING_API_KEY` in its environment (`mirror.env`), a different key from the embed run's. A new
+  vector length come from the semantic index's state (not from `embedding_model`), no retries, a 3 s connect and 15 s
+  read timeout, and the API's own key, `EMBEDDING_API_KEY` in its environment (`mirror.env`), a different key from the
+  embed run's. One client is shared by all threads. At most four questions are embedded at once (the fifth gets
+  `busy`), and three timeouts or unreachable errors in a row pause semantic search for 30 s (`breaker_open`), so a
+  stalled embedding server cannot take the threads keyword search and health need. Every embedding failure is a 503,
+  including a compressed reply that does not decompress, a vector element too big for a float, and a key that is not
+  printable ASCII (health then says so); `embedding_headers` and `query_embedding_headers` values must be printable
+  ASCII, refused at startup. The dense query sends its quantization search parameters explicitly (rescore on,
+  oversampling 1.0). A semantic look that fails is logged once, by exception type. A new
   setting, `query_embedding_headers`, is separate from `embedding_headers` so a person waiting on a search does not get
   the bulk run's background priority. **This gives the API user its first outbound connection**, to the embedding
   server's host and port only.
@@ -45,8 +52,10 @@ the keyword index by default; semantic and hybrid search are now available as op
   `query_embedding_headers` is in the example `mirror.yaml`, commented out, beside the `embedding_*` lines.
 - `wiki-mirror search "<query>" [limit] [--mode lexical|semantic|hybrid]`: the mode is checked before anything is
   sent, a `503 semantic_unavailable` prints its reason and exits 1, and the score is printed with `%.4g` (a hybrid
-  RRF score of about 0.03 read as `0.03` for every hit at two decimals). `wiki-mirror status` shows `search_modes`
-  and, when a semantic index exists but cannot be searched, the reason.
+  RRF score of about 0.03 read as `0.03` for every hit at two decimals), and a lone `--` ends the options, so
+  `wiki-mirror search -- "--odd query"` works. `wiki-mirror status` shows `search_modes` and, when a semantic index
+  exists but cannot be searched, the reason, and warns when the installed firewall differs from the one this checkout
+  would install (`update.sh` never applies a firewall change; run `install.sh`).
 
 - A maintenance job ([D8](docs/DECISIONS.md#d8), [docs/OPERATIONS.md](docs/OPERATIONS.md#the-maintenance-job)):
   `python -m wiki_mirror maintain`, run every 15 minutes by `wiki-mirror-maintain.timer`. It resumes a mirror

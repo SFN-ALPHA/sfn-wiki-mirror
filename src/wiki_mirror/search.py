@@ -100,6 +100,18 @@ _SEMANTIC_MODES: Final = frozenset({"semantic", "hybrid"})
 #: of a lexical ranking, so asking for exactly `limit` would return fewer than `limit` articles.
 _OVERFETCH: Final = 4
 
+#: The dense query's quantization search parameters, sent explicitly so that Qdrant's defaults
+#: are not what the recall depends on. Rescoring re-ranks the quantized candidates with the full
+#: vectors. Oversampling 1.0 asks for no extra candidates, because `_OVERFETCH` already does: each
+#: segment returns `limit * _OVERFETCH` candidates (32 for the default limit of 8), which reaches
+#: the evaluation's measured setup of 10 x oversampling 3.0, for which recall@10 was at least
+#: 0.9997 (`tools/wiki_passage_eval.py` `binary_oversampling`; docs/DESIGN.md, the recall line).
+#: Rescoring cost scales with candidates times segments (docs/DECISIONS.md D9), so more
+#: oversampling is paid for on every segment. The golden-set run tunes both (docs/ROADMAP.md W2
+#: items 5 and 6). Sparse vectors are not quantized, so the keyword query sends none.
+_QUANTIZATION_RESCORE: Final = True
+_QUANTIZATION_OVERSAMPLING: Final = 1.0
+
 #: Reciprocal rank fusion's constant: a passage at rank `r` adds `weight / (_RRF_K + r)`. 60 is
 #: the value of the original RRF paper (Cormack, Clarke and Buettcher, 2009) and the one the
 #: design names (docs/DESIGN.md section 12.5); it is not tuned.
@@ -425,7 +437,17 @@ class WikiSearch:
         except QueryEmbedError as exc:
             raise SemanticUnavailableError(str(exc), exc.kind) from exc
         # The collection's one vector is unnamed (`embed._create_collection`), so no `using`.
-        return self._ranked_passages(binding.collection, vector, None, points)
+        return self._ranked_passages(
+            binding.collection,
+            vector,
+            None,
+            points,
+            models.SearchParams(
+                quantization=models.QuantizationSearchParams(
+                    rescore=_QUANTIZATION_RESCORE, oversampling=_QUANTIZATION_OVERSAMPLING
+                )
+            ),
+        )
 
     def _ranked_passages(
         self,
@@ -433,6 +455,7 @@ class WikiSearch:
         query: models.SparseVector | list[float],
         using: str | None,
         points: int,
+        search_params: models.SearchParams | None = None,
     ) -> dict[int, _Hit]:
         """Ask one collection for its best passages, best first, keyed by point id.
 
@@ -445,6 +468,9 @@ class WikiSearch:
             query: A sparse vector for the keyword collection, a dense one for the semantic.
             using: The named vector to search (`SPARSE_VECTOR`), or None for the unnamed one.
             points: Most passages to fetch.
+            search_params: Qdrant's search parameters; None sends none (the keyword query, whose
+                sparse vectors are not quantized). The dense query's are
+                `_QUANTIZATION_RESCORE` and `_QUANTIZATION_OVERSAMPLING`.
 
         Returns:
             Passage hits in rank order (a dict keeps insertion order), the first being the best.
@@ -455,6 +481,7 @@ class WikiSearch:
             using=using,
             limit=points,
             with_payload=True,
+            search_params=search_params,
         )
         passages: dict[int, _Hit] = {}
         for point in response.points:

@@ -18,7 +18,8 @@
 #                                 fast-forward the checkout, reinstall, restart the API; the
 #                                 flag allows a commit that changes the built data's format
 #   wiki-mirror search "<query>" [limit] [--mode lexical|semantic|hybrid]
-#                                 a quick local search through the real API (default mode: lexical)
+#                                 a quick local search through the real API (default mode: lexical);
+#                                 put -- before a query that starts with dashes
 #   wiki-mirror key add <name>          issue an API key to another agent (shown once, only its hash kept)
 #   wiki-mirror key list                the agents that have a key (names only)
 #   wiki-mirror key revoke <name>       withdraw an agent's key (takes effect in seconds, no restart)
@@ -42,6 +43,8 @@ CONF_DIR="${CONF_DIR:-/etc/wiki-mirror}"
 MIRROR_ENV="$CONF_DIR/mirror.env"
 VENV="$APP_DIR/.venv"
 API_URL="${WIKI_MIRROR_API_URL:-http://127.0.0.1:8300}"
+# The installed ruleset, as update.sh and install.sh name it; `status` compares it with the checkout's.
+NFT_INSTALLED="${NFT_INSTALLED:-/etc/nftables.d/wiki-mirror.nft}"
 
 API_UNIT=wiki-mirror.service
 QDRANT_UNIT=wiki-mirror-qdrant.service
@@ -112,6 +115,25 @@ timer_next() {
     next="$(systemctl list-timers "$1" --all --no-legend --plain 2>/dev/null \
         | awk -v unit="$1" '$(NF - 1) == unit && $1 != "-" {print $1, $2, $3, $4; exit}' || true)"
     printf '%s' "${next:-unknown}"
+}
+
+# Warns when the firewall this checkout would install for this site is not the installed one.
+# update.sh only reports a changed firewall (nftables is an operator action), so a box that
+# updated overnight can run new code under old rules: for example, advertise `semantic` search
+# while the rules still refuse the API's call to the embedding server. The comparison is update.sh's
+# own: the checkout's template rendered for this site by `install.sh --show-firewall` (which needs
+# no root and changes nothing) against the installed file. Silent when the ruleset cannot be
+# rendered (no site file, a broken one): update.sh and the installer already say so, and a line
+# here that failed for a reason of its own would hide the counters it sits under.
+firewall_drift_note() {
+    local rendered status=0
+    rendered="$(mktemp)" || return 0
+    APP_DIR="$APP_DIR" CONF_DIR="$CONF_DIR" bash "$APP_DIR/deploy/install.sh" --show-firewall \
+        > "$rendered" 2>/dev/null || status=$?
+    if [[ $status -eq 0 ]] && ! cmp -s "$rendered" "$NFT_INSTALLED"; then
+        warn "the installed firewall differs from this checkout's - run \`$APP_DIR/deploy/install.sh\` to apply it"
+    fi
+    rm -f "$rendered"
 }
 
 cmd_status() {
@@ -331,6 +353,7 @@ for problem in record.get("problems") or []:
     else
         warn "the wiki_mirror table is not loaded - run install.sh to apply the firewall"
     fi
+    firewall_drift_note
     printf '\n'
     [[ -n "$health" ]]
 }
@@ -400,7 +423,8 @@ cmd_update() {
 # `search "<query>" [limit] [--mode lexical|semantic|hybrid]`. The mode is checked here, so a typo
 # is a usage error and not a request; it is sent only when given, so the service's own default
 # (lexical) stays the one place that decides it. A semantic or hybrid search the service cannot
-# serve (503 semantic_unavailable, D10) prints its reason; it never falls back to keywords.
+# serve (503 semantic_unavailable, D10) prints its reason; it never falls back to keywords. A lone
+# `--` ends the options, so `search -- "--odd query"` searches for text that begins with dashes.
 cmd_search() {
     require_root search
     local usage='usage: wiki-mirror search "<query>" [limit] [--mode lexical|semantic|hybrid]'
@@ -411,7 +435,10 @@ cmd_search() {
             --mode)   [[ $# -ge 2 ]] || die "--mode needs a value; $usage"
                       mode="$2"; have_mode=true; shift ;;
             --mode=*) mode="${1#--mode=}"; have_mode=true ;;
-            --*)      die "unknown option '${1:0:30}'; $usage" ;;
+            # The end of options, as in every other command: what follows is the query and the
+            # limit, even if the query begins with "--".
+            --)       shift; positional+=("$@"); break ;;
+            --*)      die "unknown option '${1:0:30}' (to search for text that starts with --, put it after a lone --); $usage" ;;
             *)        positional+=("$1") ;;
         esac
         shift

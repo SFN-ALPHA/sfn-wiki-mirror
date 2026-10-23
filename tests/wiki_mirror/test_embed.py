@@ -328,6 +328,15 @@ def test_client_vector_with_a_non_finite_or_non_numeric_value_raises(bad: str) -
         _embed_once(client, ["a"])
 
 
+def test_client_vector_with_an_integer_too_big_for_a_float_names_only_its_position() -> None:
+    body = ('{"embeddings": [[1, 2, 1' + "0" * 400 + ', 4]]}').encode()
+    client = _client(lambda request: httpx.Response(200, content=body))
+    with pytest.raises(EmbedError, match="non-finite") as raised:
+        _embed_once(client, ["a"])
+    assert "position 2" in str(raised.value)
+    assert "0" * 20 not in str(raised.value)
+
+
 def test_client_503_with_retry_after_waits_that_long_then_succeeds() -> None:
     answers = iter([httpx.Response(503, headers={"Retry-After": "7"}), None])
     time = _Time()
