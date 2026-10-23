@@ -62,8 +62,9 @@ There is deliberately no `MemoryHigh` on Qdrant: it throttled the build into tim
 Disk, as measured on 2026-10-18 after the move to NVMe: 45 GB used with compression (article store 25 GB,
 Qdrant 37 GB logical), 206 GB free. A monthly build needs the new store beside the old one for a few hours, about
 100 GB at peak. The build refuses to create a store or collection with fewer than `min_free_disk_gb` (20) GB
-free. The snapshot storage holds two snapshots of about 151 GB each. Never put the store or Qdrant on network
-storage.
+free. The merge of the semantic index's segments into 10 GB ones ([D9](DECISIONS.md#d9)) needs a further 25 GB free
+for as long as it runs; the maintenance job waits for it ([below](#when-a-settings-change-waits)). The snapshot
+storage holds two snapshots of about 151 GB each. Never put the store or Qdrant on network storage.
 
 **One figure to plan with** ([SIZING.md](SIZING.md) has the arithmetic): **250 GB of fast local disk** for the
 store, the index and the headroom a monthly build needs, plus **about 300 GB** of bulk storage for the two retained
@@ -546,7 +547,8 @@ What it reads and writes:
   (`<born>` is the date tag of that store's snapshot). When every passage is in, it switches HNSW on and moves the
   alias `wikipedia_semantic` to the collection, with the graph and the binary copy on disk. Qdrant then builds the
   graphs in the background, on disk, `SEMANTIC_OPTIMIZATION_THREADS` (2) segments at a time, which takes hours
-  after the run: on the maintainer's box about 4 h 38 min had built 62% of the graph before the 2026-10-23 incident
+  after the run (a new collection is created with the 10 GB segment cap, `SEMANTIC_MAX_SEGMENT_KB`, [D9](DECISIONS.md#d9),
+  so its segments are merged as they are built): on the maintainer's box about 4 h 38 min had built 62% of the graph before the 2026-10-23 incident
   ([D8](DECISIONS.md#d8)), at about 93,000 passages a minute. Watch it in `wiki-mirror status` (Semantic index:
   `building its search graph (N of M indexed)` until `ready`), or `curl -s localhost:6333/collections/wikipedia_semantic`
   until its `status` is `green`. The build is Qdrant's own and survives a restart only with help: a restart in the
@@ -612,8 +614,9 @@ http://127.0.0.1:6333/collections/wikipedia_semantic_<born>`) and its state file
 * **No hybrid search.** The collection is built and the alias points at it, but no query reads it.
 * **Semantic search latency depends on the page cache.** Measured after the rebuild (over loopback, `limit` 10): about
   45 ms once cached, about half a second the first time a query touches the files, and seconds to tens of seconds
-  right after a restart or with a cold cache. A first-time query reads about 290 MB from disk. The levers if that is
-  too slow for hybrid search, none done yet, are listed in [D8](DECISIONS.md#d8).
+  right after a restart or with a cold cache. A first-time query reads about 290 MB from disk. The first lever, fewer
+  and larger segments, was decided on 2026-10-23 ([D9](DECISIONS.md#d9)) and its effect is to be measured when the
+  merge has finished; the others, none done yet, are listed in [D8](DECISIONS.md#d8).
 
 ## The maintenance job
 
@@ -634,17 +637,19 @@ and records the fact when Qdrant is down. It is safe on every box and takes seco
    does not restart pending optimizations after it restarts until some update operation arrives; the job sends the
    empty update that starts them (`PATCH /collections/<name>` with `{"optimizers_config": {}}`).
 4. **Reconciles** the semantic collection behind the `wikipedia_semantic` alias with the code: the graph's `m`,
-   `ef_construct` and `on_disk`, the binary copy's `always_ram`, and the optimizer thread count must equal the
-   constants `SEMANTIC_HNSW`, `SEMANTIC_QUANTIZATION` and `SEMANTIC_OPTIMIZATION_THREADS` in
-   `src/wiki_mirror/embed.py`. Only the parts that differ are sent, in one update.
+   `ef_construct` and `on_disk`, the binary copy's `always_ram`, the optimizer thread count and the segment size cap
+   must equal the constants `SEMANTIC_HNSW`, `SEMANTIC_QUANTIZATION`, `SEMANTIC_OPTIMIZATION_THREADS` and
+   `SEMANTIC_MAX_SEGMENT_KB` in `src/wiki_mirror/embed.py`. Only the parts that differ are sent, in one update.
 5. Writes the record, `state/maintenance.json`, which `/v1/wiki/health` and `wiki-mirror status` show
    ([API.md](API.md#get-v1wikihealth)).
 
 It never starts or retries an embedding run, a build or an update, and it leaves the keyword collection's settings
-and all segment sizes alone. Nothing pushes a notification; health and `wiki-mirror status` are where a problem shows.
+and every segment size except the semantic collection's cap alone. Nothing pushes a notification; health and
+`wiki-mirror status` are where a problem shows.
 
-On a box whose semantic collection already has the settings the code names (the maintainer's, whose placement was
-changed by hand on 2026-10-23), the first run finds them equal and does nothing.
+On a box whose semantic collection already has the settings the code names, the first run finds them equal and does
+nothing. A box built under the earlier 1 GB cap does not: its first run after the update to [D9](DECISIONS.md#d9)
+finds the segment cap different and starts the merge ([below](#the-merge-of-the-semantic-segments)).
 
 ### The crash-loop guard
 
@@ -689,23 +694,53 @@ A run in which Qdrant does not answer records `collections: []`, and a collectio
 
 A change to where the graph or the binary copy lives makes Qdrant rebuild every segment's graph in the background:
 hours of background work on 41.6M passages, mostly disk reads and writes, with the keyword index still serving and no
-embeddings redone (a change of the thread count alone does not rebuild). So the job applies a settings change only
+embeddings redone. A change of the segment size cap is a rebuild too, because the merges it sets off rewrite every
+segment (a change of the thread count alone does not rebuild). So the job applies a settings change only
 when all of these hold, and otherwise leaves it and says why in the record, trying again 15 minutes later:
 
 * the collection's embedding run is complete (the embed stage keeps HNSW off while it loads, on purpose);
 * the collection is not `red` (a settings change would hide why it failed);
 * no build or embedding run holds the build lock. The job only probes the lock and never holds it: a build starting
   while the job held it would exit 1 and wait an hour for its retry;
-* for a change that rebuilds (the graph's `m`, `ef_construct` or `on_disk`, or the quantization): the restart count
-  can be read and is at most 1 (the first two reasons for a hold, above), Qdrant holds no more than 90% of its memory
-  cap, and free disk is at least `min_free_disk_gb`, because a rebuild rewrites segments.
+* for a change that rebuilds (the graph's `m`, `ef_construct` or `on_disk`, the quantization, or the segment size
+  cap): the restart count can be read and is at most 1 (the first two reasons for a hold, above), Qdrant holds no more
+  than 90% of its memory cap, and free disk is at least `min_free_disk_gb` **plus 25 GB of room**, because a rebuild
+  writes whole segments before it deletes the old ones. The 25 GB is two merges at once (`SEMANTIC_OPTIMIZATION_THREADS`)
+  times the 10 GB cap (10,000,000 KB of 1024 bytes) times 1.27 (a segment is about 1.27 times its cap on disk), which
+  is 24.2 GB, rounded up; with the default floor that is 45 GB free. The problem sentence names both: `not enough
+  free disk to create the rewritten segments of <name>: <N> GB free under <path>, it needs 25 GB of room for itself
+  above the floor of 20 GB (min_free_disk_gb), 45 GB in all`. A floor of `0` turns the whole check off, room included.
 
 A change that does not rebuild (only the optimizer thread count) waits until the collection is `green`, because any
 collection update makes Qdrant stop the optimizations in flight, which would throw away the segment being rebuilt. A
 `grey` collection has nothing in flight and is changed at once, unless it is held (a held collection gets no settings
 update). Where the collection is not `grey`, the change cannot cause an out-of-memory kill, so it ignores the restart
-count. If a settings update on a `grey` collection fails, the plain
+count and the disk room. If a settings update on a `grey` collection fails, the plain
 resume follows in the same run.
+
+### The merge of the semantic segments
+
+The semantic collection was built in 85 segments of about 1 GB, and a search walks and rescores every one of them.
+[D9](DECISIONS.md#d9) raised the cap to 10 GB (`SEMANTIC_MAX_SEGMENT_KB`), so that Qdrant merges them into about 10 or
+11. What an operator sees on a box that has the 85:
+
+* On the first maintenance run after the code update that carries the change, an `applied_settings` action in
+  `wiki-mirror status` (Maintenance: last action) and the journal, with the change text `segment size cap: 1000000 KB
+  -> 10000000 KB` (a collection with no cap set reads `segment size cap: Qdrant's default -> 10000000 KB`), and a
+  warning in the journal that a storage change starts a background rebuild of every segment. If the collection was
+  `grey` the action says so, and the update also resumed it.
+* Or, instead, a problem sentence `settings not changed yet: <why>` while the job waits: for the disk room above, for
+  memory, for the restart count, for the build lock or for a finished embedding run. Free the disk it names, or wait.
+* While the merge runs, the collection is `yellow`, and `wiki-mirror status` (Semantic index) reads `building its
+  search graph (N of M indexed)`. Hours: the 85-segment build took 5 h 42 min and was limited by disk. Search keeps
+  answering throughout. The segment count (`segments` in the `semantic` object of `/v1/wiki/health`, or
+  `curl -s localhost:6333/collections/wikipedia_semantic`) falls toward about 10. Free disk falls by up to 25 GB while it runs, and comes back when the old segments are deleted.
+  Qdrant's pinned memory rises by about 2.5 GB (two graph builds on the heap).
+* The job sends nothing more while it runs: the live cap now equals the code's, and the later runs find nothing to
+  change. A restart of Qdrant in the middle leaves the collection `grey`, and the [crash-loop
+  guard](#the-crash-loop-guard) decides about the resume as for any other.
+* When the collection is `green` again and the segment count has stopped falling, it is finished, and the effect on
+  search is measured (the plan is in D9). Nothing about the merge needs an operator.
 
 ### The problem sentences
 
@@ -723,10 +758,10 @@ A run with problems still exits 0 and writes its record. Each problem is one lin
 | `<name> is held: <unreadable>, so a crash loop cannot be ruled out; it is not resumed by itself until the count can be read` | The first reason of [the crash-loop guard](#the-crash-loop-guard). `<unreadable>` is `Qdrant's unit could not be read`, `Qdrant's unit wiki-mirror-qdrant.service is not installed` or `systemd did not report Qdrant's restart count`. Clears on the first run that can read the count. If Qdrant is healthy, `held` ends with the command to resume by hand. |
 | `<name> is held: Qdrant has restarted itself after a failure <N> times since it was last started by hand (the last at <time>); resuming it may be what kills Qdrant again, so it is not resumed by itself` | The count is 2 or more. Find why Qdrant died (`wiki-mirror logs qdrant`; the memory cap and the disk are the usual causes), fix it, then resume by hand with the command at the end of the `held` text (`wiki-mirror status` shows it), or start Qdrant by hand, which resets the count. |
 | `<name> is held: Qdrant holds <N>% of its memory cap; resuming would risk another out-of-memory kill` | Clears by itself when memory falls to 90% or less. If it persists, the cap is too small for the collection's layout. |
-| `<name> is held: <disk sentence>` | Free disk is under `min_free_disk_gb`, or `the free disk space could not be checked (<ErrorType>)`. Free space; it clears by itself. |
+| `<name> is held: <disk sentence>` | Free disk is under `min_free_disk_gb`, or `the free disk space could not be checked (<ErrorType>)`. Free space; it clears by itself. (A resume asks for the floor only; the room a rebuild needs above it is in the `settings not changed yet` row below.) |
 | `<name> is still paused after a resume at <time>` | The collection was `grey`, the job resumed it, and it is `grey` again. The resume did not take: check `wiki-mirror logs qdrant` and `curl -s localhost:6333/collections/<name>` for `optimizer_status`. If Qdrant itself needs a restart, `systemctl restart wiki-mirror-qdrant`; the next run resumes the collection again. |
 | `<name>: optimizer failed: <text>` (or `status is red, and Qdrant gave no optimizer error`) | Qdrant's optimizer stopped with an error. The job does not touch a red collection's settings. Read the text and `wiki-mirror logs qdrant` (a full disk and an out-of-memory kill are the usual causes); fix the cause, then a restart of Qdrant, and the job resumes it. |
-| `<name>: settings not changed yet: <why>; they differ from the code's: <changes>` | A settings change is waiting (previous section); `<why>` says for what: the embedding run is not finished, the collection is red, the build lock is held, free disk is under the floor, `Qdrant holds <N>% of its memory cap and a rebuild would risk an out-of-memory kill`, the restart count cannot be read (`<unreadable>, so a crash loop cannot be ruled out`), `Qdrant has restarted itself after a failure <N> times since it was last started by hand, and a rebuild may be what kills it; it is tried again after a person has looked and started Qdrant by hand`, or `it waits for green (it is <status>): any collection update stops the optimizations in flight, which would throw away the segment being rebuilt`. Nothing to do unless it persists with a run that has finished: then the reason is the one to fix. |
+| `<name>: settings not changed yet: <why>; they differ from the code's: <changes>` | A settings change is waiting (previous section); `<why>` says for what: the embedding run is not finished, the collection is red, the build lock is held, free disk is under the floor (or, for a rebuild, under the floor plus the 25 GB of room: `it needs 25 GB of room for itself above the floor of 20 GB (min_free_disk_gb), 45 GB in all`), `Qdrant holds <N>% of its memory cap and a rebuild would risk an out-of-memory kill`, the restart count cannot be read (`<unreadable>, so a crash loop cannot be ruled out`), `Qdrant has restarted itself after a failure <N> times since it was last started by hand, and a rebuild may be what kills it; it is tried again after a person has looked and started Qdrant by hand`, or `it waits for green (it is <status>): any collection update stops the optimizations in flight, which would throw away the segment being rebuilt`. Nothing to do unless it persists with a run that has finished: then the reason is the one to fix. |
 | `<name>: could not resume: <ErrorType>` / `<name>: could not apply settings: <ErrorType>` | Qdrant refused the update or did not answer it. The update is repeated 15 minutes later; if it keeps failing, `wiki-mirror logs qdrant`. |
 
 ### Exit codes
@@ -774,13 +809,15 @@ The code is the truth for the semantic collection's settings. A setting changed 
 collection) is put back within 15 minutes. To change the layout, change the constants in `embed.py` and ship the
 change: the job applies it to the live collection once it may (above), and a collection `embed` creates later starts
 with the same constants. Remember what it costs: a change to the graph or to where the binary copy lives is a
-rebuild of every segment's graph in Qdrant, hours of CPU on this index. A decision of this size gets a row in
-[DECISIONS.md](DECISIONS.md).
+rebuild of every segment's graph in Qdrant, hours of CPU on this index, and a change to the segment size cap is a
+rewrite of every segment ([The merge of the semantic segments](#the-merge-of-the-semantic-segments)). A decision of
+this size gets a row in [DECISIONS.md](DECISIONS.md).
 
 A changed layout constant is a rebuild of the semantic collection on **every box that runs that code**, started by
 that box's next maintenance run after the code update: hours of disk work, with search unaffected. Unlike a change to
 `deploy/FORMAT`, nothing holds such an update back. The waits above are the only brake: the embedding run finished, the
-collection not `red`, the build lock free, the disk floor, and Qdrant under 90% of its memory cap.
+collection not `red`, the build lock free, the disk floor plus the rebuild's room, and Qdrant under 90% of its memory
+cap.
 
 ## The monthly build
 

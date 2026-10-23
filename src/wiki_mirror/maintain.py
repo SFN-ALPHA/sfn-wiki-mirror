@@ -12,9 +12,10 @@ mirror collection (`wikipedia_lexical_*`, `wikipedia_semantic_*`), repairs two t
   semantic collection then sat `grey` until the operator sent an empty optimizers update by hand.
   The job sends it (`{"optimizers_config": {}}`, Qdrant's documented way to trigger them), unless
   the collection is held (below).
-* **Settings.** The semantic collection's live HNSW, quantization and optimizer-thread settings are
-  kept equal to the constants in `embed` (`SEMANTIC_HNSW`, `SEMANTIC_QUANTIZATION`,
-  `SEMANTIC_OPTIMIZATION_THREADS`: docs/DECISIONS.md D8), changing only what differs.
+* **Settings.** The semantic collection's live HNSW, quantization, optimizer-thread and
+  segment-size-cap settings are kept equal to the constants in `embed` (`SEMANTIC_HNSW`,
+  `SEMANTIC_QUANTIZATION`, `SEMANTIC_OPTIMIZATION_THREADS`: docs/DECISIONS.md D8;
+  `SEMANTIC_MAX_SEGMENT_KB`: D9), changing only what differs.
 
 Non-obvious constraints:
 
@@ -42,7 +43,9 @@ Non-obvious constraints:
 * **A storage change is a rebuild, and any change interrupts.** In Qdrant 1.12, changing the HNSW
   graph's `m`, `ef_construct` or `on_disk`, or any quantization field, makes Qdrant rebuild every
   segment of the collection in the background (a long job on 41.6M passages, with disk writes to
-  match). The optimizer thread count starts no rebuild, but *any* collection update makes Qdrant
+  match). So does a change of the segment size cap: a larger one makes the optimizer merge the
+  small segments into big ones, which rewrites all of them (D9). The optimizer thread count
+  starts no rebuild, but *any* collection update makes Qdrant
   stop the optimizer workers (`on_optimizer_config_update`), throwing away the segment being
   rebuilt; so a threads-only change waits until the collection is `green` (or `grey`, where
   nothing is in flight). A settings change is applied only when it is safe to start one: the
@@ -50,9 +53,9 @@ Non-obvious constraints:
   purpose), no build or embedding run holds the build lock, the collection is not `red`, and for
   a rebuild also Qdrant is under 90% of its memory cap, has not restarted itself more than
   `_RESUMES_AFTER_RESTARTS` times since it was last started by hand (its count readable), and the
-  disk has its free floor. A threads-only change cannot cause an out-of-memory kill, so it
-  ignores the restart count. Otherwise a change is skipped, and the record's problems say what it
-  waits for.
+  disk has its free floor plus `_REBUILD_ROOM_GB`, the room the merges need while they write.
+  A threads-only change cannot cause an out-of-memory kill, so it ignores the restart count and
+  the room. Otherwise a change is skipped, and the record's problems say what it waits for.
 * **The code is the truth for the semantic settings.** A value changed by hand on the box is put
   back on the next run. To change the layout, change the constants in `embed`.
 * **The build lock is probed, never held.** An embed run or a monthly build that started while this
@@ -68,7 +71,7 @@ Non-obvious constraints:
   same numbers only to decide whether it is safe to start work.
 * **Out of scope:** starting or retrying embedding runs (operator-started, they use the
   operator's GPU cluster), the lexical collection's settings, and anything that changes segment
-  sizes.
+  sizes other than the semantic collection's cap (D9).
 * **No secrets.** Qdrant has no key on the box and the job logs none; log lines carry names,
   numbers and exception type names, never a response body.
 
@@ -78,6 +81,7 @@ See docs/OPERATIONS.md ("The maintenance job") and docs/DESIGN.md section 12.5.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import shlex
 import subprocess
@@ -167,6 +171,27 @@ _MAX_DIGITS: Final = 18
 #: the growth that makes Qdrant's memory a poor predictor, since the kill of 2026-10-23 came
 #: when the in-RAM graphs outgrew the cap. Health warns separately, from the same numbers.
 _MEMORY_HOLD_PERCENT: Final = 90
+
+#: Bytes in the "KB" of Qdrant's `max_segment_size`: 1024 (`BYTES_IN_KB` in Qdrant v1.12.4,
+#: `lib/segment/src/common/mod.rs`, which `merge_optimizer.rs` multiplies the setting by).
+_QDRANT_KB_BYTES: Final = 1024
+
+#: Bytes in the "GB" of `build.ensure_free_space`, which `_REBUILD_ROOM_GB` is measured in: 1024
+#: cubed, the same as `build._BYTES_PER_GB` (private there, so stated again here, not imported).
+_GB_BYTES: Final = 1024**3
+
+#: Free disk, in GB beyond the floor, that a rebuild waits for: the merges that run at once
+#: (`SEMANTIC_OPTIMIZATION_THREADS`) each write a new segment of up to the cap before they
+#: delete the old ones, and a segment is `SEGMENT_DISK_FACTOR` times the cap on disk. So
+#: 2 x 10,000,000 KB x 1024 B x 1.27 is about 24.2 GB (of 1024 cubed bytes), rounded up to 25.
+#: Derived, not typed in, so the room follows the cap (docs/DECISIONS.md D9).
+_REBUILD_ROOM_GB: Final = math.ceil(
+    embed.SEMANTIC_OPTIMIZATION_THREADS
+    * embed.SEMANTIC_MAX_SEGMENT_KB
+    * _QDRANT_KB_BYTES
+    * embed.SEGMENT_DISK_FACTOR
+    / _GB_BYTES
+)
 
 #: The most automatic restarts after a failure (systemd's `NRestarts`, since Qdrant was last
 #: started by hand) at which the job still resumes a `grey` collection by itself; above it, the
@@ -536,7 +561,8 @@ class _SettingsChange:
     diffs: dict[str, Any]
     #: One plain statement per difference ("graph on disk: false -> true").
     changes: tuple[str, ...]
-    #: Whether Qdrant rebuilds the collection's segments for it (a graph or quantization change).
+    #: Whether Qdrant rebuilds the collection's segments for it (a graph, quantization or
+    #: segment-size-cap change).
     rebuilds: bool
 
 
@@ -749,14 +775,21 @@ class _Job:
             return _Hold(held=no_room, problem=f"{name} is held: {no_room}")
         return None
 
-    def _no_room_for(self, what: str) -> str | None:
+    def _no_room_for(self, what: str, *, room_gb: int = 0) -> str | None:
         """A sentence saying the disk is under its floor (or cannot be checked), or None if fine.
 
         `OSError` is a reason to wait too: a disk that cannot be measured is not known to have
         room, and it must not cost the run its record.
+
+        Args:
+            what: The work that needs the room, for the sentence.
+            room_gb: GB the work needs beyond the floor (`ensure_free_space`); 0 for a resume,
+                which writes little.
         """
         try:
-            ensure_free_space(self._config.data_dir, self._config.min_free_disk_gb, what)
+            ensure_free_space(
+                self._config.data_dir, self._config.min_free_disk_gb, what, room_gb=room_gb
+            )
         except BuildError as exc:
             return str(exc)
         except OSError as exc:
@@ -811,8 +844,9 @@ class _Job:
         except OSError as exc:
             return f"the build lock could not be checked ({type(exc).__name__})"
         if change.rebuilds:
-            # A rebuild rewrites segments, and the optimizer needs room the size of the largest.
-            return self._no_room_for(f"the rewritten segments of {name}")
+            # A rebuild rewrites segments, and the merges running at once each write a segment
+            # of up to the cap before they delete the old ones: room beyond the floor.
+            return self._no_room_for(f"the rewritten segments of {name}", room_gb=_REBUILD_ROOM_GB)
         return None
 
     def _apply_settings(self, name: str, change: _SettingsChange, *, grey: bool) -> bool:
@@ -971,9 +1005,14 @@ def _settings_change(info: models.CollectionInfo) -> _SettingsChange | None:
     """The semantic collection's live settings compared with `embed`'s; None when they are equal.
 
     Compared: the HNSW graph's `m`, `ef_construct` and `on_disk`; whether the quantization is
-    binary with its copy in RAM or on disk; and the optimizer thread count. A flag Qdrant leaves
-    unset is its default, off. Only the parts that differ go into the update, so a threads-only
+    binary with its copy in RAM or on disk; the optimizer's segment size cap; and its thread
+    count. A flag Qdrant leaves unset is its default, off. Only the parts that differ go into the
+    update (the cap and the thread count in one `OptimizersConfigDiff`), so a threads-only
     difference does not touch the graph or the quantization and starts no rebuild.
+
+    A cap that differs is a rebuild, because the merges it sets off rewrite every segment (D9). A
+    live cap of None means Qdrant's own default (indexing threads x 200,000 KB), which is never
+    the code's, so it differs and is applied.
     """
     config = info.config
     changes: list[str] = []
@@ -1012,15 +1051,24 @@ def _settings_change(info: models.CollectionInfo) -> _SettingsChange | None:
         )
         diffs["quantization_config"] = embed.SEMANTIC_QUANTIZATION
         changes.append(f"quantization: {kind} -> binary, copy in RAM: {_flag(wanted_ram)}")
+    # The graph and the quantization are the storage changes so far; the segment cap joins them
+    # below. The thread count does not rebuild, so it is not counted.
     rebuilds = bool(diffs)
+    optimizer: dict[str, Any] = {}
+    live_cap = config.optimizer_config.max_segment_size
+    if live_cap != embed.SEMANTIC_MAX_SEGMENT_KB:
+        optimizer["max_segment_size"] = embed.SEMANTIC_MAX_SEGMENT_KB
+        was = "Qdrant's default" if live_cap is None else f"{live_cap} KB"
+        changes.append(f"segment size cap: {was} -> {embed.SEMANTIC_MAX_SEGMENT_KB} KB")
+        rebuilds = True
     live_threads = config.optimizer_config.max_optimization_threads
     if live_threads != embed.SEMANTIC_OPTIMIZATION_THREADS:
-        diffs["optimizers_config"] = models.OptimizersConfigDiff(
-            max_optimization_threads=embed.SEMANTIC_OPTIMIZATION_THREADS
-        )
+        optimizer["max_optimization_threads"] = embed.SEMANTIC_OPTIMIZATION_THREADS
         changes.append(
             f"optimizer threads: {live_threads} -> {embed.SEMANTIC_OPTIMIZATION_THREADS}"
         )
+    if optimizer:
+        diffs["optimizers_config"] = models.OptimizersConfigDiff(**optimizer)
     if not changes:
         return None
     return _SettingsChange(diffs=diffs, changes=tuple(changes), rebuilds=rebuilds)

@@ -59,8 +59,11 @@ Non-obvious constraints:
   checkpoint steps back to just before the highest article still present (`_verified_checkpoint`)
   and a warning says so. A collection with no usable state is never deleted automatically: two
   days of vectors are not discarded on a guess.
-* **Segments are capped** (`_MAX_SEGMENT_KB`) and optimized `SEMANTIC_OPTIMIZATION_THREADS` at a
-  time, for the reasons in `index.py`; the numbers here are the dense collection's own.
+* **Segments are capped** (`SEMANTIC_MAX_SEGMENT_KB`, 10 GB) and optimized
+  `SEMANTIC_OPTIMIZATION_THREADS` at a time, for the reasons in `index.py`; the numbers here are
+  the dense collection's own. The cap is large because every segment is searched and rescored
+  separately: fewer segments, fewer reads per query (docs/DECISIONS.md D9). The maintenance job
+  keeps the live collection equal to it.
 * **Local state, no build state.** Progress lives in `state/index_semantic_<born>.json`, written
   atomically after every window. This stage never writes `build.json`: the index being served is
   fine while an embedding run is failing, and `/v1/wiki/health` must not say otherwise. It does
@@ -106,7 +109,9 @@ from wiki_mirror.text.sanitize import Chunk
 __all__ = [
     "ALIAS",
     "EMBEDDING_API_KEY_ENV",
+    "SEGMENT_DISK_FACTOR",
     "SEMANTIC_HNSW",
+    "SEMANTIC_MAX_SEGMENT_KB",
     "SEMANTIC_OPTIMIZATION_THREADS",
     "SEMANTIC_QUANTIZATION",
     "TEXT_FORM",
@@ -152,14 +157,35 @@ _UPSERT_POINTS: Final = 128
 #: Seconds between progress lines.
 _PROGRESS_SECONDS: Final = 60.0
 
-#: Largest segment Qdrant may build, in kilobytes (its unit; it counts vector data, which for
-#: this collection is 2 KB a point as float16). About 1 GB, some 500,000 passages: the optimizer
+#: Largest segment Qdrant may build, in its "KB" (1024 bytes: `BYTES_IN_KB` in Qdrant v1.12.4,
+#: `lib/segment/src/common/mod.rs`; it counts vector data, which for this collection is 2 KB a
+#: point as float16). 10 GB, some 5.0 million passages: the optimizer
 #: needs free disk the size of the segment it rewrites, and the HNSW build of one segment holds
-#: its graph on the heap, so a bound is wanted; but each segment is searched separately, and
-#: the 400 MB cap of the lexical collection (about 200,000 dense points) would mean over 200
-#: graphs per query on a six-core box. Not measured on this collection yet; docs/DESIGN.md
-#: section 12.5 says to look at it once the graphs are built.
-_MAX_SEGMENT_KB: Final = 1_000_000
+#: its graph on the heap, so a bound is wanted; but each segment is searched separately.
+#: Measured on the reference box on 2026-10-23 (Qdrant 1.12.4, limit 10), the earlier 1 GB cap
+#: left 85 segments, and a first-time query caused about 1,370 major page faults and took about
+#: 460 ms; with rescoring off it caused about 130 and took about 200 ms. Qdrant rescores per
+#: segment, each of the 85 re-reading its own top 10 from the float16 originals (85 x 10 x about
+#: 1.5 pages), and those 85 GB are never all cached. Fewer, larger segments are expected to cut
+#: that roughly eight-fold, to be measured after the merge (D9). Qdrant 1.12.4
+#: (`merge_optimizer.rs`, `check_condition`) merges a collection that
+#: has more segments than `default_segment_number` (0 = automatic, the CPU count clamped to
+#: 2..8) by taking its smallest segments, at least three at a time, while their cumulative
+#: vector size stays under this value: about 9 one-GB segments a merge, ending at 10 or 11
+#: segments. The costs are transient: a merge writes the new segment before it deletes the old
+#: ones, and `SEMANTIC_OPTIMIZATION_THREADS` merges run at once (`SEGMENT_DISK_FACTOR` for the
+#: room), and the new segment's graph is built on the heap (about 251 bytes a point, 1.26 GB for
+#: a 5.0M-point segment). docs/DECISIONS.md D9. The maintenance job keeps the live collection
+#: equal to this value, as a rebuilding change.
+SEMANTIC_MAX_SEGMENT_KB: Final = 10_000_000
+
+#: How much larger a segment is on disk than the vector data the cap counts: the graph, the
+#: binary copy, the payload and the id tracker come on top. Measured on the reference box on
+#: 2026-10-23, with `du --apparent-size --block-size=1K` (KiB): the largest segment of the
+#: 1,000,000 KB cap was 1,264,748 KiB, a ratio of 1.265, so 1.27.
+#: `maintain.py` multiplies the cap, and the merges running at once, by this to know the disk
+#: room a rebuild needs (docs/DECISIONS.md D9).
+SEGMENT_DISK_FACTOR: Final = 1.27
 
 #: Segment optimizations (merges, graph builds, quantization) at once, for the semantic collection:
 #: two (the lexical collection keeps one, `index._MAX_OPTIMIZATION_THREADS`). Two are safe because
@@ -172,9 +198,9 @@ SEMANTIC_OPTIMIZATION_THREADS: Final = 2
 #: the evaluation's recall numbers assume. The graph is **on disk** (`on_disk=True`): the in-RAM
 #: graph ran Qdrant out of its 20G cap on 2026-10-23, and the operator decided that day to keep
 #: the mirror's pinned RAM under 10 GB, leaving the hot parts to the page cache, which gives its
-#: RAM back under pressure (docs/DECISIONS.md D8). Semantic search latency on this layout is not
-#: measured yet; it will be once the rebuild has finished (docs/DESIGN.md section 12.5). The
-#: maintenance job keeps the live collection equal to this value.
+#: RAM back under pressure (docs/DECISIONS.md D8). Semantic search latency on this layout was
+#: measured once the rebuild had finished (D8), and the cost that D9 attacks with the segment cap
+#: was measured on it. The maintenance job keeps the live collection equal to this value.
 SEMANTIC_HNSW: Final = models.HnswConfigDiff(m=16, ef_construct=100, on_disk=True)
 
 #: The binary-quantized copy of the vectors: held on disk too (`always_ram=False`), for the same
@@ -930,7 +956,7 @@ def _create_collection(client: QdrantClient, name: str, dimensions: int) -> None
         quantization_config=SEMANTIC_QUANTIZATION,
         on_disk_payload=True,
         optimizers_config=models.OptimizersConfigDiff(
-            max_segment_size=_MAX_SEGMENT_KB,
+            max_segment_size=SEMANTIC_MAX_SEGMENT_KB,
             max_optimization_threads=SEMANTIC_OPTIMIZATION_THREADS,
         ),
     )

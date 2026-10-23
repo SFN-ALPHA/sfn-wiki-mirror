@@ -746,6 +746,55 @@ def test_ensure_free_space_exactly_at_the_floor_passes(
 
 
 @pytest.mark.unit
+def test_ensure_free_space_between_the_floor_and_the_room_raises_naming_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _disk(monkeypatch, 30)
+    with pytest.raises(BuildError) as raised:
+        ensure_free_space(tmp_path, 20, "the rewritten segments of a collection", room_gb=25)
+    message = str(raised.value)
+    assert "30.0 GB free" in message
+    assert "25 GB of room" in message
+    assert "floor of 20 GB (min_free_disk_gb)" in message
+    assert "45 GB in all" in message
+
+
+@pytest.mark.unit
+def test_ensure_free_space_exactly_at_the_floor_plus_the_room_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _disk(monkeypatch, 45)
+    ensure_free_space(tmp_path, 20, "the rewritten segments of a collection", room_gb=25)
+
+
+@pytest.mark.unit
+def test_ensure_free_space_below_the_floor_with_room_asked_still_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _disk(monkeypatch, 3.5)
+    with pytest.raises(BuildError, match=r"3\.5 GB free.*25 GB of room"):
+        ensure_free_space(tmp_path, 20, "the rewritten segments of a collection", room_gb=25)
+
+
+@pytest.mark.unit
+def test_ensure_free_space_without_room_asked_does_not_mention_room(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _disk(monkeypatch, 3.5)
+    with pytest.raises(BuildError) as raised:
+        ensure_free_space(tmp_path, 20, "a new article store")
+    assert "room" not in str(raised.value)
+
+
+@pytest.mark.unit
+def test_ensure_free_space_with_the_floor_off_ignores_the_room_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _disk(monkeypatch, 1)
+    ensure_free_space(tmp_path, 0, "anything", room_gb=25)
+
+
+@pytest.mark.unit
 def test_ensure_free_space_with_the_floor_off_never_looks_at_the_disk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

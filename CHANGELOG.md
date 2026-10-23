@@ -37,6 +37,17 @@ answers from the keyword index alone.
 
 ### Changed
 
+- Fewer, larger semantic segments ([D9](docs/DECISIONS.md#d9)): the semantic collection's segment size cap goes from
+  1 GB to 10 GB of vector data (`SEMANTIC_MAX_SEGMENT_KB` in `embed.py`, new), measured on 2026-10-23 as the cause of
+  most of a first-time search's page faults (about 1,370 a query, about 1,230 of them from rescoring each of 85
+  segments). The maintenance job applies it to the live collection as a rebuilding change, and Qdrant then merges the
+  85 segments into about 10 or 11 in the background: one rewrite of about 100 GB, likely hours, with search answering
+  throughout and the collection `yellow` while it runs. Expected to cut the reads per query about eight times; that
+  is measured after the merge, not asserted. Every box that runs the code applies it on its next maintenance run.
+- A rebuilding settings change now waits for free disk of `min_free_disk_gb` plus the room the merges need (25 GB for
+  two merges of 10 GB segments at 1.27 times the cap on disk, in Qdrant's 1024-byte KB), not the floor alone; the problem sentence names both.
+  `build.ensure_free_space` takes an optional `room_gb` for it; its other callers are unchanged. A resume and a
+  threads-only change still ask for the floor or nothing, as before.
 - The semantic index lives on disk ([D8](docs/DECISIONS.md#d8)): the HNSW graph (`on_disk`) and the binary-quantized
   copy (`always_ram: false`) join the float16 vectors there, and the semantic collection's optimizer threads go
   from 1 to 2. The goal is under 10 GB of pinned memory; measured after the rebuild (2026-10-23), Qdrant rests at
@@ -47,8 +58,8 @@ answers from the keyword index alone.
   layout, measured: about 45 ms cached, about half a second the first time, seconds to tens of seconds after a
   restart. The pinned peak during a monthly build is still an estimate (12 GB).
 - The code is the truth for the semantic collection's settings: a setting changed by hand on the box is put back by
-  the next maintenance run. To change the layout, change `SEMANTIC_HNSW`, `SEMANTIC_QUANTIZATION` and
-  `SEMANTIC_OPTIMIZATION_THREADS` in `embed.py`.
+  the next maintenance run. To change the layout, change `SEMANTIC_HNSW`, `SEMANTIC_QUANTIZATION`,
+  `SEMANTIC_OPTIMIZATION_THREADS` and `SEMANTIC_MAX_SEGMENT_KB` in `embed.py`.
 
 ### Fixed
 
@@ -70,6 +81,9 @@ answers from the keyword index alone.
 
 - The measured memory breakdown of the in-RAM layout, the 2026-10-23 incident, the alternatives and the order of
   fallbacks if cold semantic search is too slow ([D8](docs/DECISIONS.md#d8)).
+- The measurement behind the 10 GB segment cap, Qdrant 1.12.4's merge rule, the transient disk and heap of the merge,
+  the plan for measuring its effect, and what an operator sees while it runs ([D9](docs/DECISIONS.md#d9),
+  [OPERATIONS.md](docs/OPERATIONS.md#the-merge-of-the-semantic-segments), [SIZING.md](docs/SIZING.md)).
 
 ## [0.2.0] - 2026-10-20
 

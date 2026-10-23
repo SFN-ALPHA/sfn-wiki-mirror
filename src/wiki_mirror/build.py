@@ -179,18 +179,23 @@ def build_lock(data_dir: Path) -> Iterator[None]:
         os.close(descriptor)  # closing the descriptor releases the lock
 
 
-def ensure_free_space(directory: Path, floor_gb: int, what: str) -> None:
+def ensure_free_space(directory: Path, floor_gb: int, what: str, *, room_gb: int = 0) -> None:
     """Refuse to start a large local write when the disk is nearly full.
 
     Args:
         directory: Somewhere on the disk that will be written (a missing directory is judged by
             its nearest existing parent, which is on the same disk).
         floor_gb: Free space, in GB, that must remain; 0 disables the check
-            (`MirrorConfig.min_free_disk_gb`).
+            (`MirrorConfig.min_free_disk_gb`). It disables the room as well: an operator who
+            turned the floor off asked not to have the disk measured.
         what: What is about to be created, for the message ("a new article store").
+        room_gb: Free space, in GB, that `what` itself needs while it is written, on top of the
+            floor (the maintenance job's rebuild writes whole segments before it deletes the old
+            ones). The message names it apart from the floor, because the floor is the
+            operator's setting and the room is not.
 
     Raises:
-        BuildError: Less than `floor_gb` GB is free. Nothing has been created.
+        BuildError: Less than `floor_gb` + `room_gb` GB is free. Nothing has been created.
     """
     if floor_gb <= 0:
         return
@@ -198,10 +203,16 @@ def ensure_free_space(directory: Path, floor_gb: int, what: str) -> None:
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
     free = shutil.disk_usage(probe).free
-    if free < floor_gb * _BYTES_PER_GB:
+    if free < (floor_gb + room_gb) * _BYTES_PER_GB:
+        needs = (
+            f"the floor is {floor_gb} GB (min_free_disk_gb)"
+            if room_gb <= 0
+            else f"it needs {room_gb} GB of room for itself above the floor of {floor_gb} GB "
+            f"(min_free_disk_gb), {floor_gb + room_gb} GB in all"
+        )
         msg = (
             f"not enough free disk to create {what}: {free / _BYTES_PER_GB:.1f} GB free under "
-            f"{probe}, the floor is {floor_gb} GB (min_free_disk_gb)"
+            f"{probe}, {needs}"
         )
         raise BuildError(msg)
 

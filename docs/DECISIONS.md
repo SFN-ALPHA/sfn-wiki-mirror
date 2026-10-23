@@ -18,6 +18,7 @@ only the conclusion, and say what was accepted as a cost.
 | [D6](#d6) | 2026-10-19 | A site's network lives in `/etc/wiki-mirror/site.env`; the firewall in the repository is a template |
 | [D7](#d7) | 2026-10-19 | The embedding run is its own stage, unit and key file |
 | [D8](#d8) | 2026-10-23 | The semantic index lives on disk, and a maintenance job keeps it healthy |
+| [D9](#d9) | 2026-10-23 | Fewer, larger semantic segments: the cap goes from 1 GB to 10 GB, and the maintenance job applies it |
 
 <a id="d1"></a>
 ## D1 - 2026-10-16 - A local Wikipedia mirror
@@ -308,7 +309,8 @@ on purpose: the operator has looked. The 90% is a judgment, the line health alre
   yet, so nothing is slower today; this decides what to do before hybrid search ships.
 * **The levers if that is too slow for hybrid search**, in the order they are worth trying; each is still to be
   measured and none is done: (1) fewer, larger segments (about 85 down to 10-20), at the next rebuild: each search
-  walks every segment's graph, so the work per query falls about in proportion, with no extra RAM; (2) a smaller ZFS
+  walks every segment's graph, so the work per query falls about in proportion, with no extra RAM (decided and
+  measured in [D9](#d9)); (2) a smaller ZFS
   `recordsize` for Qdrant's dataset (for example 16K), host-side, applying to files written after the change and so
   to the next rebuild; (3) rescoring and oversampling: rescoring with the full vectors costs about half the time
   here, and whether it can be lowered without losing recall is to be measured on the golden set; (4) pre-warm the
@@ -343,4 +345,101 @@ on purpose: the operator has looked. The 90% is a judgment, the line health alre
   `degraded` in `/v1/wiki/health` and as red lines in `wiki-mirror status`.
 * **Accepted:** the job's resume depends on a Qdrant behaviour that a newer version may fix, which makes the resume a
   harmless no-op; the job does not start or retry embedding runs, and does not touch the keyword collection's
-  settings or any segment size.
+  settings or any segment size. ([D9](#d9) later made the semantic collection's segment size cap one of the settings
+  it keeps.)
+
+<a id="d9"></a>
+## D9 - 2026-10-23 - Fewer, larger semantic segments: the cap goes from 1 GB to 10 GB, and the maintenance job applies it
+
+**Decision.** The semantic collection's segment size cap (`max_segment_size`) goes from 1,000,000 KB (1 GB of vector
+data) to 10,000,000 KB (10 GB, about 5.0 million passages a segment: Qdrant's KB is 1024 bytes, and a float16
+1,024-dimension vector is 2,048 bytes). It is the public constant
+`embed.SEMANTIC_MAX_SEGMENT_KB`, beside the other layout constants, and a new collection from `embed` is created with
+it. The maintenance job keeps the live collection equal to it, as it does the others, and treats a difference as a
+rebuilding change: Qdrant merges the small segments into big ones in the background, which rewrites all of them. The
+job's guards for a rebuild are the ones it already had, plus one new one: free disk of the floor
+(`min_free_disk_gb`) plus the room the merges need while they write (below). Decided by the maintainer.
+
+**Context.** The 1 GB cap was set before the semantic collection existed, and its own comment said it was not
+measured. D8 listed fewer, larger segments as the first lever against slow first-time searches. It was then measured
+on the reference box (2026-10-23, Qdrant 1.12.4, `limit` 10, payload `page_id`). The data was in the host's ZFS cache
+(the ARC), so 0 bytes came from disk and the faults were satisfied from host RAM:
+
+| Case | Major page faults | Time |
+|---|---|---|
+| First-time query (a random stored passage's vector) | about 1,370 | about 460 ms |
+| First-time query, rescoring off (`rescore: false`) | about 130 | about 200 ms |
+| The same query repeated | none to speak of | about 45 ms |
+
+A fixed baseline of 30 queries by point id had a median of 285 ms, a worst case of 332 ms and about 1,310 faults each.
+Rescoring therefore causes about 1,230 of the faults. Qdrant rescores per segment: each of the 85 segments re-reads
+its own top 10 from the float16 originals, which are 85 GB and so are never all cached. 85 segments x 10 candidates x
+about 1.5 pages is about 1,275, which is the measurement. Right after the rebuild earlier the same day, first-time
+queries read about 290 MB from disk each, with a median of 6 s (D8).
+
+On disk the collection was 85 segments and 100 GB in all. Measured with `du --apparent-size --block-size=1K` (KiB),
+the largest segment was 1,264,748 KiB against the cap of 1,000,000 KiB: a ratio of 1.265, so 1.27 times the cap,
+because the cap counts the vector data only, and the graph, the binary copy, the payload and the id tracker come on
+top.
+
+**Reasoning.** What Qdrant 1.12.4 does with a larger cap (`lib/collection/src/collection_manager/optimizers/
+merge_optimizer.rs`, `check_condition`, at tag v1.12.4): when a collection has more segments than
+`default_segment_number`, the optimizer merges its smallest segments, at least 3 at a time, as long as their
+cumulative vector size stays under `max_segment_size`. `default_segment_number` 0 means automatic: the CPU count
+clamped to 2..8, which is 6 on the reference box's six cores. With a 10 GB cap about 9 one-GB segments go into each
+merge, and merging stops once the three smallest left exceed the cap, at about 10 or 11 segments in all. Each query
+then walks about 8 times fewer graphs and does about 8 times fewer rescoring reads, if the page faults scale with the
+segment count as measured above. **That is an expectation, to be measured after the merge, not asserted.**
+
+Each merge writes the new segment before it deletes the old ones, and builds the new segment's HNSW graph on the
+heap. The measured links file is about 251 bytes a point, so about 1.26 GB for a 5.0M-point segment.
+`SEMANTIC_OPTIMIZATION_THREADS` is 2, so two merges run at once.
+
+**Alternatives considered.**
+
+* **Turn rescoring off.** It cuts the first-time query from about 460 ms to about 200 ms, but it gives up recall that
+  has not been measured on the golden set. It stays a lever (D8, lever 3) and is not needed to reach the segment
+  count's effect.
+* **A cap between 1 GB and 10 GB.** It would leave more segments, and the faults scale with the segment count, so
+  the gain is the one thing being bought; a second rewrite to go further would cost the whole 100 GB again. 10 GB
+  leaves the transient disk and heap below at a size the box has room for.
+* **Leave it.** The cost of the status quo is a first-time search of about half a second and seconds to tens of
+  seconds after a restart, and nothing searches the semantic collection yet. This decides what hybrid search starts
+  from.
+
+**Consequences.**
+
+* **One rewrite of about 100 GB in the background.** Likely hours: the 85-segment rebuild of D8 took 5 h 42 min and
+  was limited by disk. Search keeps answering throughout. The collection shows `yellow` ("building its
+  search graph") while it runs, and the job records an `applied_settings` action with the change text
+  (`segment size cap: 1000000 KB -> 10000000 KB`) when it starts it. Every box that runs the code applies it on its
+  next maintenance run after the update, as for any layout constant (D8).
+* **Transient disk of about 25 GB and heap of about 2.5 GB.** Two merges at once, each writing a segment of up to
+  10,000,000 KiB x 1.27 (about 12.1 GB) before it deletes its inputs, is 2 x 10,000,000 KiB x 1.27 = 24.2 GB (of 1024
+  cubed bytes, the unit the job's disk check uses), rounded up to 25. The job derives this from the constants
+  (`SEMANTIC_OPTIMIZATION_THREADS` x `SEMANTIC_MAX_SEGMENT_KB` x 1024 x `SEGMENT_DISK_FACTOR`) and holds a rebuild
+  back until free disk is the floor plus that room: with the default 20 GB floor, 45 GB. Before this the job
+  checked only the floor, which was written for 1 GB segments. Two graph builds at 1.26 GB each is about 2.5 GB of
+  heap, on top of the 7.5 GB at rest: about 10 GB, under the 90% hold line of a 24G cap. A merge that a Qdrant
+  restart cuts short leaves the collection `grey`, and the crash-loop guard decides whether the job resumes it.
+* **A wait for green before it is measured.** `yellow` means merges are still running; the numbers are taken when the
+  collection is `green` and the segment count has stopped falling. Any measurement during the merge says nothing
+  about the result.
+* **The measurement plan.** After `green`: (1) the same 30 queries by point id as the baseline, compared with the
+  baseline for the overlap of the top 10 (recall of the merged index against the 85-segment one, which should be
+  near-identical, and is not assumed to be) and for time and faults; (2) the first-time probe, with and without
+  rescoring, on fresh random stored vectors, with the page cache as warm as for the baseline. The result is written
+  back here. If the faults do not fall about in proportion to the segments, the expectation above was wrong and this
+  decision says so.
+* **The storage's record size is left alone until after that measurement.** Lever 2 of D8 (a smaller ZFS
+  `recordsize` for Qdrant's dataset) applies only to files written after it changes, so it could be had for free
+  during this rewrite. It is left out on purpose: two changes at once would not say which one helped, and the first
+  measurement has one question, what the segment count does. The cost accepted is that if a smaller record size turns
+  out to help, it takes a second rewrite of the files after it is set.
+* **The cap is a setting of the code, like the rest.** A cap changed by hand on the box is put back as a rebuild
+  within 15 minutes (hours of merging), so the way to change it is to change `SEMANTIC_MAX_SEGMENT_KB`. It is not
+  adjustable in `mirror.yaml`: that would be a knob where a decision was made.
+* **Accepted:** a segment of 10 GB is searched as one unit and rewritten as one unit, so the next rewrite that touches
+  one (a vacuum after many deletions, or a graph rebuild) costs up to 12.1 GB of disk and about 1.26 GB of heap at a
+  time, not the 1.2 GB of disk it did before. How much the monthly update ([D3](#d3)) rewrites on the new layout is
+  not measured; it is looked at after the first update that follows this change.

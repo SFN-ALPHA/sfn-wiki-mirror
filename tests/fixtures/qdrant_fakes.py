@@ -16,7 +16,10 @@ Non-obvious constraints:
   (`{"error": "<text>"}`), and the text is made up.
 * **The recorded semantic reply predates the thread change.** It has `max_optimization_threads: 1`
   (the layout of 2026-10-23 07:28, before D8 made it 2), so `semantic_info` defaults the thread
-  count to the code's value; a test about the thread difference says `threads=1`.
+  count to the code's value; a test about the thread difference says `threads=1`. It also
+  predates D9: it has `max_segment_size: 1000000` (the old 1 GB cap), so `semantic_info` defaults
+  the cap to the code's 10,000,000 KB; a test about the cap difference says `segment_cap=` with
+  the old value, or `None` for the unset cap Qdrant reports as its default.
 * **`GET /collections` was not recorded.** `recorded_transport` builds it from the names it is
   given, in Qdrant's documented shape (`{"result": {"collections": [{"name": ...}]}}`).
 * **Applying an update is a model, not Qdrant.** With `applies=True` the fake merges the diffs
@@ -81,6 +84,7 @@ def semantic_info(
     on_disk: bool = True,
     always_ram: bool = False,
     threads: int = 2,
+    segment_cap: int | None = 10_000_000,
     optimizer_error: str | None = None,
 ) -> models.CollectionInfo:
     """The recorded semantic collection with the named settings (defaults: the code's layout).
@@ -90,6 +94,8 @@ def semantic_info(
         on_disk: `hnsw_config.on_disk`.
         always_ram: `quantization_config.binary.always_ram`.
         threads: `optimizer_config.max_optimization_threads`.
+        segment_cap: `optimizer_config.max_segment_size`, in KB; None leaves it unset, which
+            Qdrant reports as `null` when the collection runs on its default.
         optimizer_error: When set, `optimizer_status` is `{"error": <this text>}` (a `red`
             collection's shape); otherwise `ok`.
     """
@@ -98,6 +104,7 @@ def semantic_info(
     raw["config"]["hnsw_config"]["on_disk"] = on_disk
     raw["config"]["quantization_config"]["binary"]["always_ram"] = always_ram
     raw["config"]["optimizer_config"]["max_optimization_threads"] = threads
+    raw["config"]["optimizer_config"]["max_segment_size"] = segment_cap
     if optimizer_error is not None:
         raw["optimizer_status"] = {"error": optimizer_error}
     return models.CollectionInfo.model_validate(raw)

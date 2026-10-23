@@ -1010,7 +1010,7 @@ def test_run_embed_creates_the_collection_for_dense_search_with_hnsw_off(
     assert vectors.on_disk is True
     assert made["hnsw_config"].m == 0
     assert made["quantization_config"] == embed.SEMANTIC_QUANTIZATION
-    assert made["optimizers_config"].max_segment_size == embed._MAX_SEGMENT_KB
+    assert made["optimizers_config"].max_segment_size == embed.SEMANTIC_MAX_SEGMENT_KB
     assert made["optimizers_config"].max_optimization_threads == embed.SEMANTIC_OPTIMIZATION_THREADS
     assert made["on_disk_payload"] is True
 
@@ -1022,6 +1022,13 @@ def test_semantic_settings_keep_everything_on_disk_and_use_two_optimizer_threads
     assert embed.SEMANTIC_HNSW.on_disk is True
     assert embed.SEMANTIC_QUANTIZATION.binary.always_ram is False
     assert embed.SEMANTIC_OPTIMIZATION_THREADS == 2
+
+
+def test_semantic_segment_cap_is_ten_gigabytes_and_its_disk_factor_is_the_measured_one() -> None:
+    # Decision D9 (docs/DECISIONS.md), spelled out like the layout above: the maintenance job
+    # rewrites every segment when this changes, and sizes the disk room it waits for from both.
+    assert embed.SEMANTIC_MAX_SEGMENT_KB == 10_000_000
+    assert embed.SEGMENT_DISK_FACTOR == 1.27
 
 
 def test_run_embed_completion_switches_hnsw_on_after_the_last_upsert(

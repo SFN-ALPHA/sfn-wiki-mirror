@@ -60,11 +60,26 @@ RAM (19.2 GB at rest, 62% of the graph built) was: graph links 6.87 GB, binary c
 and about 2.7 GB of per-point bookkeeping (ID maps, payload stores; the remainder, not measured directly). Finished,
 that layout would have rested at about 22.7 GB.
 
+**Segments** (measured 2026-10-23, [D9](DECISIONS.md#d9)). The collection built under a cap of 1 GB of vector data
+a segment is 85 segments and **100 GB** on disk (measured). By `du --apparent-size --block-size=1K` the largest was
+1,264,748 KiB against the 1,000,000 KiB cap, a ratio of 1.265: a segment is about **1.27 times its cap** on disk,
+because the cap counts the float16 vectors only and the graph, the binary copy, the payload and the id tracker come
+on top. The cap is now 10 GB (10,000,000 KiB, about 5.0 million passages a segment), and Qdrant merges the 85 into
+about 10 or 11 segments of up to about 12.1 GB each in the background, one rewrite of about 100 GB that took
+5 h 42 min for the 85-segment build and is expected to take hours again. While it runs, the free disk it needs on top
+of the 20 GB floor is **about 25 GB**: two merges at once, each writing a segment of up to 12.1 GB before it deletes
+its inputs (2 x 10,000,000 KiB x 1.27 = 24.2 GB). The maintenance job waits for that room before it starts the
+merges. The graph of a merged segment is built on the heap, about 251 bytes a point, so about 1.26 GB per merge
+(2.5 GB for two),
+on top of the 7.5 GB at rest. The total on disk after the merge is expected to stay about 100 GB (the same data); the
+final figure is taken when the merge has finished.
+
 **Totals (estimates).**
 
 - Local disk: 25 (articles) + 37 (keyword) + about 102 (semantic) = about **165 GB**. Add headroom: a monthly
   build holds two article stores side by side for a few hours (about 100 GB peak before the semantic index), and
-  Qdrant's optimizer needs free space for segment rewrites. The build refuses to start below 20 GB free. **Plan on
+  Qdrant's optimizer needs free space for segment rewrites (about 25 GB beyond the floor while the 10 GB segments
+  merge, above). The build refuses to start below 20 GB free. **Plan on
   250 GB of local disk, plus about 300 GB of bulk storage for the snapshots.** This is the one disk figure the other
   docs quote.
 - RAM for Qdrant, pinned: **7.4-7.5 GB** at rest, measured after the on-disk rebuild finished on 2026-10-23 (7.52 GB

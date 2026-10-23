@@ -348,10 +348,11 @@ search) is not built: no query reads the semantic collection yet.
   form the passage-length evaluation measured (dense hit@5 0.953), recorded as `TEXT_FORM` in the state. A question
   is embedded as plain text. Changing the form is a new `TEXT_FORM`, and so a new collection.
 - **The collection.** Float16 vectors on disk, the binary-quantized copy on disk (`always_ram=False`), HNSW off
-  (`m=0`) during the load and on (`m=16`, `ef_construct=100`, `on_disk=True`) at the end, segments capped at about
-  1 GB (about 85 of them), two optimizations at a time. These values are the constants `SEMANTIC_HNSW`,
-  `SEMANTIC_QUANTIZATION` and `SEMANTIC_OPTIMIZATION_THREADS` in `embed.py`, and the code is the truth for them
-  (below). The finish switches HNSW on, then moves the alias `wikipedia_semantic` (both idempotent, so a run that
+  (`m=0`) during the load and on (`m=16`, `ef_construct=100`, `on_disk=True`) at the end, segments capped at 10 GB
+  of vector data (the load itself left 85 segments of about 1 GB, under the cap of 1 GB used until D9; the cap was
+  raised after measuring them, below), two optimizations at a time. These values are the constants `SEMANTIC_HNSW`,
+  `SEMANTIC_QUANTIZATION`, `SEMANTIC_OPTIMIZATION_THREADS` and `SEMANTIC_MAX_SEGMENT_KB` in `embed.py`, and the code is
+  the truth for them (below). The finish switches HNSW on, then moves the alias `wikipedia_semantic` (both idempotent, so a run that
   died between them repeats them), and records the run complete.
 - **What it will not do.** It does not delete a collection that has no usable state, and it does not resume with
   other settings. It does not catch up after a monthly rebuild: embed after a new snapshot builds a whole new
@@ -376,11 +377,21 @@ bookkeeping (the remainder). Complete, it would have rested at about 22.7 GB.
   rebuild. A first-time query reads about 290 MB from disk, because a search walks the graph of every one of the 85
   segments; most of it is read amplification (the ZFS `recordsize` of the dataset was not checked). Nothing serves
   semantic search yet, so this decides what to do before hybrid search is switched on (step 4). The levers, in order,
-  each still to be measured: fewer, larger segments (about 85 down to 10-20) at the next rebuild; a smaller ZFS
+  each still to be measured: fewer, larger segments (done, next paragraph); a smaller ZFS
   `recordsize` for Qdrant's dataset; lower rescoring and oversampling, if the golden set shows no recall loss;
   pre-warming the graph and binary files after Qdrant starts; and last, pinning the binary copy again (+5.3 GB, about
   12.8 GB pinned, which misses the goal). A newer Qdrant (1.16 or later) with `hnsw_config.inline_storage` is a further
   option, about 150 GB more disk (an estimate; a staged upgrade from 1.12).
+* **Fewer, larger segments, decided 2026-10-23** ([D9](DECISIONS.md#d9)). The 1 GB cap had never been measured; it
+  was, with the data in the host's ZFS cache (the ARC), so that nothing came from disk and the faults were served
+  from host RAM. A first-time query caused about 1,370 major page
+  faults and took about 460 ms; with rescoring off it caused about 130 and took about 200 ms; a repeat took about 45
+  ms. Qdrant rescores per segment, so the 85 segments each re-read their own top 10 from the float16 originals (85 x 10
+  x about 1.5 pages, about 1,275), and those 85 GB are never all cached. The cap went to 10 GB (about 5.0 million
+  passages a segment), and Qdrant merges the segments in the background down to about 10 or 11, one rewrite of about
+  100 GB. The expected effect, about 8 times fewer rescoring reads and graph walks per query, is **measured after the
+  merge**, not asserted: the plan is in D9. The storage's record size is left alone until then, so that the two
+  levers are not confounded.
 * **Why moving it costs a rebuild.** In every Qdrant version up to 1.20, changing where the graph or the quantized
   copy lives makes Qdrant rebuild every segment's graph in the background, although the files are identical. It
   costs CPU only; the keyword index keeps serving and no embedding is redone. A change of the optimizer thread count
@@ -390,22 +401,24 @@ bookkeeping (the remainder). Complete, it would have rested at about 22.7 GB.
 [OPERATIONS.md](OPERATIONS.md#the-maintenance-job)). The same night showed that Qdrant 1.12 does not restart pending
 optimizations after it restarts: the semantic collection sat `grey` until an update operation arrived, and nothing
 noticed. Every 15 minutes the job resumes any `grey` collection with an empty optimizers update, makes the live
-semantic collection's HNSW, quantization and optimizer-thread settings equal to the three constants, and writes
+semantic collection's HNSW, quantization, optimizer-thread and segment-size-cap settings equal to the four constants, and writes
 `state/maintenance.json`, which health and `wiki-mirror status` read. Choices that would look like bugs:
 
 * **The code is the truth.** A setting changed by hand is put back within 15 minutes. A layout change is a change to
   the constants, reviewed and shipped like any other.
 * **A settings change that rebuilds waits** until the collection's embedding run is complete (the embed stage keeps
   HNSW off during the load on purpose), the collection is not `red`, the build lock is free and free disk is at
-  least `min_free_disk_gb`. The lock is probed and never held.
+  least `min_free_disk_gb` plus the room the merges need while they write (25 GB for the 10 GB cap and two merges
+  at once, D9). The lock is probed and never held. A different segment cap is a rebuild too, because the merges
+  rewrite every segment.
 * **Nothing stops the record.** Qdrant not answering, `systemctl` failing or an unreadable cgroup file become empty
   fields and a problem sentence. The job exits 1 only when it cannot write the record.
 * **A crash is an automatic restart.** `last_crash_at` is the start time of the Qdrant run in which systemd's
   `NRestarts` went up; a start by hand resets that count and is not a crash. systemd's `Result` and the cgroup's
   `oom_kill` counter are not used: the first reads `success` after an automatic restart, the second restarts at 0
   with the unit.
-* **Out of scope:** starting or retrying embedding runs, the keyword collection's settings, segment sizes and
-  pre-warming. Nothing pushes an alert; health turns `degraded` (a stale record, a restart after a failure within 24
+* **Out of scope:** starting or retrying embedding runs, the keyword collection's settings, segment sizes other than
+  the semantic collection's cap, and pre-warming. Nothing pushes an alert; health turns `degraded` (a stale record, a restart after a failure within 24
   hours, Qdrant above 90% of its cap) and `wiki-mirror status` shows it.
 
 **Embedding rate, measured 2026-10-16** (bge-m3 through the embedding server at background priority, about

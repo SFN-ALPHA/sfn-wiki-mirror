@@ -10,7 +10,8 @@ the recorded files, served byte for byte, to see what it parses and the requests
 Failure paths named here: a `grey` collection (resumed with an empty optimizers update, resumed
 again with a problem when a resume did not take), a `red` one (a problem, no settings call), a
 settings difference that must wait (the embedding run unfinished, the build lock held or not
-checkable, the disk floor, memory near the cap, a threads-only change until green), Qdrant not
+checkable, the disk floor and the room a rebuild needs above it, memory near the cap, a
+threads-only change until green; a segment size cap that differs is a rebuild, D9), Qdrant not
 answering, a collection that vanished or cannot be described, an update Qdrant refuses,
 `systemctl` missing, slow or failing, unreadable cgroup files, a unit that is not installed or not
 running, and what is and is not a crash.
@@ -1231,12 +1232,14 @@ def test_run_maintenance_grey_collection_with_the_old_layout_gets_one_update_and
         "binary": {"always_ram": False}
     }
     assert update["optimizers_config"].model_dump(exclude_none=True) == {
-        "max_optimization_threads": 2
+        "max_segment_size": 10_000_000,
+        "max_optimization_threads": 2,
     }
     (action,) = record.actions
     assert action.action == "applied_settings"
     assert action.detail.startswith(
-        "graph on disk: false -> true; binary copy in RAM: true -> false; optimizer threads: 1 -> 2"
+        "graph on disk: false -> true; binary copy in RAM: true -> false; "
+        "segment size cap: 1000000 KB -> 10000000 KB; optimizer threads: 1 -> 2"
     )
     assert "also resumed" in action.detail
     assert record.last_action == action
@@ -1278,6 +1281,151 @@ def test_run_maintenance_a_collection_without_binary_quantization_gets_it_back(
     (update,) = qdrant.updates
     assert update["quantization_config"] == embed.SEMANTIC_QUANTIZATION
     assert record.actions[0].detail == "quantization: none -> binary, copy in RAM: false"
+
+
+@pytest.mark.contract
+def test_run_maintenance_a_cap_difference_alone_is_applied_as_a_rebuild_to_a_yellow_collection(
+    config: MirrorConfig,
+    cgroup_root: Path,
+    frozen_clock: FrozenClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # D9: the merges the new cap sets off rewrite every segment, so it is a rebuilding change: it
+    # does not wait for green (the merges replace whatever is in flight) and it is warned about.
+    _mark_load(config, complete=True)
+    qdrant = _mirror(semantic=semantic_info(status="yellow", segment_cap=1_000_000))
+    with caplog.at_level(logging.INFO, logger="wiki_mirror.maintain"):
+        record = _run(config, qdrant, cgroup_root, frozen_clock)
+    (update,) = qdrant.updates
+    assert set(update) == {"collection_name", "optimizers_config"}
+    assert update["optimizers_config"].model_dump(exclude_none=True) == {
+        "max_segment_size": 10_000_000
+    }
+    (action,) = record.actions
+    assert (action.action, action.collection) == ("applied_settings", SEMANTIC)
+    assert action.detail == "segment size cap: 1000000 KB -> 10000000 KB"
+    assert record.problems == ()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "rebuild" in warnings[0]
+
+
+@pytest.mark.contract
+def test_run_maintenance_threads_and_cap_differing_together_go_in_one_optimizers_diff(
+    config: MirrorConfig, cgroup_root: Path, frozen_clock: FrozenClock
+) -> None:
+    _mark_load(config, complete=True)
+    qdrant = _mirror(semantic=semantic_info(status="green", threads=1, segment_cap=1_000_000))
+    record = _run(config, qdrant, cgroup_root, frozen_clock)
+    (update,) = qdrant.updates
+    assert set(update) == {"collection_name", "optimizers_config"}
+    assert update["optimizers_config"].model_dump(exclude_none=True) == {
+        "max_segment_size": 10_000_000,
+        "max_optimization_threads": 2,
+    }
+    (action,) = record.actions
+    assert action.detail == "segment size cap: 1000000 KB -> 10000000 KB; optimizer threads: 1 -> 2"
+
+
+@pytest.mark.contract
+def test_run_maintenance_a_cap_that_is_unset_is_applied(
+    config: MirrorConfig, cgroup_root: Path, frozen_clock: FrozenClock
+) -> None:
+    # Qdrant reports `null` for a collection on its own default (indexing threads x 200,000 KB),
+    # which is never the code's cap.
+    _mark_load(config, complete=True)
+    qdrant = _mirror(semantic=semantic_info(status="green", segment_cap=None))
+    record = _run(config, qdrant, cgroup_root, frozen_clock)
+    (update,) = qdrant.updates
+    assert update["optimizers_config"].model_dump(exclude_none=True) == {
+        "max_segment_size": 10_000_000
+    }
+    assert record.actions[0].detail == "segment size cap: Qdrant's default -> 10000000 KB"
+
+
+@pytest.mark.contract
+def test_run_maintenance_equal_caps_send_nothing(
+    config: MirrorConfig, cgroup_root: Path, frozen_clock: FrozenClock
+) -> None:
+    _mark_load(config, complete=True)
+    live = semantic_info(status="yellow").config.optimizer_config.max_segment_size
+    assert live == embed.SEMANTIC_MAX_SEGMENT_KB
+    qdrant = _mirror(semantic=semantic_info(status="yellow"))
+    record = _run(config, qdrant, cgroup_root, frozen_clock)
+    assert qdrant.updates == []
+    assert record.actions == ()
+    assert record.problems == ()
+
+
+@pytest.mark.contract
+def test_run_maintenance_a_cap_the_fake_applies_settles_and_is_not_sent_again(
+    config: MirrorConfig, cgroup_root: Path, frozen_clock: FrozenClock
+) -> None:
+    _mark_load(config, complete=True)
+    qdrant = _mirror(semantic=semantic_info(status="green", segment_cap=1_000_000), applies=True)
+    _run(config, qdrant, cgroup_root, frozen_clock)
+    second = _run(config, qdrant, cgroup_root, frozen_clock)
+    assert len(qdrant.updates) == 1
+    assert second.actions == ()
+    assert second.problems == ()
+
+
+@pytest.mark.contract
+@_PREVIOUS_RECORDS
+def test_run_maintenance_a_cap_difference_waits_after_two_restarts(
+    config: MirrorConfig, cgroup_root: Path, frozen_clock: FrozenClock, record_state: str
+) -> None:
+    _leave_record(config, record_state)
+    _mark_load(config, complete=True)
+    qdrant = _mirror(semantic=semantic_info(status="yellow", segment_cap=1_000_000))
+    record = _run(config, qdrant, cgroup_root, frozen_clock, show=_restarted(2))
+    assert qdrant.updates == []
+    assert record.problems == (
+        f"{SEMANTIC}: settings not changed yet: Qdrant has restarted itself after a failure 2 "
+        "times since it was last started by hand, and a rebuild may be what kills it; it is "
+        "tried again after a person has looked and started Qdrant by hand; they differ from "
+        "the code's: segment size cap: 1000000 KB -> 10000000 KB",
+    )
+
+
+@pytest.mark.contract
+@_NO_COUNT
+def test_run_maintenance_a_cap_difference_waits_when_the_restart_count_cannot_be_read(
+    config: MirrorConfig, cgroup_root: Path, frozen_clock: FrozenClock, kind: str, cause: str
+) -> None:
+    _mark_load(config, complete=True)
+    qdrant = _mirror(semantic=semantic_info(status="yellow", segment_cap=1_000_000))
+    reader = _unreadable_count(kind, cgroup_root)
+    record = _run(config, qdrant, cgroup_root, frozen_clock, reader=reader)
+    assert qdrant.updates == []
+    assert any(
+        f"{SEMANTIC}: settings not changed yet: {cause}, so a crash loop cannot be ruled out"
+        in problem
+        and "segment size cap: 1000000 KB -> 10000000 KB" in problem
+        for problem in record.problems
+    )
+
+
+@pytest.mark.contract
+@pytest.mark.parametrize(
+    ("anon", "applied"),
+    [(900_000_000, True), (900_000_001, False)],
+    ids=["exactly-90-percent", "just-over-90-percent"],
+)
+def test_run_maintenance_a_cap_difference_waits_over_90_percent_of_the_memory_cap(
+    tmp_path: Path, config: MirrorConfig, frozen_clock: FrozenClock, anon: int, applied: bool
+) -> None:
+    root = _memory(tmp_path, anon=anon, cap=1_000_000_000)
+    _mark_load(config, complete=True)
+    qdrant = _mirror(semantic=semantic_info(status="green", segment_cap=1_000_000))
+    record = _run(config, qdrant, root, frozen_clock)
+    assert (len(qdrant.updates) == 1) is applied
+    if applied:
+        assert record.problems == ()
+    else:
+        (problem,) = record.problems
+        assert "Qdrant holds 90.0% of its memory cap and a rebuild would risk" in problem
+        assert "segment size cap: 1000000 KB -> 10000000 KB" in problem
 
 
 @pytest.mark.contract
@@ -1426,6 +1574,72 @@ def test_run_maintenance_a_threads_only_change_needs_no_disk_room(
     qdrant = _mirror(semantic=semantic_info(status="green", threads=1))
     _run(config, qdrant, cgroup_root, frozen_clock)
     assert len(qdrant.updates) == 1
+
+
+@pytest.mark.unit
+def test_rebuild_room_is_the_merges_at_once_times_the_cap_times_the_measured_factor() -> None:
+    # D9: 2 merges x 10,000,000 KB x 1024 B x 1.27 = 24.2 GB of 1024 cubed bytes, rounded up. The
+    # number the operator is told; the pins below keep the units (Qdrant's KB, our GB) honest.
+    assert maintain._QDRANT_KB_BYTES == 1024
+    assert maintain._GB_BYTES == build._BYTES_PER_GB
+    assert maintain._REBUILD_ROOM_GB == 25
+
+
+@pytest.mark.contract
+def test_run_maintenance_a_rebuild_waits_when_the_disk_is_between_the_floor_and_the_room(
+    tmp_path: Path, cgroup_root: Path, frozen_clock: FrozenClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path, min_free_disk_gb=20)
+    _disk(monkeypatch, 30)  # above the 20 GB floor, below 20 + 25
+    _mark_load(config, complete=True)
+    qdrant = _mirror(semantic=semantic_info(status="green", segment_cap=1_000_000))
+    record = _run(config, qdrant, cgroup_root, frozen_clock)
+    assert qdrant.updates == []
+    (problem,) = record.problems
+    assert "not enough free disk to create the rewritten segments of" in problem
+    assert "30.0 GB free" in problem
+    assert "25 GB of room" in problem
+    assert "floor of 20 GB (min_free_disk_gb)" in problem
+    assert "segment size cap: 1000000 KB -> 10000000 KB" in problem
+
+
+@pytest.mark.contract
+def test_run_maintenance_a_rebuild_is_applied_when_the_disk_has_the_floor_and_the_room(
+    tmp_path: Path, cgroup_root: Path, frozen_clock: FrozenClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path, min_free_disk_gb=20)
+    _disk(monkeypatch, 20 + maintain._REBUILD_ROOM_GB)
+    _mark_load(config, complete=True)
+    qdrant = _mirror(semantic=semantic_info(status="green", segment_cap=1_000_000))
+    record = _run(config, qdrant, cgroup_root, frozen_clock)
+    assert len(qdrant.updates) == 1
+    assert record.problems == ()
+
+
+@pytest.mark.contract
+def test_run_maintenance_a_threads_only_change_is_not_held_by_the_rebuild_room(
+    tmp_path: Path, cgroup_root: Path, frozen_clock: FrozenClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = make_config(tmp_path, min_free_disk_gb=20)
+    _disk(monkeypatch, 30)
+    _mark_load(config, complete=True)
+    qdrant = _mirror(semantic=semantic_info(status="green", threads=1))
+    record = _run(config, qdrant, cgroup_root, frozen_clock)
+    assert len(qdrant.updates) == 1
+    assert record.problems == ()
+
+
+@pytest.mark.contract
+def test_crash_loop_a_grey_collection_is_resumed_with_the_floor_but_not_the_rebuild_room(
+    tmp_path: Path, cgroup_root: Path, frozen_clock: FrozenClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A resume writes little: only a rebuilding settings change asks for the room.
+    config = make_config(tmp_path, min_free_disk_gb=20)
+    _disk(monkeypatch, 30)
+    qdrant = _mirror(semantic=semantic_info(status="grey"))
+    _run(config, qdrant, cgroup_root, frozen_clock)
+    assert len(qdrant.updates) == 1
+    assert _semantic(config).held is None
 
 
 @pytest.mark.contract
@@ -1822,8 +2036,8 @@ def test_resume_over_the_real_client_patches_the_collection_with_an_empty_optimi
 def test_the_recorded_yellow_reply_is_read_by_the_real_client_into_the_record(
     config: MirrorConfig, cgroup_root: Path, frozen_clock: FrozenClock
 ) -> None:
-    # The recorded yellow collection still has one optimizer thread: the change waits for green,
-    # and nothing is sent.
+    # The recorded yellow collection has one optimizer thread and the old 1 GB cap (D9). The cap
+    # makes the change a rebuild, so it does not wait for green: one update carries both.
     _mark_load(config, complete=True)
     requests: list[httpx.Request] = []
     client = _real_client("collection_semantic_yellow.json", requests)
@@ -1831,7 +2045,12 @@ def test_the_recorded_yellow_reply_is_read_by_the_real_client_into_the_record(
         record = _run(config, client, cgroup_root, frozen_clock)
     finally:
         client.close()
-    assert _patches(requests) == []
+    assert _patches(requests) == [
+        (
+            f"/collections/{SEMANTIC}",
+            {"optimizers_config": {"max_segment_size": 10_000_000, "max_optimization_threads": 2}},
+        )
+    ]
     assert record.collections[1] == CollectionReport(
         name=SEMANTIC,
         alias="wikipedia_semantic",
@@ -1841,9 +2060,9 @@ def test_the_recorded_yellow_reply_is_read_by_the_real_client_into_the_record(
         indexed_vectors=25855559,
         segments=85,
     )
-    (problem,) = record.problems
-    assert "it waits for green (it is yellow)" in problem
-    assert "optimizer threads: 1 -> 2" in problem
+    (action,) = record.actions
+    assert action.detail == "segment size cap: 1000000 KB -> 10000000 KB; optimizer threads: 1 -> 2"
+    assert record.problems == ()
 
 
 @pytest.mark.contract
@@ -1863,7 +2082,10 @@ def test_settings_over_the_real_client_send_only_the_differing_parts(
             {
                 "hnsw_config": {"on_disk": True},
                 "quantization_config": {"binary": {"always_ram": False}},
-                "optimizers_config": {"max_optimization_threads": 2},
+                "optimizers_config": {
+                    "max_segment_size": 10_000_000,
+                    "max_optimization_threads": 2,
+                },
             },
         )
     ]

@@ -39,7 +39,7 @@ flowchart LR
 | Parse | `parse.py`, `build.run_parse` | Turns each chunk's Parsoid HTML into plain text with section headings, infobox key-value blocks and category lists; drops reference lists, navigation boxes and "See also" link farms. Workers are spawned processes, one chunk each, streaming to a zstd spool; the parent is the single SQLite writer. |
 | Article store | `store.py`, `records.py` | One SQLite file per snapshot, `articles/<identifier>_<yyyymmdd>.db`. Compressed text, title and redirect-alias indexes, a per-article `text_hash`. Highest revision wins on duplicates. A finished store is immutable and opened read-only. |
 | Keyword index | `index.py`, `passages.py` | Cuts every article into passages with the vendored chunker and encodes each with the vendored hashed-BM25 sparse encoder, then upserts them into Qdrant. Checkpointed; ends by pointing the alias at the new collection. |
-| Semantic index (embedding run) | `embed.py` | Cuts the same passages as the keyword index, asks an Ollama-compatible embedding server for a vector each, and upserts them into `wikipedia_semantic_<born>` in windows of 64 articles with a checkpoint (`state/index_semantic_<born>.json`). Resumable, and a resume verifies the checkpoint against Qdrant. Started by hand (`wiki-mirror embed-now`) as `wiki-mirror-embed.service`; no query reads the result yet. The collection's layout (graph and binary copy on disk, optimizer threads) is the constants `SEMANTIC_HNSW`, `SEMANTIC_QUANTIZATION` and `SEMANTIC_OPTIMIZATION_THREADS` ([D8](DECISIONS.md#d8)). |
+| Semantic index (embedding run) | `embed.py` | Cuts the same passages as the keyword index, asks an Ollama-compatible embedding server for a vector each, and upserts them into `wikipedia_semantic_<born>` in windows of 64 articles with a checkpoint (`state/index_semantic_<born>.json`). Resumable, and a resume verifies the checkpoint against Qdrant. Started by hand (`wiki-mirror embed-now`) as `wiki-mirror-embed.service`; no query reads the result yet. The collection's layout (graph and binary copy on disk, optimizer threads, segment size cap) is the constants `SEMANTIC_HNSW`, `SEMANTIC_QUANTIZATION`, `SEMANTIC_OPTIMIZATION_THREADS` ([D8](DECISIONS.md#d8)) and `SEMANTIC_MAX_SEGMENT_KB` ([D9](DECISIONS.md#d9)). |
 | Maintenance job | `maintain.py`, `maintenance_record.py`, `wiki-mirror-maintain.{service,timer}` | Every 15 minutes, as `wikimirror-sync`: reads Qdrant's systemd unit and memory, resumes a paused (`grey`) mirror collection, keeps the semantic collection's live settings equal to the constants in `embed.py`, and writes `state/maintenance.json` for health and `wiki-mirror status`. |
 | Serving | `serving.py` | Holds the (collection, store) pair currently served, follows the alias and the index state, and hands requests a lease so a swap never closes a store under a reader. |
 | Search | `search.py` | Query encoding, article folding, exact-title priority, snippets cut from the store, windowed article reads. |
@@ -104,8 +104,10 @@ out-of-memory kill and its semantic collection sat paused unnoticed.
   it as `maintenance` and turns `degraded` when it is more than 60 minutes old, when Qdrant was restarted after a
   failure within 24 hours, or when Qdrant's anonymous memory is above 90% of its cap.
 * **Settings wait for a safe moment.** A graph or binary-copy placement change makes Qdrant rebuild every segment's
-  graph, so it is sent only when the collection's embedding run is complete, the collection is not `red`, the build
-  lock is free (probed, never held) and the disk has its floor. Otherwise the record's problems say what it waits for.
+  graph, and a change of the segment size cap ([D9](DECISIONS.md#d9)) makes it merge and rewrite them, so either is
+  sent only when the collection's embedding run is complete, the collection is not `red`, the build lock is free
+  (probed, never held) and the disk has its floor plus the room the merges need. Otherwise the record's problems say
+  what it waits for.
 * **The code is the truth** for the semantic settings: a hand change is put back on the next run.
 * **It never stops the record.** A source it cannot read becomes an empty field and a problem sentence; exit 1 only
   when the record cannot be written. It starts no embedding run, build or update.
@@ -159,7 +161,8 @@ rather than one with both vectors are in [DESIGN.md §12.2](DESIGN.md#122-the-fo
   W3's per-article selection.
 * **Segments are capped** at 400,000 KB with one optimization at a time, so a merge fits in memory and a rewrite
   never needs a third of the disk free. Both came from OOM kills during the first build (DESIGN.md §12.8). (The
-  semantic collection has its own: about 1 GB segments and two optimizations at a time, DESIGN.md §12.5.)
+  semantic collection has its own: 10 GB segments, `SEMANTIC_MAX_SEGMENT_KB`, and two optimizations at a time,
+  [D9](DECISIONS.md#d9) and DESIGN.md §12.5.)
 * **The index state file** `state/index_lexical_<born>.json` records the build checkpoint, the chunker
   fingerprint (`v1:512/50`) and `applied_snapshot`: the snapshot whose store the passages were cut from. Serving
   pairs the collection with that snapshot's store. Today `applied_snapshot` equals `<born>`; the planned monthly
