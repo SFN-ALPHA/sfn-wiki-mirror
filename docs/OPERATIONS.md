@@ -888,6 +888,10 @@ take a newer set deliberately. On the workstation:
 5. Commit the new file with the change that needed it. `tests/deploy/` checks it is exact, covers the direct
    dependencies, meets `pyproject.toml`'s floors, and is what both scripts install with.
 
+`qdrant-client` is the one pin that does not take the newest release. Qdrant supports a client at most one minor
+version from its server, so the client stays on the minor of `QDRANT_VERSION` in `deploy/install.sh` (`pyproject.toml`
+caps it, and a test compares the two). Upgrade the server and the client together.
+
 ## Network
 
 Input is SSH and :8300 from the site's LAN (`LAN_CIDR` in [`site.env`](#4-the-site-file)), nothing else. Output is

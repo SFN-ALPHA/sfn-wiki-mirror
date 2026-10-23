@@ -1776,6 +1776,9 @@ def test_run_maintenance_logs_each_action_and_problem_and_a_summary_with_the_com
 def _real_client(semantic_file: str, requests: list[httpx.Request]) -> QdrantClient:
     """The real client in front of the recorded files, served byte for byte (no socket).
 
+    The 1.12 client (the server's minor, see pyproject.toml) makes no version request on
+    construction and has no `check_compatibility` argument, so none is passed.
+
     Args:
         semantic_file: The recorded reply the semantic collection answers with.
         requests: Receives every request the client sends.
@@ -1787,7 +1790,6 @@ def _real_client(semantic_file: str, requests: list[httpx.Request]) -> QdrantCli
     return QdrantClient(
         url="http://127.0.0.1:6333",
         transport=recorded_transport(bodies, requests),
-        check_compatibility=False,
     )
 
 
@@ -1874,11 +1876,7 @@ def test_run_maintenance_over_the_real_client_with_nothing_listening_is_one_prob
     def refuse(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)
 
-    client = QdrantClient(
-        url="http://127.0.0.1:6333",
-        transport=httpx.MockTransport(refuse),
-        check_compatibility=False,
-    )
+    client = QdrantClient(url="http://127.0.0.1:6333", transport=httpx.MockTransport(refuse))
     try:
         record = _run(config, client, cgroup_root, frozen_clock)
     finally:

@@ -25,7 +25,10 @@ dependencies = [
     # [standard] is what the service ran with on the box (uvloop, httptools, websockets); the
     # pins in constraints.txt cover it.
     "uvicorn[standard]>=0.32",
-    "qdrant-client>=1.12",
+    # The client's minor version is the server's (QDRANT_VERSION in deploy/install.sh). Qdrant
+    # supports a client at most one minor version from its server, and 1.19 against 1.12.4 warned
+    # on every connection. The two move together when the server is upgraded.
+    "qdrant-client>=1.12,<1.13",
     # The MCP server (src/wiki_mirror/mcp_server.py): the SDK speaks the protocol and
     # the streamable-HTTP transport, and the service decides who may call what.
     "mcp>=2.0",

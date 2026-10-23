@@ -290,13 +290,22 @@ def _semantic(**fields: object) -> dict[str, object]:
     return {**block, **fields}
 
 
-def _status_box(installed: Installed, health: dict[str, object], *, enabled: str = "") -> None:
+def _status_box(
+    installed: Installed,
+    health: dict[str, object],
+    *,
+    enabled: str = "",
+    timers: str | None = None,
+) -> None:
     """Stub everything `status` reaches: a real Python, the key file, curl, systemctl, nft.
 
     Args:
         installed: The scratch box.
         health: What the API's health route answers.
         enabled: Space-separated unit names `systemctl is-enabled` reports enabled.
+        timers: What `systemctl list-timers` knows, one line per timer, in its own format
+            (default: the recorded output for the three timers). The stub prints the line
+            of the unit it is asked about, and nothing for a unit with no line.
     """
     stubs = installed.root / "stubs"
     # `status` parses the health JSON with the venv's Python; the default stub only echoes.
@@ -313,6 +322,13 @@ def _status_box(installed: Installed, health: dict[str, object], *, enabled: str
         stubs / "curl",
         f'#!/bin/sh\necho "$*" >> "$(dirname "$0")/curl.args"\ncat "{body}"\n',
     )
+    timer_lines = stubs / "list_timers.txt"
+    timer_lines.write_text(
+        timers
+        if timers is not None
+        else (_FIXTURES / "systemd" / "list_timers.txt").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
     _executable(
         stubs / "systemctl",
         "#!/bin/sh\n"
@@ -321,6 +337,8 @@ def _status_box(installed: Installed, health: dict[str, object], *, enabled: str
         f'  is-enabled) case " {enabled} " in *" $2 "*) echo enabled ;;'
         " *) echo disabled ;; esac ;;\n"
         "  show) echo ;;\n"
+        # The unit is asked about by name ($2); the real command prints one line per timer.
+        f'  list-timers) grep -F " $2 " "{timer_lines}" || true ;;\n'
         "esac\n",
     )
     _executable(
@@ -466,6 +484,49 @@ def test_cli_status_shows_the_maintain_timer_when_it_is_enabled(installed: Insta
     out = _status(installed, _health_body(), enabled="wiki-mirror-maintain.timer")
     assert "wiki-mirror-maintain.timer is not enabled" not in out
     assert "wiki-mirror-maintain.timer     " in out
+
+
+_ALL_TIMERS = "wiki-mirror-maintain.timer wiki-mirror-update.timer wiki-mirror-build.timer"
+
+
+def _timer_line(out: str, unit: str) -> str:
+    """The Schedule line `status` printed for `unit`."""
+    # Other sections name the maintenance timer too; only the Schedule line carries "next".
+    (line,) = [line for line in out.splitlines() if unit in line and " next " in line]
+    return line.strip()
+
+
+def test_cli_status_a_monotonic_timer_shows_its_next_run(installed: Installed) -> None:
+    # The maintenance timer runs on OnBootSec/OnUnitActiveSec: its realtime property is empty,
+    # which is how its line once read "next " and nothing else.
+    out = _status(installed, _health_body(), enabled=_ALL_TIMERS)
+    line = _timer_line(out, "wiki-mirror-maintain.timer")
+    assert line.endswith("next Fri 2026-10-23 15:05:49 CDT")
+
+
+def test_cli_status_a_timer_whose_left_column_spans_words_shows_only_its_next_run(
+    installed: Installed,
+) -> None:
+    # "1 week 2 days left" is four words, and the build timer's LAST column is "-".
+    out = _status(installed, _health_body(), enabled=_ALL_TIMERS)
+    assert _timer_line(out, "wiki-mirror-build.timer").endswith("next Sun 2026-11-01 23:49:45 CST")
+
+
+def test_cli_status_a_timer_list_timers_does_not_know_shows_next_unknown(
+    installed: Installed,
+) -> None:
+    only_maintain = (_FIXTURES / "systemd" / "list_timers.txt").read_text(encoding="utf-8")
+    only_maintain = only_maintain.splitlines(keepends=True)[0]
+    out = _status(installed, _health_body(), enabled=_ALL_TIMERS, timers=only_maintain)
+    assert _timer_line(out, "wiki-mirror-update.timer").endswith("next unknown")
+
+
+def test_cli_status_a_timer_with_no_next_run_shows_next_unknown(installed: Installed) -> None:
+    # The real line with its NEXT column replaced by the "-" systemd prints for an unset one.
+    real = (_FIXTURES / "systemd" / "list_timers.txt").read_text(encoding="utf-8")
+    after_next = real.splitlines()[0].split(maxsplit=4)[4]
+    out = _status(installed, _health_body(), enabled=_ALL_TIMERS, timers=f"- {after_next}\n")
+    assert _timer_line(out, "wiki-mirror-maintain.timer").endswith("next unknown")
 
 
 def test_cli_status_firewall_shows_exactly_the_four_counters_with_their_packets(

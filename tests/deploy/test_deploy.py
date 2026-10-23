@@ -494,6 +494,23 @@ def test_each_pin_satisfies_the_floor_pyproject_declares() -> None:
         assert pinned >= wanted, f"{name} is pinned at {pins[name]}, below the floor {floor}"
 
 
+def test_the_qdrant_client_pin_is_the_servers_minor_version() -> None:
+    # Qdrant supports a client at most one minor version from its server; a client at 1.19
+    # against the 1.12.4 server warned on every connection and may send fields the server does
+    # not know. A refresh of the pins takes the newest of everything, so this is what stops it.
+    installer = (DEPLOY / "install.sh").read_text(encoding="utf-8")
+    server = re.search(r'^QDRANT_VERSION="(\d+)\.(\d+)\.\d+"$', installer, re.MULTILINE)
+    assert server is not None, "QDRANT_VERSION in install.sh is no longer a plain x.y.z"
+    client = re.match(r"(\d+)\.(\d+)", _pins()["qdrant-client"])
+    assert client is not None, "the qdrant-client pin is not a version"
+    assert client.groups() == server.groups(), (
+        f"qdrant-client is pinned at {_pins()['qdrant-client']} but the server is "
+        f"{'.'.join(server.groups())}.x (QDRANT_VERSION in deploy/install.sh): pin the newest "
+        "client of the server's minor version in deploy/constraints.txt and pyproject.toml, or "
+        "upgrade the server first"
+    )
+
+
 @pytest.mark.parametrize("script", ["install.sh", "update.sh"])
 def test_the_scripts_install_dependencies_from_the_pins_and_from_wheels(script: str) -> None:
     text = (DEPLOY / script).read_text(encoding="utf-8")

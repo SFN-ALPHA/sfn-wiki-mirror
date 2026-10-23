@@ -55,6 +55,16 @@ answers from the keyword index alone.
 - A semantic collection left paused (`grey`) when Qdrant restarted after an out-of-memory kill is resumed by the
   maintenance job within 15 minutes; before, it stayed paused and nothing showed it.
 - `wiki-mirror status` no longer prints a comment fragment as a firewall counter (`in_invalid "Inbound packets`).
+- `wiki-mirror status` shows when each timer fires next, `wiki-mirror-maintain.timer` included. The line read
+  `NextElapseUSecRealtime`, which systemd leaves empty for a timer on the monotonic clock, so the maintenance
+  timer's "next" was blank. It now reads `systemctl list-timers`, which answers for both kinds.
+- The Qdrant client is pinned to the server's minor version (`qdrant-client` 1.12.2 for the 1.12.4 server;
+  was 1.19.1). Qdrant supports a client at most one minor version from its server, and the 1.19 client warned
+  "incompatible with server version 1.12.4" every time it was constructed, which is every 15 minutes from the
+  maintenance job, and could send request fields the server does not know. `portalocker` moves back to 2.10.1 and
+  `grpcio-tools` 1.84.0 and `setuptools` join the pins, because that client needs them. A test keeps the pin's
+  minor version equal to `QDRANT_VERSION` in `deploy/install.sh`, so upgrading the server and the client is one
+  change.
 
 ### Documented
 

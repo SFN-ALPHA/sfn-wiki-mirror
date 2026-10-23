@@ -817,6 +817,20 @@ def _assert_equals_uninterrupted(
         assert state[key] == expected[key]
 
 
+def _embed_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The messages the embedding code itself logged at WARNING or above.
+
+    The 1.12 client logs its local-mode payload-index notice at WARNING on the root logger
+    (newer clients raise a UserWarning, which pyproject.toml ignores), so a check that nothing
+    was warned must look at this module's logger alone.
+    """
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "wiki_mirror.embed" and r.levelno >= logging.WARNING
+    ]
+
+
 def test_verified_checkpoint_matching_count_keeps_the_checkpoint(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -826,7 +840,7 @@ def test_verified_checkpoint_matching_count_keeps_the_checkpoint(
     with caplog.at_level(logging.INFO, logger="wiki_mirror.embed"):
         _run(config, client, FakeSource(articles), resumed, **_WINDOWS_OF_ONE)
     assert "checkpoint verified" in caplog.text
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not _embed_warnings(caplog)
     assert sorted(resumed.texts) == sorted(
         _expected_texts([a for a in articles if a.page_id > checkpoint])
     )
@@ -848,7 +862,7 @@ def test_verified_checkpoint_tail_loss_steps_back_and_the_run_equals_an_uninterr
         survivor - 1,
         2 * (survivor - 1),
     )
-    warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    (warning,) = _embed_warnings(caplog)
     assert f"page id {checkpoint}" in warning
     assert f"page id {survivor - 1}" in warning
     assert f"({2 * checkpoint} passages)" in warning
@@ -932,7 +946,7 @@ def test_verified_checkpoint_points_beyond_the_checkpoint_do_not_step_it_back(
     state = _resume_state(tmp_path)
     with caplog.at_level(logging.INFO, logger="wiki_mirror.embed"):
         assert embed._verified_checkpoint(client, _COLLECTION, state) is state
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not _embed_warnings(caplog)
     _run(config, client, FakeSource(articles), _Embedder(), **_WINDOWS_OF_ONE)
     _assert_equals_uninterrupted(tmp_path, client, articles)
 

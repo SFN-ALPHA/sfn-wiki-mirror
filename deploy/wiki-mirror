@@ -97,6 +97,20 @@ render() {
     done
 }
 
+# Prints when a timer fires next, as `systemctl list-timers` shows it ("Sat 2026-10-24 02:22:44
+# CDT"), or "unknown" when the timer has no line or no next run. $1 is the timer unit. Not
+# `systemctl show -p NextElapseUSecRealtime`: that is empty for a timer on the monotonic clock
+# (the maintenance timer's OnBootSec/OnUnitActiveSec), and it exits 0 when empty, so no fallback
+# after it ever ran. With --plain the NEXT column is four fields (weekday, date, time, zone), or
+# a single "-" when unset; LEFT after it is several words, so only fields 1-4 are taken. The
+# unit is the second-to-last field (ACTIVATES is last), which also drops any other line.
+timer_next() {
+    local next
+    next="$(systemctl list-timers "$1" --all --no-legend --plain 2>/dev/null \
+        | awk -v unit="$1" '$(NF - 1) == unit && $1 != "-" {print $1, $2, $3, $4; exit}' || true)"
+    printf '%s' "${next:-unknown}"
+}
+
 cmd_status() {
     require_root status
     local health="" state
@@ -271,19 +285,19 @@ for problem in record.get("problems") or []:
 
     head2 "Schedule"
     if [[ "$(systemctl is-enabled "$BUILD_TIMER" 2>/dev/null || true)" == enabled ]]; then
-        good "$(printf '%-40s next %s' "$BUILD_TIMER" "$(systemctl show "$BUILD_TIMER" -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)")"
+        good "$(printf '%-40s next %s' "$BUILD_TIMER" "$(timer_next "$BUILD_TIMER")")"
     else
         warn "$BUILD_TIMER is not enabled - no monthly build will run"
     fi
     if [[ "$(systemctl is-enabled "$MAINTAIN_TIMER" 2>/dev/null || true)" == enabled ]]; then
-        good "$(printf '%-40s next %s' "$MAINTAIN_TIMER" "$(systemctl show "$MAINTAIN_TIMER" -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)")"
+        good "$(printf '%-40s next %s' "$MAINTAIN_TIMER" "$(timer_next "$MAINTAIN_TIMER")")"
     else
         # Unlike the update timer this one is meant to be on everywhere: it only reads, resumes
         # and applies the code's own settings, and without it nobody notices a Qdrant that failed.
         warn "$MAINTAIN_TIMER is not enabled - Qdrant is neither watched nor healed; enable it once: systemctl enable --now $MAINTAIN_TIMER"
     fi
     if [[ "$(systemctl is-enabled "$UPDATE_TIMER" 2>/dev/null || true)" == enabled ]]; then
-        good "$(printf '%-40s next %s' "$UPDATE_TIMER" "$(systemctl show "$UPDATE_TIMER" -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)")"
+        good "$(printf '%-40s next %s' "$UPDATE_TIMER" "$(timer_next "$UPDATE_TIMER")")"
     else
         # Not a warning: the nightly update is opt-in (install.sh --auto-update), so off is the
         # normal state of a box whose operator has not chosen to follow upstream.
